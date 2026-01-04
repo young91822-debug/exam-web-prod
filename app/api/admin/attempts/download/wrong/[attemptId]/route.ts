@@ -12,25 +12,23 @@ function csvEscape(v: any) {
 
 function toCsv(rows: Record<string, any>[], headers: string[]) {
   const head = headers.join(",");
-  const body = rows
-    .map((r) => headers.map((h) => csvEscape(r[h])).join(","))
-    .join("\n");
+  const body = rows.map((r) => headers.map((h) => csvEscape(r[h])).join(",")).join("\n");
   return head + "\n" + body + "\n";
 }
 
-export async function GET(req: NextRequest, ctx: { params: { attemptId: string } }) {
+// ✅ Next.js 16(Turbopack)에서는 context.params가 Promise일 수 있어서 이렇게 타입을 잡는 게 안전함
+type Ctx = { params: Promise<{ attemptId: string }> | { attemptId: string } };
+
+export async function GET(req: NextRequest, ctx: Ctx) {
   try {
-    const attemptId = ctx?.params?.attemptId;
+    const p = await Promise.resolve(ctx?.params as any);
+    const attemptId = String(p?.attemptId ?? "").trim();
+
     if (!attemptId) {
       return NextResponse.json({ ok: false, error: "MISSING_ATTEMPT_ID" }, { status: 400 });
     }
 
-    // ✅ 너가 원한 다운로드 컬럼
-    // emp_id / submitted_at / question
-    // (테이블/컬럼명이 다를 수 있어서 가장 흔한 구조로 조회하고,
-    //  실패하면 에러를 detail로 내려서 바로 다음 수정이 가능하게 함)
-
-    // 1) attempt에서 emp_id + submitted_at 가져오기
+    // ✅ emp_id / submitted_at / question CSV 다운로드
     const { data: attempt, error: attemptErr } = await supabaseAdmin
       .from("exam_attempts")
       .select("id, emp_id, submitted_at")
@@ -47,13 +45,8 @@ export async function GET(req: NextRequest, ctx: { params: { attemptId: string }
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", attemptId }, { status: 404 });
     }
 
-    // 2) 오답 question_id 목록 가져오기 (가장 흔한 테이블명 후보)
-    // - exam_wrong_questions (attempt_id, question_id)
-    // - wrong_questions (attempt_id, question_id)
-    // 둘 다 시도
-    let wrongRows:
-      | { question_id?: number; questionId?: number; id?: number; question?: string }[]
-      | null = null;
+    // 1) 오답 question_id 목록 (후보 테이블 2개 시도)
+    let wrongRows: any[] | null = null;
 
     {
       const { data, error } = await supabaseAdmin
@@ -61,7 +54,7 @@ export async function GET(req: NextRequest, ctx: { params: { attemptId: string }
         .select("question_id")
         .eq("attempt_id", attemptId as any);
 
-      if (!error && data) wrongRows = data as any;
+      if (!error && data) wrongRows = data as any[];
     }
 
     if (!wrongRows) {
@@ -70,39 +63,29 @@ export async function GET(req: NextRequest, ctx: { params: { attemptId: string }
         .select("question_id")
         .eq("attempt_id", attemptId as any);
 
-      if (!error && data) wrongRows = data as any;
+      if (!error && data) wrongRows = data as any[];
     }
 
-    // 오답 테이블이 아예 없거나 비어 있어도 CSV는 내려줌
     const ids = (wrongRows ?? [])
-      .map((r: any) => r.question_id ?? r.questionId ?? null)
-      .filter((x: any) => x !== null);
+      .map((r) => r.question_id ?? r.questionId ?? null)
+      .filter((x) => x !== null)
+      .map((x) => Number(x));
 
-    // 3) question 내용 가져오기 (가장 흔한 테이블명 candidates)
-    // - questions (id, content)
-    // - exam_questions (id, content)
-    let questionMap = new Map<number, string>();
+    // 2) 문항 content 맵핑 (후보 테이블 2개 시도)
+    const questionMap = new Map<number, string>();
 
     if (ids.length > 0) {
-      // 3-1) questions 먼저
+      // questions
       {
-        const { data, error } = await supabaseAdmin
-          .from("questions")
-          .select("id, content")
-          .in("id", ids as any);
-
+        const { data, error } = await supabaseAdmin.from("questions").select("id, content").in("id", ids as any);
         if (!error && data) {
           for (const q of data as any[]) questionMap.set(Number(q.id), String(q.content ?? ""));
         }
       }
 
-      // 3-2) 부족하면 exam_questions도
+      // exam_questions (fallback)
       if (questionMap.size === 0) {
-        const { data, error } = await supabaseAdmin
-          .from("exam_questions")
-          .select("id, content")
-          .in("id", ids as any);
-
+        const { data, error } = await supabaseAdmin.from("exam_questions").select("id, content").in("id", ids as any);
         if (!error && data) {
           for (const q of data as any[]) questionMap.set(Number(q.id), String(q.content ?? ""));
         }
@@ -112,7 +95,7 @@ export async function GET(req: NextRequest, ctx: { params: { attemptId: string }
     const rows = ids.map((qid) => ({
       emp_id: attempt.emp_id ?? "",
       submitted_at: attempt.submitted_at ?? "",
-      question: questionMap.get(Number(qid)) ?? `question_id:${qid}`,
+      question: questionMap.get(qid) ?? `question_id:${qid}`,
     }));
 
     const csv = toCsv(rows, ["emp_id", "submitted_at", "question"]);
