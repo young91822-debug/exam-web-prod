@@ -1,14 +1,23 @@
-// app/api/auth/logout/route.ts
+// app/api/auth/login/logout/route.ts
 import { NextResponse } from "next/server";
 
+export const dynamic = "force-dynamic";
+
 export async function POST() {
+  const isProd = process.env.NODE_ENV === "production";
+
+  const cookie = [
+    "empId=",
+    "Path=/",
+    "HttpOnly",
+    isProd ? "Secure" : "",
+    "SameSite=Lax",
+    "Max-Age=0",
+  ]
+    .filter(Boolean)
+    .join("; ");
+
   const res = NextResponse.json({ ok: true });
-
-  // 쿠키 전부 삭제(프로젝트에서 쓰는 후보들)
-  const keys = ["empId", "emp_id", "userId", "employeeId", "emp", "admin"];
-  for (const k of keys) {
-    res.cookies.set(k, "", { path: "/", maxAge: 0 });
-  }
-
+  res.headers.set("Set-Cookie", cookie);
   return res;
 }
