@@ -1,14 +1,14 @@
+// app/api/admin/questions/import/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 function normChoices(v: any): string[] {
   if (!Array.isArray(v)) return [];
-  return v.map((x) => String(x ?? "").trim()).slice(0, 4);
+  return v.map((x: any) => String(x ?? "").trim()).slice(0, 4);
 }
 
 // ✅ NaN/빈값/null 들어와도 절대 null로 안 흘러가게 숫자 정리
 function toInt(v: any, fallback: number) {
-  // "", null, undefined, " " -> NaN 처리
   if (v === null || v === undefined) return fallback;
   const s = String(v).trim();
   if (s === "") return fallback;
@@ -25,7 +25,9 @@ function toInt(v: any, fallback: number) {
 export async function POST(req: Request) {
   try {
     const raw = await req.text();
-    if (!raw) return NextResponse.json({ error: "요청 바디가 비었습니다." }, { status: 400 });
+    if (!raw) {
+      return NextResponse.json({ error: "요청 바디가 비었습니다." }, { status: 400 });
+    }
 
     let body: any;
     try {
@@ -35,7 +37,9 @@ export async function POST(req: Request) {
     }
 
     const items = Array.isArray(body.items) ? body.items : [];
-    if (items.length === 0) return NextResponse.json({ error: "items가 비었습니다." }, { status: 400 });
+    if (items.length === 0) {
+      return NextResponse.json({ error: "items가 비었습니다." }, { status: 400 });
+    }
 
     const payload = items.map((it: any) => {
       const choices = normChoices(it.choices);
@@ -45,6 +49,7 @@ export async function POST(req: Request) {
       const aFromAnswer = it.answer;
 
       let answer_index: number;
+
       // answer_index 우선
       if (aiFromIndex !== undefined && aiFromIndex !== null && String(aiFromIndex).trim() !== "") {
         answer_index = toInt(aiFromIndex, 0);
@@ -68,19 +73,42 @@ export async function POST(req: Request) {
       const p = payload[i];
 
       if (!p.content) {
-        return NextResponse.json({ error: `CSV ${i + 1}번째 행: 문제내용(content)이 비었습니다.` }, { status: 400 });
+        return NextResponse.json(
+          { error: `CSV ${i + 1}번째 행: 문제내용(content)이 비었습니다.` },
+          { status: 400 }
+        );
       }
-      if (!Array.isArray(p.choices) || p.choices.length < 4 || p.choices.some((x) => !x)) {
-        return NextResponse.json({ error: `CSV ${i + 1}번째 행: 보기(choices) 4개가 모두 필요합니다.` }, { status: 400 });
+
+      // ✅ (중요) strict TS + 컴파일 안정: any 타입 명시 + 괄호/줄바꿈 정리
+      if (
+        !Array.isArray(p.choices) ||
+        p.choices.length < 4 ||
+        p.choices.some((x: any) => !String(x ?? "").trim())
+      ) {
+        return NextResponse.json(
+          { error: `CSV ${i + 1}번째 행: 보기(choices) 4개가 모두 필요합니다.` },
+          { status: 400 }
+        );
       }
+
       if (![0, 1, 2, 3].includes(p.answer_index)) {
-        return NextResponse.json({
-          error: `CSV ${i + 1}번째 행: 정답이 잘못됐습니다. (answer_index=${p.answer_index}) 정답은 1~4로 입력하세요.`,
-          debug: { received_answer: items[i]?.answer, received_answer_index: items[i]?.answer_index },
-        }, { status: 400 });
+        return NextResponse.json(
+          {
+            error: `CSV ${i + 1}번째 행: 정답이 잘못됐습니다. (answer_index=${p.answer_index}) 정답은 1~4로 입력하세요.`,
+            debug: {
+              received_answer: items[i]?.answer,
+              received_answer_index: items[i]?.answer_index,
+            },
+          },
+          { status: 400 }
+        );
       }
+
       if (!Number.isFinite(p.points) || p.points < 0) {
-        return NextResponse.json({ error: `CSV ${i + 1}번째 행: 배점(points)은 0 이상 숫자여야 합니다.` }, { status: 400 });
+        return NextResponse.json(
+          { error: `CSV ${i + 1}번째 행: 배점(points)은 0 이상 숫자여야 합니다.` },
+          { status: 400 }
+        );
       }
     }
 
@@ -88,15 +116,20 @@ export async function POST(req: Request) {
     const { error } = await supabaseAdmin.from("questions").insert(payload);
 
     if (error) {
-      // DB 에러가 나면 첫 행 샘플 같이 보여줌(원인 추적용)
-      return NextResponse.json({
-        error: `DB insert 실패: ${error.message}`,
-        sample: payload[0],
-      }, { status: 500 });
+      return NextResponse.json(
+        {
+          error: `DB insert 실패: ${error.message}`,
+          sample: payload[0],
+        },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({ ok: true, inserted: payload.length });
   } catch (e: any) {
-    return NextResponse.json({ error: `import 서버 오류: ${e?.message || "unknown"}` }, { status: 500 });
+    return NextResponse.json(
+      { error: `import 서버 오류: ${e?.message || "unknown"}` },
+      { status: 500 }
+    );
   }
 }
