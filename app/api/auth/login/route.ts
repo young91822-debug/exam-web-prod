@@ -14,10 +14,8 @@ export async function POST(req: Request) {
     const loginId = s(body.loginId ?? body.empId ?? body.id);
     const password = s(body.password ?? body.pw);
 
-    // ✅ 배포 반영/동작 확인용 마커
     const marker = "LOGIN_V4_NO_COOKIES";
 
-    // ✅ admin/1234는 무조건 성공
     if (loginId === "admin" && password === "1234") {
       return NextResponse.json({
         ok: true,
