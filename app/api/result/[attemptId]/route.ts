@@ -7,12 +7,12 @@ export const dynamic = "force-dynamic";
 function s(v: any) {
   return String(v ?? "").trim();
 }
-function n(v: any, d: number | null = null) {
-  const x = Number(v);
-  return Number.isFinite(x) ? x : d;
-}
 function isNumericId(x: string) {
   return /^\d+$/.test(x);
+}
+function n(v: any, d = 0) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
 }
 
 export async function GET(
@@ -20,20 +20,18 @@ export async function GET(
   context: { params: Promise<{ attemptId: string }> }
 ) {
   try {
-    // ✅ Next.js 타입이 params를 Promise로 기대하는 경우 대응
+    // ✅ Next 16 타입: params가 Promise
     const { attemptId: raw } = await context.params;
     const attemptId = s(raw);
 
     if (!attemptId) {
       return NextResponse.json({ ok: false, error: "MISSING_ATTEMPT_ID" }, { status: 400 });
     }
-
-    // 숫자 PK만 쓰는 구조면 안전하게 제한(원하면 제거 가능)
     if (!isNumericId(attemptId)) {
       return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
-    // 1) attempt 조회 (테이블/컬럼명은 너 프로젝트 기준으로 맞춰져 있어야 함)
+    // 1) attempt
     const { data: attempt, error: e1 } = await supabaseAdmin
       .from("attempts")
       .select("*")
@@ -47,8 +45,7 @@ export async function GET(
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
     }
 
-    // 2) 답안(선택) 조회
-    // - 시트/스키마에 맞춰 테이블명/컬럼명 확인 필요
+    // 2) answers
     const { data: answers, error: e2 } = await supabaseAdmin
       .from("attempt_answers")
       .select("*")
@@ -58,14 +55,15 @@ export async function GET(
       return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED" }, { status: 500 });
     }
 
-    // 3) 문항 조회 (attempt에 문항 id 목록이 있으면 그걸로 IN 조회하는 구조로 바꿔도 됨)
-    // 여기서는 answers에 question_id가 있다고 가정
-    const qids = Array.from(new Set((answers ?? []).map((a: any) => a?.question_id).filter(Boolean)));
+    // 3) questions (answers의 question_id로 조회)
+    const qids = Array.from(
+      new Set((answers ?? []).map((a: any) => a?.question_id).filter(Boolean))
+    );
 
     const { data: questions, error: e3 } = await supabaseAdmin
       .from("questions")
       .select("*")
-      .in("id", qids.length ? qids : [-1]); // 빈배열 방지
+      .in("id", qids.length ? qids : [-1]);
 
     if (e3) {
       return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED" }, { status: 500 });
@@ -74,9 +72,9 @@ export async function GET(
     const qMap = new Map<any, any>();
     for (const q of questions ?? []) qMap.set(q.id, q);
 
-    // 4) 채점 결과 구성
     const graded = (answers ?? []).map((a: any) => {
       const q = qMap.get(a.question_id);
+
       const correctIndex =
         q?.correct_index ?? q?.correctIndex ?? q?.answer_index ?? q?.answerIndex ?? null;
 
@@ -95,7 +93,7 @@ export async function GET(
         correctIndex,
         chosenIndex,
         isCorrect,
-        points: n(q?.points, 0) ?? 0,
+        points: n(q?.points, 0),
       };
     });
 
