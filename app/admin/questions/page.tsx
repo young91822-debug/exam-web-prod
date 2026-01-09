@@ -1,575 +1,428 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 
-type Q = {
-  id: number;
-  content: string;
-  choices: string[];
-  answer_index: number;
-  points: number;
-  is_active: boolean;
-  created_at?: string | null;
-  updated_at?: string | null;
+type Question = {
+  id: string | number;
+  content?: string;
+  points?: number;
+  is_active?: boolean | null;
 };
 
-function fmt(dt?: string | null) {
-  if (!dt) return "-";
-  const d = new Date(dt);
-  if (Number.isNaN(d.getTime())) return "-";
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mi = String(d.getMinutes()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+type ListRes = {
+  ok: boolean;
+  error?: string;
+  detail?: string;
+  total?: number;
+  page?: number;
+  pageSize?: number;
+  items?: Question[];
+};
+
+const PAGE_SIZE = 20;
+
+function qsInt(v: string | null, d: number) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : d;
 }
 
-function isModified(q: Q) {
-  if (!q.created_at || !q.updated_at) return null;
-  const c = new Date(q.created_at).getTime();
-  const u = new Date(q.updated_at).getTime();
-  if (Number.isNaN(c) || Number.isNaN(u)) return null;
-  return u > c + 1000;
+/** 간단 CSV 파서 (따옴표/쉼표 기본 대응) */
+function parseCSV(text: string) {
+  const rows: string[][] = [];
+  let cur = "";
+  let row: string[] = [];
+  let inQ = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (ch === '"') {
+      if (inQ && text[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQ = !inQ;
+      }
+      continue;
+    }
+
+    if (!inQ && ch === ",") {
+      row.push(cur);
+      cur = "";
+      continue;
+    }
+
+    if (!inQ && (ch === "\n" || ch === "\r")) {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(cur);
+      cur = "";
+      if (row.length > 1 || (row.length === 1 && row[0].trim() !== "")) rows.push(row);
+      row = [];
+      continue;
+    }
+
+    cur += ch;
+  }
+
+  row.push(cur);
+  if (row.length > 1 || (row.length === 1 && row[0].trim() !== "")) rows.push(row);
+  return rows;
 }
 
-function ToggleSwitch({
-  on,
-  disabled,
-  onToggle,
-}: {
-  on: boolean;
-  disabled?: boolean;
-  onToggle: (next: boolean) => void;
-}) {
-  return (
-    <button
-      type="button"
-      aria-pressed={on}
-      disabled={!!disabled}
-      onClick={() => onToggle(!on)}
-      style={{
-        ...toggleWrap,
-        opacity: disabled ? 0.55 : 1,
-        cursor: disabled ? "not-allowed" : "pointer",
-      }}
-    >
-      <span style={{ ...toggleTrack, background: on ? "#111" : "#ddd" }}>
-        <span
-          style={{
-            ...toggleThumb,
-            transform: on ? "translateX(18px)" : "translateX(0px)",
-            background: "white",
-          }}
-        />
-      </span>
-      <span style={{ fontWeight: 800, fontSize: 12, width: 32, textAlign: "left" }}>
-        {on ? "ON" : "OFF"}
-      </span>
-    </button>
-  );
+/** ✅ CSV -> 업로드 rows 변환(최대한 유연) */
+function csvToRowsForUpload(csvText: string) {
+  const rows = parseCSV(csvText);
+  if (!rows.length) return [];
+
+  const header = rows[0].map((s) => String(s ?? "").trim());
+  const body = rows.slice(1);
+
+  const norm = (x: string) => x.replace(/\s+/g, "").toLowerCase();
+
+  const idx = (...names: string[]) => {
+    const set = new Set(names.map(norm));
+    return header.findIndex((h) => set.has(norm(h)));
+  };
+
+  const iContent = idx("content", "문제", "question");
+  const iPoints = idx("points", "배점");
+  const iActive = idx("is_active", "사용여부", "active");
+
+  const iC1 = idx("choice1", "보기1", "option1");
+  const iC2 = idx("choice2", "보기2", "option2");
+  const iC3 = idx("choice3", "보기3", "option3");
+  const iC4 = idx("choice4", "보기4", "option4");
+
+  const iCorrect = idx("correct_index", "정답", "정답번호", "answer");
+
+  const out: any[] = [];
+
+  for (const r of body) {
+    const content = iContent >= 0 ? String(r[iContent] ?? "").trim() : "";
+    if (!content) continue;
+
+    const pointsRaw = iPoints >= 0 ? String(r[iPoints] ?? "").trim() : "";
+    const points = pointsRaw ? Number(pointsRaw) : 1;
+
+    const activeRaw = iActive >= 0 ? String(r[iActive] ?? "").trim().toLowerCase() : "";
+    const is_active =
+      activeRaw === ""
+        ? true
+        : activeRaw === "1" || activeRaw === "true" || activeRaw === "y" || activeRaw === "yes" || activeRaw === "on";
+
+    const choices = [iC1, iC2, iC3, iC4]
+      .filter((i) => i >= 0)
+      .map((i) => String(r[i] ?? "").trim())
+      .filter((s) => s !== "");
+
+    let correct_index: number | null = null;
+    if (iCorrect >= 0) {
+      const v = String(r[iCorrect] ?? "").trim();
+      const n = Number(v);
+      if (Number.isFinite(n)) {
+        // 1~4 -> 0~3
+        if (n >= 1 && n <= 4) correct_index = n - 1;
+        else correct_index = n;
+      }
+    }
+
+    out.push({
+      content,
+      points: Number.isFinite(points) ? points : 1,
+      is_active,
+      choices,
+      correct_index,
+    });
+  }
+
+  return out;
 }
 
-export default function AdminQuestionsPage() {
-  const fileRef = useRef<HTMLInputElement | null>(null);
+export default function QuestionsAdminPage() {
+  const router = useRouter();
+  const sp = useSearchParams();
 
-  const [loading, setLoading] = useState(true);
-  const [uploading, setUploading] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
 
-  const [items, setItems] = useState<Q[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
+  const [page, setPage] = useState(() => qsInt(sp.get("page"), 1));
+  const [total, setTotal] = useState(0);
+  const [items, setItems] = useState<Question[]>([]);
 
-  // OFF 숨김 기본, 체크하면 OFF도 보여줌
-  const [showOff, setShowOff] = useState(false);
+  const totalPages = useMemo(() => Math.max(1, Math.ceil((total || 0) / PAGE_SIZE)), [total]);
 
-  // 직접등록/수정 모달
-  const [formOpen, setFormOpen] = useState(false);
-  const [editId, setEditId] = useState<number | null>(null);
+  useEffect(() => {
+    const p = qsInt(sp.get("page"), 1);
+    setPage(p);
+  }, [sp]);
 
-  const [content, setContent] = useState("");
-  const [c1, setC1] = useState("");
-  const [c2, setC2] = useState("");
-  const [c3, setC3] = useState("");
-  const [c4, setC4] = useState("");
-  const [answerIndex, setAnswerIndex] = useState(0);
-  const [points, setPoints] = useState(5);
-  const [isActive, setIsActive] = useState(true);
-
-  const total = items.length;
-
-  function resetForm() {
-    setEditId(null);
-    setContent("");
-    setC1("");
-    setC2("");
-    setC3("");
-    setC4("");
-    setAnswerIndex(0);
-    setPoints(5);
-    setIsActive(true);
-  }
-
-  function openCreate() {
-    resetForm();
-    setFormOpen(true);
-  }
-
-  function openEdit(q: Q) {
-    setEditId(q.id);
-    setContent(q.content ?? "");
-    setC1(q.choices?.[0] ?? "");
-    setC2(q.choices?.[1] ?? "");
-    setC3(q.choices?.[2] ?? "");
-    setC4(q.choices?.[3] ?? "");
-    setAnswerIndex(Number(q.answer_index ?? 0));
-    setPoints(Number(q.points ?? 0));
-    setIsActive(!!q.is_active);
-    setFormOpen(true);
-  }
-
-  async function loadAll() {
+  async function fetchList(p = page) {
+    setErr("");
     setLoading(true);
-    setError(null);
     try {
-      const res = await fetch("/api/admin/questions?limit=100000", { cache: "no-store" });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error || "문항 조회 실패");
-      setItems(Array.isArray(data?.data) ? data.data : []);
-    } catch (e: any) {
-      setError(String(e?.message || e));
+      // ✅ pageSize 20 고정, includeOff=1(전체보기)
+      const url = `/api/admin/questions?page=${p}&pageSize=${PAGE_SIZE}&includeOff=1`;
+      const res = await fetch(url, { cache: "no-store" });
+      const json: ListRes = await res.json().catch(() => ({ ok: false } as any));
+
+      if (!res.ok || !json?.ok) {
+        setErr(`LIST_FAILED: ${json?.detail || json?.error || res.status}`);
+        console.error("LIST_FAILED:", json);
+        setItems([]);
+        setTotal(0);
+        return;
+      }
+
+      setItems(Array.isArray(json.items) ? json.items : []);
+      setTotal(Number(json.total ?? 0));
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
-    loadAll();
-  }, []);
+    fetchList(page);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
 
-  function openFilePicker() {
-    fileRef.current?.click();
+  function goPage(p: number) {
+    const next = Math.min(Math.max(1, p), totalPages);
+    router.push(`/admin/questions?page=${next}`);
   }
 
-  async function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    e.target.value = "";
-    if (!file) return;
+  async function onClearAll() {
+    if (!confirm("정말 전체 문항을 삭제할까요?")) return;
 
-    setUploading(true);
-    setError(null);
-    setToast(null);
+    setErr("");
+    setLoading(true);
 
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-
-      const res = await fetch("/api/admin/questions/import", {
+      const res = await fetch("/api/admin/questions/clear", {
         method: "POST",
-        body: fd,
+        cache: "no-store",
       });
 
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error || "CSV 업로드 실패");
-
-      setToast(`✅ CSV 업로드 완료 (${data?.inserted ?? "?"}건)`);
-      await loadAll();
-    } catch (e: any) {
-      setError(String(e?.message || e));
-    } finally {
-      setUploading(false);
-    }
-  }
-
-  function validateForm() {
-    if (!content.trim()) return "문제 내용을 입력해줘.";
-    const arr = [c1, c2, c3, c4].map((v) => v.trim());
-    if (arr.some((v) => !v)) return "보기 4개를 모두 입력해줘.";
-    if (answerIndex < 0 || answerIndex > 3) return "정답은 1~4 중에서 골라줘.";
-    if (!Number.isFinite(points) || points <= 0) return "배점은 1 이상 숫자로 입력해줘.";
-    return null;
-  }
-
-  async function saveQuestion() {
-    setError(null);
-    setToast(null);
-
-    const v = validateForm();
-    if (v) {
-      setError(v);
-      return;
-    }
-
-    setSaving(true);
-    try {
-      const payload = {
-        content: content.trim(),
-        choices: [c1.trim(), c2.trim(), c3.trim(), c4.trim()],
-        answer_index: answerIndex,
-        points: Number(points),
-        is_active: !!isActive,
-      };
-
-      if (editId == null) {
-        const res = await fetch("/api/admin/questions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data?.error || "직접 등록 실패");
-        setToast("✅ 직접 등록 완료");
-      } else {
-        const res = await fetch(`/api/admin/questions/${editId}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data?.error || "수정 실패");
-        setToast("✅ 수정 완료");
+      const raw = await res.text();
+      let json: any = null;
+      try {
+        json = raw ? JSON.parse(raw) : null;
+      } catch {
+        json = null;
       }
 
-      setFormOpen(false);
-      resetForm();
-      await loadAll();
+      if (!res.ok || !json?.ok) {
+        const msg = json?.detail || json?.error || (raw ? raw.slice(0, 300) : "") || `HTTP_${res.status}`;
+        setErr(`CLEAR_FAILED: ${msg}`);
+        console.error("CLEAR_FAILED raw:", raw);
+        console.error("CLEAR_FAILED json:", json);
+        return;
+      }
+
+      router.push(`/admin/questions?page=1`);
+      await fetchList(1);
     } catch (e: any) {
-      setError(String(e?.message || e));
+      setErr(`CLEAR_FAILED: ${String(e?.message ?? e)}`);
     } finally {
-      setSaving(false);
+      setLoading(false);
     }
   }
 
-  // ✅ ON/OFF 변경 (토글)
-  async function setActive(q: Q, next: boolean) {
-    setError(null);
-    setToast(null);
-
-    setItems((prev) => prev.map((x) => (x.id === q.id ? { ...x, is_active: next } : x)));
-
+  async function onUploadCSV(file: File) {
+    setErr("");
+    setLoading(true);
     try {
-      const res = await fetch(`/api/admin/questions/${q.id}`, {
-        method: "PATCH",
+      const text = await file.text();
+      const rows = csvToRowsForUpload(text);
+
+      if (!rows.length) {
+        setErr("CSV에 업로드할 문항이 없어요.");
+        return;
+      }
+
+      const res = await fetch("/api/admin/questions/upload", {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ is_active: next }),
+        body: JSON.stringify({ rows }),
+        cache: "no-store",
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error || "사용여부 변경 실패");
 
-      if (data?.updated_at) {
-        setItems((prev) => prev.map((x) => (x.id === q.id ? { ...x, updated_at: data.updated_at } : x)));
+      const raw = await res.text();
+      let json: any = null;
+      try {
+        json = raw ? JSON.parse(raw) : null;
+      } catch {
+        json = null;
       }
 
-      setToast(next ? "✅ ON(사용)으로 변경" : "✅ OFF(숨김) 처리 완료");
-    } catch (e: any) {
-      setItems((prev) => prev.map((x) => (x.id === q.id ? { ...x, is_active: q.is_active } : x)));
-      setError(String(e?.message || e));
+      if (!res.ok || !json?.ok) {
+        setErr(`UPLOAD_FAILED: ${json?.detail || json?.error || raw?.slice(0, 300) || res.status}`);
+        console.error("UPLOAD_FAILED raw:", raw);
+        return;
+      }
+
+      router.push(`/admin/questions?page=1`);
+      await fetchList(1);
+    } finally {
+      setLoading(false);
     }
   }
-
-  const visibleRows = useMemo(() => {
-    return showOff ? items : items.filter((x) => x.is_active);
-  }, [items, showOff]);
 
   return (
-    <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-        <h1 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>문제등록</h1>
-
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
-          <label style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "#444" }}>
-            <input type="checkbox" checked={showOff} onChange={(e) => setShowOff(e.target.checked)} />
-            OFF도 보기
-          </label>
-
-          <button onClick={openCreate} disabled={saving || uploading} style={btnPrimary}>
-            직접등록
-          </button>
-
-          <button onClick={openFilePicker} disabled={uploading || saving} style={btn}>
-            {uploading ? "업로드 중..." : "CSV 업로드"}
-          </button>
-
-          <button onClick={loadAll} disabled={loading || uploading || saving} style={btn2}>
-            새로고침
-          </button>
-
-          <input
-            ref={fileRef}
-            type="file"
-            accept=".csv,text/csv"
-            onChange={onPickFile}
-            style={{ display: "none" }}
-          />
-        </div>
-      </div>
-
-      <div style={{ color: "#666", marginBottom: 14 }}>
-        전체 <b>{total}</b>건 / 현재 표시 <b>{visibleRows.length}</b>건
-        <span style={{ marginLeft: 10, color: "#999" }}>(※ ID는 숨김 처리됨)</span>
-      </div>
-
-      {toast && (
-        <div style={{ padding: 10, border: "1px solid #cfe9d6", background: "#f3fff6", borderRadius: 10, marginBottom: 12 }}>
-          {toast}
-        </div>
-      )}
-
-      {error && (
-        <div style={{ padding: 12, border: "1px solid #f99", background: "#fff5f5", borderRadius: 10, marginBottom: 12 }}>
-          {error}
-        </div>
-      )}
-
-      {/* 모달 */}
-      {formOpen && (
-        <div style={modalBackdrop}>
-          <div style={modal}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <h2 style={{ margin: 0, fontSize: 18 }}>
-                {editId == null ? "직접등록" : "문항 수정"}
-              </h2>
-              <button
-                onClick={() => {
-                  setFormOpen(false);
-                  resetForm();
-                }}
-                style={{ marginLeft: "auto", ...btn2 }}
-                disabled={saving}
-              >
-                닫기
-              </button>
-            </div>
-
-            <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
-              <label style={lbl}>문제</label>
-              <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={3} style={inpArea} />
-
-              <label style={lbl}>보기 1</label>
-              <input value={c1} onChange={(e) => setC1(e.target.value)} style={inp} />
-              <label style={lbl}>보기 2</label>
-              <input value={c2} onChange={(e) => setC2(e.target.value)} style={inp} />
-              <label style={lbl}>보기 3</label>
-              <input value={c3} onChange={(e) => setC3(e.target.value)} style={inp} />
-              <label style={lbl}>보기 4</label>
-              <input value={c4} onChange={(e) => setC4(e.target.value)} style={inp} />
-
-              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={lbl}>정답</span>
-                  <select value={answerIndex} onChange={(e) => setAnswerIndex(Number(e.target.value))} style={sel}>
-                    <option value={0}>1번</option>
-                    <option value={1}>2번</option>
-                    <option value={2}>3번</option>
-                    <option value={3}>4번</option>
-                  </select>
-                </div>
-
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={lbl}>배점</span>
-                  <input type="number" value={points} onChange={(e) => setPoints(Number(e.target.value))} style={{ ...inp, width: 110 }} min={1} />
-                </div>
-
-                <label style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
-                  <input type="checkbox" checked={isActive} onChange={(e) => setIsActive(e.target.checked)} />
-                  사용(ON)
-                </label>
-              </div>
-
-              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 }}>
-                <button onClick={saveQuestion} disabled={saving} style={btnPrimary}>
-                  {saving ? "저장 중..." : "저장"}
-                </button>
-                <button
-                  onClick={() => {
-                    setFormOpen(false);
-                    resetForm();
-                  }}
-                  disabled={saving}
-                  style={btn2}
-                >
-                  취소
-                </button>
-              </div>
-            </div>
+    <div style={{ padding: 24, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
+      <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12 }}>
+        <div>
+          <h1 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>시험문항 관리</h1>
+          <div style={{ fontSize: 13, opacity: 0.8, marginTop: 6 }}>
+            총 <b>{total}</b>건 · 현재 <b>{items.length}</b>건 표시 · 페이지당 <b>{PAGE_SIZE}</b>건 · {page}/{totalPages}페이지
           </div>
         </div>
-      )}
 
-      {/* 테이블 */}
-      {loading ? (
-        <div style={{ padding: 16 }}>불러오는 중...</div>
-      ) : (
-        <div style={{ overflowX: "auto", border: "1px solid #eee", borderRadius: 12 }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr style={{ background: "#fafafa" }}>
-                <th style={th}>번호</th>
-                <th style={th}>문제</th>
-                <th style={th}>배점</th>
-                <th style={th}>사용</th>
-                <th style={th}>수정여부</th>
-                <th style={th}>수정</th>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <label
+            style={{
+              border: "1px solid #ddd",
+              padding: "8px 12px",
+              borderRadius: 10,
+              cursor: loading ? "not-allowed" : "pointer",
+              opacity: loading ? 0.6 : 1,
+              background: "#fff",
+            }}
+          >
+            CSV 업로드
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              style={{ display: "none" }}
+              disabled={loading}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) onUploadCSV(f);
+              }}
+            />
+          </label>
+
+          <button
+            onClick={onClearAll}
+            disabled={loading}
+            style={{
+              border: "1px solid #f2b8b5",
+              background: "#fff5f5",
+              color: "#b42318",
+              padding: "8px 12px",
+              borderRadius: 10,
+              cursor: loading ? "not-allowed" : "pointer",
+            }}
+          >
+            전체 삭제
+          </button>
+
+          <button
+            onClick={() => fetchList(page)}
+            disabled={loading}
+            style={{
+              border: "1px solid #ddd",
+              background: "#fff",
+              padding: "8px 12px",
+              borderRadius: 10,
+              cursor: loading ? "not-allowed" : "pointer",
+            }}
+          >
+            새로고침
+          </button>
+        </div>
+      </div>
+
+      {err ? (
+        <div style={{ marginTop: 12, padding: 10, background: "#fff3f2", border: "1px solid #f2b8b5", borderRadius: 10 }}>
+          <b style={{ color: "#b42318" }}>{err}</b>
+        </div>
+      ) : null}
+
+      <div style={{ marginTop: 14, border: "1px solid #eee", borderRadius: 12, overflow: "hidden" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr style={{ background: "#fafafa" }}>
+              <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #eee", width: 110 }}>ID</th>
+              <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #eee" }}>문항</th>
+              <th style={{ textAlign: "center", padding: 10, borderBottom: "1px solid #eee", width: 80 }}>배점</th>
+              <th style={{ textAlign: "center", padding: 10, borderBottom: "1px solid #eee", width: 90 }}>상태</th>
+              <th style={{ textAlign: "center", padding: 10, borderBottom: "1px solid #eee", width: 90 }}>관리</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.length === 0 ? (
+              <tr>
+                <td colSpan={5} style={{ padding: 16, textAlign: "center", opacity: 0.7 }}>
+                  {loading ? "불러오는 중..." : "표시할 문항이 없어요."}
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {visibleRows.length === 0 ? (
-                <tr>
-                  <td style={td} colSpan={6}>
-                    표시할 문항이 없습니다. (OFF 숨김 중이면 “OFF도 보기” 체크)
+            ) : (
+              items.map((q) => (
+                <tr key={String(q.id)} style={{ borderBottom: "1px solid #f3f3f3" }}>
+                  <td style={{ padding: 10, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12 }}>
+                    {String(q.id)}
+                  </td>
+                  <td style={{ padding: 10, whiteSpace: "pre-wrap" }}>{q.content || ""}</td>
+                  <td style={{ padding: 10, textAlign: "center" }}>{q.points ?? ""}</td>
+                  <td style={{ padding: 10, textAlign: "center" }}>
+                    {q.is_active === false ? (
+                      <span style={{ padding: "2px 8px", borderRadius: 999, background: "#fff1f1", border: "1px solid #ffd1d1" }}>
+                        OFF
+                      </span>
+                    ) : (
+                      <span style={{ padding: "2px 8px", borderRadius: 999, background: "#ecfdf3", border: "1px solid #abefc6" }}>
+                        ON
+                      </span>
+                    )}
+                  </td>
+                  <td style={{ padding: 10, textAlign: "center" }}>
+                    <button
+                      onClick={() => router.push(`/admin/questions/edit?id=${encodeURIComponent(String(q.id))}`)}
+                      style={{
+                        border: "1px solid #ddd",
+                        background: "#fff",
+                        padding: "6px 10px",
+                        borderRadius: 8,
+                        cursor: "pointer",
+                      }}
+                    >
+                      수정
+                    </button>
                   </td>
                 </tr>
-              ) : (
-                visibleRows.map((q, idx) => {
-                  const mod = isModified(q);
-                  return (
-                    <tr key={q.id} style={{ borderTop: "1px solid #eee", opacity: q.is_active ? 1 : 0.55 }}>
-                      <td style={td}>{idx + 1}</td>
-                      <td style={{ ...td, textAlign: "left" }}>{q.content}</td>
-                      <td style={td}>{q.points ?? 0}</td>
-                      <td style={td}>
-                        <ToggleSwitch on={!!q.is_active} onToggle={(next) => setActive(q, next)} />
-                      </td>
-                      <td style={td}>
-                        {mod === null ? "-" : mod ? `수정됨 (${fmt(q.updated_at)})` : "신규"}
-                      </td>
-                      <td style={td}>
-                        <button onClick={() => openEdit(q)} style={btnSmall}>
-                          수정
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ marginTop: 14, display: "flex", gap: 8, alignItems: "center", justifyContent: "center" }}>
+        <button disabled={loading || page <= 1} onClick={() => goPage(1)} style={btnStyle}>
+          처음
+        </button>
+        <button disabled={loading || page <= 1} onClick={() => goPage(page - 1)} style={btnStyle}>
+          이전
+        </button>
+        <div style={{ fontSize: 13, opacity: 0.8, padding: "0 8px" }}>
+          {page} / {totalPages}
         </div>
-      )}
+        <button disabled={loading || page >= totalPages} onClick={() => goPage(page + 1)} style={btnStyle}>
+          다음
+        </button>
+        <button disabled={loading || page >= totalPages} onClick={() => goPage(totalPages)} style={btnStyle}>
+          마지막
+        </button>
+      </div>
     </div>
   );
 }
 
-const btn: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 10,
+const btnStyle: React.CSSProperties = {
   border: "1px solid #ddd",
-  background: "white",
+  background: "#fff",
+  padding: "8px 12px",
+  borderRadius: 10,
   cursor: "pointer",
-  fontWeight: 700,
-};
-
-const btnPrimary: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 10,
-  border: "1px solid #111",
-  background: "#111",
-  color: "white",
-  cursor: "pointer",
-  fontWeight: 800,
-};
-
-const btn2: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 10,
-  border: "1px solid #eee",
-  background: "#fafafa",
-  cursor: "pointer",
-  fontWeight: 600,
-};
-
-const btnSmall: React.CSSProperties = {
-  padding: "6px 10px",
-  borderRadius: 10,
-  border: "1px solid #ddd",
-  background: "white",
-  cursor: "pointer",
-  fontWeight: 700,
-  fontSize: 12,
-};
-
-const th: React.CSSProperties = {
-  textAlign: "center",
-  padding: "10px 12px",
-  fontSize: 13,
-  borderBottom: "1px solid #eee",
-  whiteSpace: "nowrap",
-};
-
-const td: React.CSSProperties = {
-  textAlign: "center",
-  padding: "10px 12px",
-  fontSize: 13,
-  verticalAlign: "top",
-};
-
-const modalBackdrop: React.CSSProperties = {
-  position: "fixed",
-  inset: 0,
-  background: "rgba(0,0,0,0.25)",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  padding: 16,
-  zIndex: 50,
-};
-
-const modal: React.CSSProperties = {
-  width: "min(820px, 100%)",
-  background: "white",
-  borderRadius: 16,
-  border: "1px solid #eee",
-  boxShadow: "0 10px 30px rgba(0,0,0,0.12)",
-  padding: 16,
-};
-
-const lbl: React.CSSProperties = { fontSize: 13, fontWeight: 700, color: "#333" };
-
-const inp: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 10,
-  border: "1px solid #ddd",
-  outline: "none",
-  width: "100%",
-};
-
-const inpArea: React.CSSProperties = {
-  ...inp,
-  resize: "vertical",
-};
-
-const sel: React.CSSProperties = {
-  padding: "8px 10px",
-  borderRadius: 10,
-  border: "1px solid #ddd",
-};
-
-const toggleWrap: React.CSSProperties = {
-  border: "none",
-  background: "transparent",
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 8,
-  padding: 0,
-};
-
-const toggleTrack: React.CSSProperties = {
-  width: 38,
-  height: 20,
-  borderRadius: 999,
-  position: "relative",
-  display: "inline-flex",
-  alignItems: "center",
-  padding: 2,
-  transition: "background 120ms ease",
-};
-
-const toggleThumb: React.CSSProperties = {
-  width: 16,
-  height: 16,
-  borderRadius: 999,
-  display: "inline-block",
-  transition: "transform 120ms ease",
-  boxShadow: "0 1px 2px rgba(0,0,0,0.25)",
 };

@@ -1,222 +1,211 @@
-// app/result/[attemptId]/page.tsx
 "use client";
 
-import { use, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import React, { useEffect, useMemo, useState } from "react";
+import { useParams, useRouter } from "next/navigation";
 
-type WrongQ = {
-  id: number;
-  content: string;
-  choices: string[];
-  points: number;
-  answer_index?: number | null;
-  picked_index?: number | null;
+type ApiOk = {
+  ok: true;
+  attempt: any;
+  graded?: any[];
+  wrongQuestions?: any[];
+  wrongCount?: number;
+  totalQuestions?: number;
+  meta?: any;
 };
 
-type ResultData = {
-  ok: boolean;
-  attemptId: number;
-  score: number;
-  totalQuestions: number;
-  totalPoints?: number;
-  wrongCount: number;
-  wrongQuestions: WrongQ[];
-  empId?: string | null;
-};
+type ApiErr = { ok: false; error: string; detail?: any };
 
-async function safeReadResponse(res: Response) {
-  const ct = res.headers.get("content-type") || "";
-  const text = await res.text();
-  if (ct.includes("application/json")) {
-    try {
-      return { kind: "json" as const, data: JSON.parse(text), raw: text };
-    } catch {
-      return { kind: "text" as const, data: null, raw: text };
-    }
-  }
-  return { kind: "text" as const, data: null, raw: text };
+type ApiResp = ApiOk | ApiErr;
+
+function fmtDate(v: any) {
+  if (!v) return "-";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v);
+  return d.toLocaleString();
 }
 
-export default function ResultPage(props: { params: Promise<{ attemptId: string }> }) {
-  // ✅ Next 16 params Promise 경고 해결
-  const { attemptId } = use(props.params);
+function pick<T = any>(obj: any, keys: string[], fallback: any = undefined): T {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null) return v as T;
+  }
+  return fallback as T;
+}
 
+export default function AdminResultDetailPage() {
   const router = useRouter();
+  const params = useParams();
+
+  const attemptId = useMemo(() => {
+    const raw = (params as any)?.attemptId ?? (params as any)?.attemptID ?? (params as any)?.id;
+    return String(raw ?? "").trim();
+  }, [params]);
+
+  const apiUrl = useMemo(() => `/api/admin/result-detail?attemptId=${encodeURIComponent(attemptId)}`, [attemptId]);
+
   const [loading, setLoading] = useState(true);
-  const [errorMsg, setErrorMsg] = useState("");
-  const [data, setData] = useState<ResultData | null>(null);
+  const [err, setErr] = useState<string>("");
+  const [data, setData] = useState<ApiOk | null>(null);
 
   useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setErr("");
+
     (async () => {
-      setLoading(true);
-      setErrorMsg("");
-      setData(null);
-
       try {
-        const res = await fetch(`/api/result/${encodeURIComponent(attemptId)}`, {
-          method: "GET",
-          cache: "no-store",
-        });
+        const res = await fetch(apiUrl, { cache: "no-store" });
+        const json: ApiResp = await res.json().catch(() => ({ ok: false, error: "BAD_JSON" } as any));
 
-        const parsed = await safeReadResponse(res);
+        if (!alive) return;
 
-        if (!res.ok) {
-          const msg =
-            parsed.kind === "json"
-              ? JSON.stringify(parsed.data, null, 2)
-              : parsed.raw || `결과 조회 실패 (status ${res.status})`;
-          setErrorMsg(`에러: 결과 조회 실패 (status ${res.status})\n${msg}`);
+        if (!json?.ok) {
+          setErr((json as ApiErr)?.error || `HTTP_${res.status}`);
+          setData(null);
           setLoading(false);
           return;
         }
 
-        const d = parsed.kind === "json" ? (parsed.data as ResultData) : null;
-        if (!d?.ok) {
-          setErrorMsg(`에러: 결과 응답이 이상함\n${parsed.raw}`);
-          setLoading(false);
-          return;
-        }
-
-        setData(d);
+        setData(json as ApiOk);
         setLoading(false);
       } catch (e: any) {
-        setErrorMsg(`에러: 네트워크/런타임 오류\n${e?.message ?? String(e)}`);
+        if (!alive) return;
+        setErr(String(e?.message ?? e));
+        setData(null);
         setLoading(false);
       }
     })();
-  }, [attemptId]);
 
-  async function onLogout() {
-    try {
-      await fetch("/api/auth/logout", { method: "POST" });
-    } catch {
-      // 네트워크 실패해도 이동은 시킴
-    }
-    router.replace("/login");
-  }
+    return () => {
+      alive = false;
+    };
+  }, [apiUrl]);
+
+  const attempt = data?.attempt ?? null;
+  const graded = Array.isArray(data?.graded) ? (data!.graded as any[]) : [];
+  const wrongQuestions = Array.isArray(data?.wrongQuestions) ? (data!.wrongQuestions as any[]) : [];
+
+  // ✅ 총문항/오답/점수는 "어떤 키로 오든" 잡아냄
+  const totalQuestions = useMemo(() => {
+    const fromTop = pick<number>(data, ["totalQuestions", "total_questions"], null);
+    const fromAttempt = pick<number>(attempt, ["total_questions", "totalQuestions"], null);
+    return fromTop ?? fromAttempt ?? graded.length ?? 0;
+  }, [data, attempt, graded.length]);
+
+  const wrongCount = useMemo(() => {
+    const fromTop = pick<number>(data, ["wrongCount", "wrong_count"], null);
+    return fromTop ?? wrongQuestions.length ?? 0;
+  }, [data, wrongQuestions.length]);
+
+  const score = useMemo(() => {
+    return pick<number>(attempt, ["score", "total_score", "result_score"], 0) ?? 0;
+  }, [attempt]);
+
+  const empId = useMemo(() => {
+    return pick<string>(attempt, ["emp_id", "empId", "user_id", "userId", "account_id", "accountId"], "-") ?? "-";
+  }, [attempt]);
+
+  const startedAt = useMemo(() => pick<any>(attempt, ["started_at", "startedAt", "created_at", "createdAt"], null), [attempt]);
+  const submittedAt = useMemo(
+    () => pick<any>(attempt, ["submitted_at", "submittedAt", "ended_at", "endedAt", "completed_at", "completedAt"], null),
+    [attempt]
+  );
 
   if (loading) {
-    return <div style={{ padding: 24, fontFamily: "system-ui" }}>결과 불러오는 중...</div>;
-  }
-
-  if (errorMsg) {
     return (
-      <div style={{ padding: 24, fontFamily: "system-ui", whiteSpace: "pre-wrap", color: "crimson" }}>
-        {errorMsg}
+      <div style={{ padding: 16 }}>
+        <button onClick={() => router.back()} style={{ marginBottom: 12 }}>
+          ← 뒤로
+        </button>
+        <h2 style={{ margin: "8px 0 12px" }}>응시 상세</h2>
+        <div>로딩 중...</div>
+        <div style={{ opacity: 0.7, marginTop: 8 }}>{apiUrl}</div>
       </div>
     );
   }
 
-  if (!data) {
-    return <div style={{ padding: 24, fontFamily: "system-ui" }}>결과가 없습니다.</div>;
+  if (err) {
+    return (
+      <div style={{ padding: 16 }}>
+        <button onClick={() => router.back()} style={{ marginBottom: 12 }}>
+          ← 뒤로
+        </button>
+        <h2 style={{ margin: "8px 0 12px" }}>응시 상세</h2>
+
+        <div style={{ fontWeight: 700, color: "crimson" }}>상세 로딩 실패</div>
+        <pre style={{ background: "#111", color: "#fff", padding: 12, borderRadius: 8, overflow: "auto" }}>
+          {JSON.stringify({ ok: false, error: err }, null, 2)}
+        </pre>
+
+        <div style={{ opacity: 0.7, marginTop: 8 }}>{apiUrl}</div>
+      </div>
+    );
   }
 
-  const totalQ = data.totalQuestions ?? 0;
-  const totalPoints = typeof data.totalPoints === "number" ? data.totalPoints : 100;
-
   return (
-    <div style={{ padding: 24, fontFamily: "system-ui" }}>
-      {/* 상단: 제목 + 로그아웃 버튼 */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-        <div>
-          <h1 style={{ fontSize: 22, fontWeight: 800, marginBottom: 6 }}>시험</h1>
-          <div style={{ color: "#666" }}>
-            attemptId: <b>{data.attemptId}</b> / 문항수: <b>{totalQ}</b>
+    <div style={{ padding: 16 }}>
+      <button onClick={() => router.back()} style={{ marginBottom: 12 }}>
+        ← 뒤로
+      </button>
+
+      <h2 style={{ margin: "8px 0 12px" }}>응시 상세</h2>
+
+      <div style={{ opacity: 0.75, fontSize: 13, marginBottom: 8 }}>
+        attemptId: {attemptId}
+        <br />
+        apiUrl: {apiUrl}
+      </div>
+
+      {/* 기본 정보 */}
+      <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>기본 정보</div>
+        <div>응시자ID: {empId}</div>
+        <div>점수: {score}</div>
+        <div>응시일시: {submittedAt ? fmtDate(submittedAt) : fmtDate(startedAt)}</div>
+        <div style={{ marginTop: 6 }}>
+          오답: {wrongCount}개 / 총 문항: {totalQuestions}개
+        </div>
+      </div>
+
+      {/* 틀린 문항 */}
+      <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>틀린 문항</div>
+
+        {wrongQuestions.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>
+            {pick(attempt, ["submitted_at"], null) ? "오답이 없습니다." : "아직 제출 전이거나 오답 데이터가 없습니다."}
           </div>
-        </div>
-
-        {/* ✅ 여기 = 너가 동그라미친 “오른쪽” 위치 */}
-        <button
-          onClick={onLogout}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            background: "#fff",
-            cursor: "pointer",
-            fontWeight: 800,
-          }}
-        >
-          로그아웃
-        </button>
+        ) : (
+          <ol style={{ margin: 0, paddingLeft: 18 }}>
+            {wrongQuestions.map((w: any, idx: number) => (
+              <li key={String(w?.id ?? w?.questionId ?? idx)} style={{ marginBottom: 10 }}>
+                <div style={{ fontWeight: 600 }}>{w?.content ?? w?.question ?? "-"}</div>
+                <div style={{ opacity: 0.85, fontSize: 13 }}>
+                  선택: {w?.selectedIndex ?? w?.selected_index ?? "-"} / 정답: {w?.correctIndex ?? w?.correct_index ?? "-"}
+                </div>
+              </li>
+            ))}
+          </ol>
+        )}
       </div>
 
-      {/* 점수 박스 */}
-      <div
-        style={{
-          marginTop: 14,
-          border: "2px solid #111",
-          borderRadius: 12,
-          padding: 14,
-          maxWidth: 820,
-        }}
-      >
-        <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 6 }}>
-          점수: {data.score} / {totalPoints}
-        </div>
-        <div style={{ fontWeight: 700 }}>틀린 문항 ({data.wrongCount}개)</div>
-      </div>
+      {/* 전체 graded */}
+      <details>
+        <summary style={{ cursor: "pointer", fontWeight: 700, marginBottom: 8 }}>전체 채점 데이터(graded) 보기</summary>
+        <pre style={{ background: "#111", color: "#fff", padding: 12, borderRadius: 8, overflow: "auto" }}>
+          {JSON.stringify(graded, null, 2)}
+        </pre>
+      </details>
 
-      {/* 오답 리스트 */}
-      <div style={{ marginTop: 16, maxWidth: 980, display: "grid", gap: 16 }}>
-        {(data.wrongQuestions || []).map((q, idx) => {
-          const picked = typeof q.picked_index === "number" ? q.picked_index : null;
-          const ans = typeof q.answer_index === "number" ? q.answer_index : null;
-
-          return (
-            <div
-              key={`${q.id}-${idx}`} // ✅ key 경고 제거
-              style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14 }}
-            >
-              <div style={{ fontWeight: 800, marginBottom: 10 }}>
-                {idx + 1}. {q.content}{" "}
-                <span style={{ color: "#777", fontWeight: 700 }}>({q.points ?? 0}점)</span>
-              </div>
-
-              <div style={{ display: "grid", gap: 8 }}>
-                {(q.choices || []).map((c, i) => {
-                  const isAnswer = ans === i;
-                  const isPicked = picked === i;
-
-                  const bg = isAnswer ? "#e9fbe9" : isPicked ? "#fdecec" : "#fff";
-                  const left = isAnswer ? "✅" : isPicked ? "❌" : "•";
-                  const label = isAnswer ? " (정답)" : isPicked ? " (내 답)" : "";
-
-                  return (
-                    <div
-                      key={`${q.id}-c-${i}`}
-                      style={{
-                        border: "1px solid #eee",
-                        borderRadius: 10,
-                        padding: "10px 12px",
-                        background: bg,
-                        display: "flex",
-                        gap: 10,
-                        alignItems: "center",
-                      }}
-                    >
-                      <span style={{ width: 24, textAlign: "center" }}>{left}</span>
-                      <span>
-                        {c}
-                        <b>{label}</b>
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      <div style={{ marginTop: 18, display: "flex", gap: 10 }}>
-        <button
-          onClick={() => router.replace("/exam")}
-          style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
-        >
-          다시 응시
-        </button>
-      </div>
+      {/* meta */}
+      {data?.meta ? (
+        <details style={{ marginTop: 10 }}>
+          <summary style={{ cursor: "pointer", fontWeight: 700 }}>meta 보기</summary>
+          <pre style={{ background: "#111", color: "#fff", padding: 12, borderRadius: 8, overflow: "auto" }}>
+            {JSON.stringify(data.meta, null, 2)}
+          </pre>
+        </details>
+      ) : null}
     </div>
   );
 }

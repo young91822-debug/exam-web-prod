@@ -1,94 +1,308 @@
 // app/api/exam/submit/route.ts
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { createClient } from "@supabase/supabase-js";
 
-function isAdmin(req: Request) {
-  const cookie = req.headers.get("cookie") || "";
-  return cookie.includes("admin=1");
+export const dynamic = "force-dynamic";
+
+function getSupabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const service = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!url) return { client: null as any, error: "Missing env: NEXT_PUBLIC_SUPABASE_URL" };
+  if (!service) return { client: null as any, error: "Missing env: SUPABASE_SERVICE_ROLE_KEY" };
+
+  const client = createClient(url, service, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
+  return { client, error: null as string | null };
+}
+
+function s(v: any) {
+  return String(v ?? "").trim();
+}
+function n(v: any, d: number | null = null) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
+}
+
+function getCookie(req: Request, name: string) {
+  const raw = req.headers.get("cookie") || "";
+  const parts = raw.split(";").map((x) => x.trim());
+  for (const p of parts) {
+    if (!p) continue;
+    const [k, ...rest] = p.split("=");
+    if (k === name) return decodeURIComponent(rest.join("=") || "");
+  }
+  return "";
+}
+
+async function readBody(req: Request): Promise<any> {
+  try {
+    return await req.json();
+  } catch {
+    try {
+      const t = await req.text();
+      if (!t) return {};
+      return JSON.parse(t);
+    } catch {
+      return {};
+    }
+  }
+}
+
+function pickCorrectIndex(q: any): number | null {
+  const cands = [
+    q?.correct_index,
+    q?.correctIndex,
+    q?.answer_index,
+    q?.answerIndex,
+    q?.correct_answer,
+    q?.correctAnswer,
+    q?.correct_choice,
+    q?.correctChoice,
+    q?.answer,
+  ];
+  for (const v of cands) {
+    if (v === undefined || v === null || v === "") continue;
+    const num = Number(v);
+    if (Number.isFinite(num)) return num;
+  }
+  return null;
+}
+
+type AnswerItem = { questionId: string; selectedIndex: number };
+
+function normalizeAnswers(body: any): AnswerItem[] {
+  const raw = body?.answers ?? body?.selected ?? body?.answerMap ?? body?.items ?? body?.payload?.answers ?? null;
+  if (!raw) return [];
+
+  if (Array.isArray(raw)) {
+    return raw
+      .map((x) => ({
+        questionId: s(x?.questionId ?? x?.question_id ?? x?.qid ?? x?.id),
+        selectedIndex: n(x?.selectedIndex ?? x?.selected_index ?? x?.value, null) as any,
+      }))
+      .filter((x) => x.questionId && x.selectedIndex !== null);
+  }
+
+  if (typeof raw === "object") {
+    return Object.entries(raw)
+      .map(([qid, idx]) => ({
+        questionId: s(qid),
+        selectedIndex: n(idx, null) as any,
+      }))
+      .filter((x) => x.questionId && x.selectedIndex !== null);
+  }
+
+  return [];
+}
+
+async function resolveAttemptId(
+  req: Request,
+  client: any,
+  body: any
+): Promise<{ attemptId: number | null; resolvedBy: string; detail?: any }> {
+  // 0) querystring
+  try {
+    const u = new URL(req.url);
+    const q = u.searchParams.get("attemptId") || u.searchParams.get("attempt_id") || u.searchParams.get("attemptID");
+    const qNum = n(q, null);
+    if (qNum && qNum > 0) return { attemptId: qNum, resolvedBy: "QUERY" };
+  } catch {}
+
+  // 1) body
+  const fromBody =
+    body?.attemptId ??
+    body?.attempt_id ??
+    body?.attemptID ??
+    body?.AttemptId ??
+    body?.AttemptID ??
+    body?.id ??
+    body?.attempt?.id;
+
+  const bodyNum = n(fromBody, null);
+  if (bodyNum && bodyNum > 0) return { attemptId: bodyNum, resolvedBy: "BODY" };
+
+  // 2) cookie attemptId (옵션)
+  const cAttempt = n(getCookie(req, "attemptId") || getCookie(req, "attempt_id"), null);
+  if (cAttempt && cAttempt > 0) return { attemptId: cAttempt, resolvedBy: "COOKIE_ATTEMPTID" };
+
+  // 3) empId 최신 STARTED
+  const empId =
+    s(body?.empId ?? body?.emp_id) ||
+    s(getCookie(req, "empId")) ||
+    s(getCookie(req, "emp_id")) ||
+    "";
+
+  if (empId) {
+    const { data: a, error } = await client
+      .from("exam_attempts")
+      .select("id, emp_id, status, started_at")
+      .eq("emp_id", empId)
+      .eq("status", "STARTED")
+      .order("started_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!error && a?.id) {
+      return { attemptId: Number(a.id), resolvedBy: "EMPID_LATEST_STARTED", detail: { empId } };
+    }
+  }
+
+  return { attemptId: null, resolvedBy: "NONE", detail: { url: req.url, keys: Object.keys(body ?? {}) } };
 }
 
 export async function POST(req: Request) {
+  const { client, error } = getSupabaseAdmin();
+  if (error) {
+    return NextResponse.json({ ok: false, error: "SUPABASE_ADMIN_INIT_FAILED", detail: error }, { status: 500 });
+  }
+
   try {
-    const body = await req.json();
-    const attemptId = Number(body?.attemptId);
-    const answers = body?.answers as Record<string, number> | undefined;
+    const body = await readBody(req);
 
-    if (!attemptId || !answers) {
-      return NextResponse.json({ ok: false, error: "INVALID_PAYLOAD" }, { status: 400 });
-    }
+    const r = await resolveAttemptId(req, client, body);
+    const attemptId = r.attemptId;
 
-    // attempt 조회
-    const { data: attempt, error: aErr } = await supabaseAdmin
-      .from("exam_attempts")
-      .select("id, question_ids")
-      .eq("id", attemptId)
-      .single();
-
-    if (aErr || !attempt) {
+    if (!attemptId) {
       return NextResponse.json(
-        { ok: false, error: "ATTEMPT_NOT_FOUND", detail: aErr?.message },
-        { status: 404 }
+        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { resolvedBy: r.resolvedBy, ...r.detail } },
+        { status: 400 }
       );
     }
 
-    const qids: number[] = attempt.question_ids || [];
-    if (!Array.isArray(qids) || qids.length === 0) {
-      return NextResponse.json({ ok: false, error: "NO_QUESTION_IDS" }, { status: 400 });
+    const items = normalizeAnswers(body);
+    if (items.length === 0) {
+      return NextResponse.json(
+        { ok: false, error: "NO_ANSWERS", detail: { resolvedBy: r.resolvedBy, attemptId } },
+        { status: 400 }
+      );
     }
 
-    // 문제 정답/배점 조회
-    const { data: qs, error: qErr } = await supabaseAdmin
-      .from("questions")
-      .select("id, content, choices, answer_index, points")
-      .in("id", qids);
+    const { data: attempt, error: aErr } = await client
+      .from("exam_attempts")
+      .select("*")
+      .eq("id", attemptId)
+      .maybeSingle();
 
-    if (qErr || !qs) {
+    if (aErr) {
       return NextResponse.json(
-        { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: qErr?.message },
+        { ok: false, error: "ATTEMPT_QUERY_FAILED", detail: String((aErr as any)?.message ?? aErr) },
+        { status: 500 }
+      );
+    }
+    if (!attempt) {
+      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
+    }
+
+    const qids = Array.from(new Set(items.map((x) => x.questionId)));
+    const { data: questions, error: qErr } = await client.from("questions").select("*").in("id", qids);
+
+    if (qErr) {
+      return NextResponse.json(
+        { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String((qErr as any)?.message ?? qErr) },
         { status: 500 }
       );
     }
 
-    // 점수 계산 + 오답 목록
-    let score = 0;
-    const wrongQuestionIds: number[] = [];
+    const qById = new Map<string, any>();
+    for (const q of questions ?? []) qById.set(String(q.id), q);
 
-    for (const q of qs as any[]) {
-      const picked = (answers as any)[String(q.id)];
-      if (typeof picked === "number" && picked === q.answer_index) score += q.points ?? 0;
-      else wrongQuestionIds.push(q.id);
+    let totalPoints = 0;
+    let score = 0;
+    let correctCount = 0;
+    const wrongQuestionIds: string[] = [];
+    const answerMapForAttempt: Record<string, number> = {};
+
+    const rows = items
+      .map((it) => {
+        const q = qById.get(String(it.questionId));
+        if (!q) return null;
+
+        const points = n(q?.points, 0) ?? 0;
+        totalPoints += points;
+
+        const correctIndex = pickCorrectIndex(q);
+        const isCorrect = correctIndex !== null ? Number(it.selectedIndex) === Number(correctIndex) : false;
+
+        if (isCorrect) {
+          correctCount += 1;
+          score += points;
+        } else {
+          wrongQuestionIds.push(String(it.questionId));
+        }
+
+        answerMapForAttempt[String(it.questionId)] = Number(it.selectedIndex);
+
+        return {
+          attempt_id: attemptId,
+          question_id: String(it.questionId),
+          selected_index: Number(it.selectedIndex),
+          is_correct: isCorrect,
+        };
+      })
+      .filter(Boolean) as any[];
+
+    if (rows.length === 0) {
+      return NextResponse.json(
+        { ok: false, error: "NO_VALID_ROWS", detail: { attemptId, qidsCount: qids.length } },
+        { status: 400 }
+      );
     }
 
-    // attempt 업데이트 (응시자 기록은 항상 저장)
-    const { error: uErr } = await supabaseAdmin
+    // 재제출 대비: 기존 삭제 후 insert
+    const { error: delErr } = await client.from("exam_attempt_answers").delete().eq("attempt_id", attemptId);
+    if (delErr) {
+      return NextResponse.json(
+        { ok: false, error: "ANSWERS_DELETE_FAILED", detail: String((delErr as any)?.message ?? delErr) },
+        { status: 500 }
+      );
+    }
+
+    const { error: insErr } = await client.from("exam_attempt_answers").insert(rows);
+    if (insErr) {
+      return NextResponse.json(
+        { ok: false, error: "ANSWERS_INSERT_FAILED", detail: String((insErr as any)?.message ?? insErr) },
+        { status: 500 }
+      );
+    }
+
+    const nowIso = new Date().toISOString();
+    const { error: upErr } = await client
       .from("exam_attempts")
       .update({
-        answers,
+        submitted_at: nowIso,
+        status: "SUBMITTED",
         score,
-        submitted_at: new Date().toISOString(),
-        status: "submitted",
+        correct_count: correctCount,
+        total_points: totalPoints,
+        total_questions: rows.length,
+        answers: answerMapForAttempt, // ✅ fallback용 저장
       })
       .eq("id", attemptId);
 
-    if (uErr) {
+    if (upErr) {
       return NextResponse.json(
-        { ok: false, error: "ATTEMPT_UPDATE_FAILED", detail: uErr.message },
+        { ok: false, error: "ATTEMPT_UPDATE_FAILED", detail: String((upErr as any)?.message ?? upErr) },
         { status: 500 }
       );
     }
 
-    // ✅ 오답 "누적"은 관리자만 (admin=1)일 때만 수행
-    // (지금은 "누적시키지마"가 요구라서, 기본은 아무것도 안 함)
-    if (isAdmin(req)) {
-      // 여기에서만 누적 테이블 insert/update 하도록 만들면 됨.
-      // 지금은 요구대로 "일반 응시자 제출 시 누적 0"이 핵심이라
-      // 누적 로직이 있던 프로젝트라면 그 코드를 이 블록 안으로 옮겨줘.
-    }
-
-    return NextResponse.json({ ok: true, attemptId, score, wrongQuestionIds });
+    return NextResponse.json({
+      ok: true,
+      attemptId,
+      resolvedBy: r.resolvedBy,
+      score,
+      totalPoints,
+      correctCount,
+      wrongQuestionIds,
+      savedAnswers: rows.length,
+      marker: "SUBMIT_OK_SAVED_TO_exam_attempt_answers_AND_exam_attempts.answers",
+    });
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: "SUBMIT_CRASH", message: e?.message ?? String(e) },
+      { ok: false, error: "SUBMIT_FAILED", detail: String(e?.message ?? e) },
       { status: 500 }
     );
   }

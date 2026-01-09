@@ -1,66 +1,40 @@
-"use client";
+// app/admin/page.tsx
 import Link from "next/link";
 
-export default function AdminHome() {
+export default function AdminHomePage() {
+  const menus = [
+    { href: "/admin/questions", label: "시험문항 관리" },
+    { href: "/admin/results", label: "응시현황" },
+    { href: "/admin/accounts", label: "응시자 계정 관리" },
+    // ✅ 오답 누적 메뉴 제거
+    // { href: "/admin/wrong", label: "오답 누적" },
+  ];
+
   return (
-    <div style={{ padding: 40 }}>
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 24 }}>
-        관리자 대시보드
-      </h1>
+    <div style={{ padding: 24, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
+      <h1 style={{ fontSize: 22, fontWeight: 800, marginBottom: 14 }}>관리자 홈</h1>
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
-          gap: 20,
-        }}
-      >
-        <AdminCard
-          title="👤 계정 관리"
-          desc="직원 계정 생성 / 삭제"
-          href="/admin/accounts"
-        />
-
-        <AdminCard
-          title="📝 문제 등록"
-          desc="CSV 업로드 · 문제 관리"
-          href="/admin/questions"
-        />
-
-        <AdminCard
-          title="📊 응시 현황"
-          desc="점수 · 오답 확인 / 다운로드"
-          href="/admin/results"
-        />
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        {menus.map((m) => (
+          <Link
+            key={m.href}
+            href={m.href}
+            style={{
+              padding: "10px 14px",
+              border: "1px solid #e5e7eb",
+              borderRadius: 12,
+              textDecoration: "none",
+              fontWeight: 700,
+              color: "#111827",
+              background: "white",
+            }}
+          >
+            {m.label}
+          </Link>
+        ))}
       </div>
-    </div>
-  );
-}
 
-function AdminCard({
-  title,
-  desc,
-  href,
-}: {
-  title: string;
-  desc: string;
-  href: string;
-}) {
-  return (
-    <Link
-      href={href}
-      style={{
-        border: "1px solid #ddd",
-        borderRadius: 12,
-        padding: 20,
-        textDecoration: "none",
-        color: "#000",
-        background: "#fff",
-        boxShadow: "0 2px 6px rgba(0,0,0,0.05)",
-      }}
-    >
-      <h2 style={{ fontSize: 18, marginBottom: 8 }}>{title}</h2>
-      <p style={{ fontSize: 14, color: "#555" }}>{desc}</p>
-    </Link>
+      <p style={{ marginTop: 12, color: "#6b7280" }}>위 메뉴로 이동해서 관리하세요.</p>
+    </div>
   );
 }

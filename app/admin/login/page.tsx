@@ -1,143 +1,97 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-
-function hasCookie(key: string) {
-  if (typeof document === "undefined") return false;
-  return document.cookie
-    .split(";")
-    .some((c) => c.trim().startsWith(key + "="));
-}
+import { useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 
 export default function LoginPage() {
-  const router = useRouter();
-  const [userId, setUserId] = useState("");
+  const sp = useSearchParams();
+
+  const nextPath = useMemo(() => {
+    const n = sp?.get("next");
+    if (!n) return "/exam";
+    if (!n.startsWith("/")) return "/exam";
+    if (n.startsWith("//")) return "/exam";
+    return n;
+  }, [sp]);
+
+  const err = sp?.get("err") || "";
+
+  const [loginId, setLoginId] = useState("");
   const [password, setPassword] = useState("");
-  const [msg, setMsg] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  async function onLogin() {
-    setLoading(true);
-    setMsg(null);
-
-    try {
-      const res = await fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ userId, password }),
-      });
-
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json?.error || "로그인 실패");
-
-      // 쿠키 반영 대기
-      await new Promise((r) => setTimeout(r, 100));
-
-      const okUserId = hasCookie("user_id");
-      const okUserUuid = hasCookie("user_uuid");
-
-      if (!okUserId) {
-        throw new Error(
-          "로그인 성공했지만 user_id 쿠키가 저장되지 않았습니다.\n" +
-          "→ Network 탭에서 login 응답의 Set-Cookie를 확인하세요."
-        );
-      }
-
-      if (json?.role !== "admin" && !okUserUuid) {
-        throw new Error(
-          "로그인 성공했지만 user_uuid 쿠키가 없습니다.\n" +
-          "→ accounts.id(UUID) 컬럼을 확인하세요."
-        );
-      }
-
-      if (json?.role === "admin") router.push("/admin");
-      else router.push("/exam");
-    } catch (e: any) {
-      setMsg(e?.message || "오류 발생");
-    } finally {
-      setLoading(false);
-    }
-  }
 
   return (
-    <div style={{ maxWidth: 420, margin: "0 auto", padding: 24 }}>
-      <h1 style={{ fontSize: 20, fontWeight: 900, marginBottom: 14 }}>
-        로그인
-      </h1>
+    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
+      <div style={{ width: 360, border: "1px solid #e5e7eb", borderRadius: 14, padding: 18 }}>
+        <h1 style={{ margin: 0, fontSize: 22, fontWeight: 800 }}>로그인</h1>
 
-      {msg && (
-        <div
-          style={{
-            color: "crimson",
-            marginBottom: 10,
-            whiteSpace: "pre-wrap",
-          }}
+        {err && (
+          <div style={{ marginTop: 10, fontSize: 12, color: "#b91c1c" }}>
+            {err === "invalid" ? "아이디 또는 비밀번호가 올바르지 않습니다." :
+             err === "required" ? "아이디/비밀번호를 입력해 주세요." :
+             err === "db" ? "서버 오류가 발생했습니다. 잠시 후 다시 시도해 주세요." :
+             "로그인에 실패했습니다."}
+          </div>
+        )}
+
+        {/* ✅ fetch 없이 브라우저가 직접 POST */}
+        <form
+          method="POST"
+          action={`/api/auth/login?redirect=1&next=${encodeURIComponent(nextPath)}`}
+          style={{ marginTop: 14, display: "grid", gap: 10 }}
         >
-          {msg}
-        </div>
-      )}
+          <div>
+            <div style={labelStyle}>아이디(emp_id)</div>
+            <input
+              name="loginId"
+              value={loginId}
+              onChange={(e) => setLoginId(e.target.value)}
+              placeholder="예: 1001"
+              style={inputStyle}
+              autoComplete="username"
+            />
+          </div>
 
-      <div style={{ display: "grid", gap: 10 }}>
-        <input
-          placeholder="아이디"
-          value={userId}
-          onChange={(e) => setUserId(e.target.value)}
-          style={input}
-        />
-        <input
-          placeholder="비밀번호"
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          style={input}
-        />
+          <div>
+            <div style={labelStyle}>비밀번호</div>
+            <input
+              name="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="비밀번호"
+              style={inputStyle}
+              type="password"
+              autoComplete="current-password"
+            />
+          </div>
 
-        <button onClick={onLogin} disabled={loading} style={btn}>
-          {loading ? "로그인 중..." : "로그인"}
-        </button>
-
-        <button
-          type="button"
-          style={btn2}
-          onClick={() =>
-            alert(
-              `document.cookie:\n\n${document.cookie || "(쿠키 없음)"}`
-            )
-          }
-        >
-          (디버그) document.cookie 보기
-        </button>
+          <button type="submit" style={btnStyle}>
+            로그인
+          </button>
+        </form>
       </div>
     </div>
   );
 }
 
-const input: React.CSSProperties = {
-  padding: "12px 12px",
-  borderRadius: 12,
+const labelStyle: React.CSSProperties = {
+  fontSize: 12,
+  opacity: 0.8,
+  marginBottom: 6,
+};
+
+const inputStyle: React.CSSProperties = {
+  width: "100%",
+  padding: "10px 12px",
   border: "1px solid #e5e7eb",
+  borderRadius: 10,
   outline: "none",
-  fontSize: 14,
 };
 
-const btn: React.CSSProperties = {
-  padding: "12px 12px",
-  borderRadius: 12,
-  border: "1px solid #111",
-  background: "#111",
-  color: "#fff",
-  fontWeight: 900,
-  cursor: "pointer",
-};
-
-const btn2: React.CSSProperties = {
-  padding: "12px 12px",
-  borderRadius: 12,
-  border: "1px solid #111",
-  background: "#fff",
-  color: "#111",
-  fontWeight: 900,
+const btnStyle: React.CSSProperties = {
+  padding: "10px 12px",
+  borderRadius: 10,
+  border: "1px solid #111827",
+  background: "#111827",
+  color: "white",
   cursor: "pointer",
 };

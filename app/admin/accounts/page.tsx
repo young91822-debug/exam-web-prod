@@ -1,74 +1,40 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-type Row = {
-  id: string;
-  user_id: string;
-  password: string;
+type Account = {
+  id: number;
+  emp_id: string;
+  name: string | null;
+  is_active: boolean;
   created_at: string;
 };
 
 export default function AdminAccountsPage() {
-  const [userId, setUserId] = useState("");
-  const [password, setPassword] = useState("");
-  const [rows, setRows] = useState<Row[]>([]);
-  const [msg, setMsg] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [rows, setRows] = useState<Account[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+  const [okMsg, setOkMsg] = useState<string | null>(null);
+
+  // form
+  const [empId, setEmpId] = useState("");
+  const [name, setName] = useState("");
+  const [isActive, setIsActive] = useState(true);
+
+  const canCreate = useMemo(() => empId.trim().length > 0, [empId]);
 
   async function load() {
     setLoading(true);
-    setMsg(null);
+    setErr(null);
     try {
-      const res = await fetch("/api/admin/accounts", { credentials: "include" });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json?.error || "조회 실패");
-      setRows(json?.data || []);
+      const res = await fetch("/api/admin/accounts", { method: "GET" });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j?.ok) {
+        throw new Error(j?.detail || j?.error || `LOAD_FAILED (${res.status})`);
+      }
+      setRows(j.rows || []);
     } catch (e: any) {
-      setRows([]);
-      setMsg(e?.message || "오류");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function createAccount() {
-    setLoading(true);
-    setMsg(null);
-    try {
-      const res = await fetch("/api/admin/accounts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ userId, password }),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json?.error || "생성 실패");
-
-      setUserId("");
-      setPassword("");
-      await load();
-    } catch (e: any) {
-      setMsg(e?.message || "오류");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function remove(id: string) {
-    if (!confirm("삭제할까?")) return;
-    setLoading(true);
-    setMsg(null);
-    try {
-      const res = await fetch(`/api/admin/accounts?id=${encodeURIComponent(id)}`, {
-        method: "DELETE",
-        credentials: "include",
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json?.error || "삭제 실패");
-      await load();
-    } catch (e: any) {
-      setMsg(e?.message || "오류");
+      setErr(String(e?.message || e));
     } finally {
       setLoading(false);
     }
@@ -78,109 +44,212 @@ export default function AdminAccountsPage() {
     load();
   }, []);
 
+  async function onCreate() {
+    setErr(null);
+    setOkMsg(null);
+
+    const payload = {
+      empId: empId.trim(),
+      name: name.trim() || null,
+      isActive,
+    };
+
+    try {
+      const res = await fetch("/api/admin/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // ✅ 버튼 눌렀는데 “반응이 없다” 방지: body 반드시 넣기
+        body: JSON.stringify(payload),
+      });
+
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j?.ok) {
+        throw new Error(j?.detail || j?.error || `CREATE_FAILED (${res.status})`);
+      }
+
+      setOkMsg(`생성 완료: ${j.emp_id}`);
+      setEmpId("");
+      setName("");
+      setIsActive(true);
+
+      await load();
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    }
+  }
+
+  async function onToggle(row: Account) {
+    setErr(null);
+    setOkMsg(null);
+
+    try {
+      const res = await fetch("/api/admin/accounts", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: row.id, isActive: !row.is_active }),
+      });
+
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j?.ok) {
+        throw new Error(j?.detail || j?.error || `UPDATE_FAILED (${res.status})`);
+      }
+      setOkMsg(`변경 완료: ${row.emp_id}`);
+      await load();
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    }
+  }
+
   return (
-    <div style={{ padding: 24 }}>
-      <h1 style={{ fontSize: 20, fontWeight: 900, marginBottom: 12 }}>계정관리</h1>
+    <div style={{ padding: 24, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
+      <h1 style={{ fontSize: 20, fontWeight: 800, marginBottom: 12 }}>응시자 계정 관리</h1>
 
-      {msg && <div style={{ color: "crimson", marginBottom: 10, whiteSpace: "pre-wrap" }}>{msg}</div>}
+      {/* 메시지 */}
+      {err && (
+        <div style={{ marginBottom: 12, padding: 10, border: "1px solid #fecaca", background: "#fff1f2", borderRadius: 12 }}>
+          <b>에러</b>: {err}
+        </div>
+      )}
+      {okMsg && (
+        <div style={{ marginBottom: 12, padding: 10, border: "1px solid #bbf7d0", background: "#f0fdf4", borderRadius: 12 }}>
+          {okMsg}
+        </div>
+      )}
 
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12 }}>
-        <input placeholder="아이디" value={userId} onChange={(e) => setUserId(e.target.value)} style={input} />
-        <input placeholder="비밀번호" value={password} onChange={(e) => setPassword(e.target.value)} style={input} />
-        <button onClick={createAccount} disabled={loading} style={btn}>
-          계정 생성
-        </button>
-        <button onClick={load} disabled={loading} style={btn2}>
-          새로고침
-        </button>
+      {/* 생성 폼 */}
+      <div style={{ border: "1px solid #e5e7eb", borderRadius: 14, padding: 14, marginBottom: 14 }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ fontSize: 12, color: "#6b7280" }}>응시자ID(emp_id) *</label>
+            <input
+              value={empId}
+              onChange={(e) => setEmpId(e.target.value)}
+              placeholder="예: 201978"
+              style={{ width: 220, padding: "10px 12px", borderRadius: 12, border: "1px solid #e5e7eb" }}
+            />
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ fontSize: 12, color: "#6b7280" }}>이름(선택)</label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="예: 홍길동"
+              style={{ width: 220, padding: "10px 12px", borderRadius: 12, border: "1px solid #e5e7eb" }}
+            />
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={{ fontSize: 12, color: "#6b7280" }}>사용 여부</label>
+            <select
+              value={isActive ? "Y" : "N"}
+              onChange={(e) => setIsActive(e.target.value === "Y")}
+              style={{ width: 160, padding: "10px 12px", borderRadius: 12, border: "1px solid #e5e7eb" }}
+            >
+              <option value="Y">사용</option>
+              <option value="N">미사용</option>
+            </select>
+          </div>
+
+          {/* ✅ submit 이슈 방지: type="button" */}
+          <button
+            type="button"
+            onClick={onCreate}
+            disabled={!canCreate}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid #111827",
+              background: canCreate ? "#111827" : "#9ca3af",
+              color: "white",
+              fontWeight: 800,
+              cursor: canCreate ? "pointer" : "not-allowed",
+            }}
+          >
+            생성
+          </button>
+
+          <button
+            type="button"
+            onClick={load}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid #e5e7eb",
+              background: "white",
+              fontWeight: 800,
+              cursor: "pointer",
+            }}
+          >
+            새로고침
+          </button>
+        </div>
+
+        <div style={{ marginTop: 8, color: "#6b7280", fontSize: 12 }}>
+          * “생성” 눌렀는데 아무 반응 없으면: 브라우저 개발자도구 → Network에서 <b>/api/admin/accounts</b> POST가 찍히는지 확인
+        </div>
       </div>
 
-      means: 총 {rows.length}건
+      {/* 목록 */}
+      <div style={{ border: "1px solid #e5e7eb", borderRadius: 14, overflow: "hidden" }}>
+        <div style={{ padding: 12, borderBottom: "1px solid #e5e7eb", display: "flex", justifyContent: "space-between" }}>
+          <div style={{ fontWeight: 800 }}>
+            목록 {loading ? "(로딩중...)" : `(${rows.length}건)`}
+          </div>
+        </div>
 
-      <div style={{ marginTop: 10, border: "1px solid #eee", borderRadius: 12, overflow: "hidden" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ background: "#fafafa" }}>
-              <th style={th}>아이디</th>
-              <th style={th}>비밀번호</th>
-              <th style={th}>생성일</th>
-              <th style={th}>삭제</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 ? (
-              <tr>
-                <td colSpan={4} style={{ padding: 16, color: "#666" }}>
-                  계정이 없어. 위에서 생성해줘.
-                </td>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ background: "#f9fafb", textAlign: "left" }}>
+                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>ID</th>
+                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>emp_id</th>
+                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>이름</th>
+                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>사용</th>
+                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>생성일</th>
+                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>관리</th>
               </tr>
-            ) : (
-              rows.map((r) => (
-                <tr key={r.id} style={{ borderTop: "1px solid #eee" }}>
-                  <td style={td}>{r.user_id}</td>
-                  <td style={td}>{r.password}</td>
-                  <td style={td}>{r.created_at ? new Date(r.created_at).toLocaleString() : "-"}</td>
-                  <td style={td}>
-                    <button onClick={() => remove(r.id)} disabled={loading} style={danger}>
-                      삭제
+            </thead>
+            <tbody>
+              {!loading && rows.length === 0 && (
+                <tr>
+                  <td colSpan={6} style={{ padding: 14, color: "#6b7280" }}>
+                    아직 계정이 없습니다.
+                  </td>
+                </tr>
+              )}
+
+              {rows.map((r) => (
+                <tr key={r.id}>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>{r.id}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6", fontWeight: 800 }}>{r.emp_id}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>{r.name || "-"}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>{r.is_active ? "사용" : "미사용"}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>
+                    {new Date(r.created_at).toLocaleString()}
+                  </td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>
+                    <button
+                      type="button"
+                      onClick={() => onToggle(r)}
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: 10,
+                        border: "1px solid #e5e7eb",
+                        background: "white",
+                        fontWeight: 800,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {r.is_active ? "미사용으로" : "사용으로"}
                     </button>
                   </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
 }
-
-const input: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 12,
-  border: "1px solid #e5e7eb",
-  outline: "none",
-  width: 240,
-};
-
-const btn: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 12,
-  border: "1px solid #111",
-  background: "#111",
-  color: "#fff",
-  fontWeight: 900,
-  cursor: "pointer",
-};
-
-const btn2: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 12,
-  border: "1px solid #111",
-  background: "#fff",
-  color: "#111",
-  fontWeight: 900,
-  cursor: "pointer",
-};
-
-const th: React.CSSProperties = {
-  textAlign: "left",
-  padding: 12,
-  fontSize: 13,
-  color: "#333",
-};
-
-const td: React.CSSProperties = {
-  padding: 12,
-  fontSize: 13,
-};
-
-const danger: React.CSSProperties = {
-  padding: "8px 10px",
-  borderRadius: 10,
-  border: "1px solid #b91c1c",
-  background: "#b91c1c",
-  color: "#fff",
-  fontWeight: 900,
-  cursor: "pointer",
-};

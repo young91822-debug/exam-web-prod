@@ -1,112 +1,135 @@
 // app/api/result/[attemptId]/route.ts
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
-export async function GET(req: Request, ctx: any) {
+export const dynamic = "force-dynamic";
+
+function n(v: any, d: number | null = null) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
+}
+function s(v: any) {
+  return String(v ?? "").trim();
+}
+
+function pickCorrectIndex(q: any): number | null {
+  const cands = [
+    q?.correct_index,
+    q?.correctIndex,
+    q?.answer_index,
+    q?.answerIndex,
+    q?.correct_answer,
+    q?.correctAnswer,
+    q?.answer,
+  ];
+  for (const v of cands) {
+    if (v === undefined || v === null || v === "") continue;
+    const num = Number(v);
+    if (Number.isFinite(num)) return num;
+  }
+  return null;
+}
+
+function pickChoices(q: any): string[] {
+  const c = q?.choices ?? q?.options ?? q?.choice_list ?? q?.choiceList ?? [];
+  if (Array.isArray(c)) return c.map((x) => String(x ?? ""));
+  if (typeof c === "string") {
+    try {
+      const parsed = JSON.parse(c);
+      if (Array.isArray(parsed)) return parsed.map((x) => String(x ?? ""));
+    } catch {}
+    if (c.includes("|")) return c.split("|").map((x) => x.trim());
+    if (c.includes(",")) return c.split(",").map((x) => x.trim());
+    return [c];
+  }
+  return [];
+}
+
+export async function GET(_req: Request, { params }: { params: { attemptId: string } }) {
   try {
-    const p = await Promise.resolve(ctx?.params);
-    const attemptId = Number(p?.attemptId);
-
+    const attemptId = n(params?.attemptId, null);
     if (!attemptId) {
-      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID", raw: p }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
-    // 1) attempt 조회
+    // attempt
     const { data: attempt, error: aErr } = await supabaseAdmin
       .from("exam_attempts")
-      .select("id, emp_id, question_ids, total_questions, answers, score, submitted_at, status")
+      .select("*")
       .eq("id", attemptId)
-      .single();
+      .maybeSingle();
 
-    if (aErr || !attempt) {
-      return NextResponse.json(
-        { ok: false, error: "ATTEMPT_NOT_FOUND", detail: aErr?.message ?? "no attempt" },
-        { status: 404 }
-      );
+    if (aErr) {
+      return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: aErr }, { status: 500 });
+    }
+    if (!attempt) {
+      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
     }
 
-    const qids: number[] = Array.isArray(attempt.question_ids) ? attempt.question_ids.map((x: any) => Number(x)) : [];
-    const totalQuestions = qids.length;
+    // answers (내 선택)
+    const { data: ansRows, error: ansErr } = await supabaseAdmin
+      .from("exam_attempt_answers")
+      .select("question_id, selected_index")
+      .eq("attempt_id", attemptId);
 
-    // 🔥 여기서 0이면: start가 question_ids를 저장 못한 거야.
-    if (totalQuestions === 0) {
-      return NextResponse.json({
-        ok: true,
-        attemptId,
-        score: Number(attempt.score ?? 0),
-        totalQuestions: 0,
-        totalPoints: 100,
-        wrongCount: 0,
-        wrongQuestions: [],
-        debug: {
-          message: "question_ids is empty on this attempt. /api/exam/start is not saving question_ids.",
-          attempt: {
-            id: attempt.id,
-            emp_id: attempt.emp_id,
-            total_questions: attempt.total_questions,
-            status: attempt.status,
-            submitted_at: attempt.submitted_at,
-            has_answers: !!attempt.answers,
-          },
-        },
-      });
+    if (ansErr) {
+      return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: ansErr }, { status: 500 });
     }
 
-    // 2) 문제 조회
-    const { data: qs, error: qErr } = await supabaseAdmin
+    const selectedByQid = new Map<string, number>();
+    for (const r of ansRows ?? []) {
+      const qid = s((r as any)?.question_id);
+      const idx = n((r as any)?.selected_index, null);
+      if (qid && idx !== null) selectedByQid.set(qid, idx);
+    }
+
+    // questionIds: attempt.answers.questionIds 우선, 없으면 답안 qid
+    let questionIds: string[] = [];
+    const a = attempt?.answers;
+
+    if (a && typeof a === "object" && Array.isArray(a?.questionIds)) {
+      questionIds = a.questionIds.map((x: any) => s(x)).filter(Boolean);
+    } else {
+      questionIds = Array.from(selectedByQid.keys());
+    }
+
+    // questions
+    const { data: questions, error: qErr } = await supabaseAdmin
       .from("questions")
-      .select("id, content, choices, points, answer_index")
-      .in("id", qids);
+      .select("*")
+      .in("id", questionIds);
 
-    if (qErr || !qs) {
-      return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: qErr?.message }, { status: 500 });
+    if (qErr) {
+      return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: qErr }, { status: 500 });
     }
 
-    // 3) 점수/오답 계산(answers 없으면 score만 보여주고 오답은 비움)
-    const answers: Record<string, number> | null = attempt.answers ?? null;
+    const qById = new Map<string, any>();
+    for (const q of questions ?? []) qById.set(String((q as any).id), q);
 
-    // 총점(원래 배점 합) -> 화면은 100 고정이라 score만 보여주되,
-    // 필요하면 여기서 totalRawPoints로도 쓸 수 있음
-    let score = Number(attempt.score ?? 0);
+    const graded = questionIds.map((qid) => {
+      const q = qById.get(String(qid)) ?? {};
+      const selectedIndex = selectedByQid.has(String(qid)) ? selectedByQid.get(String(qid))! : null;
+      const correctIndex = pickCorrectIndex(q);
 
-    const wrongQuestions: any[] = [];
-    if (answers) {
-      // score가 DB에 없거나 0인 경우를 대비해서 재계산도 가능
-      let computed = 0;
+      const status = selectedIndex == null ? "unsubmitted" : "submitted";
+      const isCorrect = status === "submitted" && correctIndex != null ? selectedIndex === correctIndex : false;
 
-      for (const q of qs as any[]) {
-        const picked = answers[String(q.id)];
-        const correct = Number(q.answer_index);
-        const pts = Number(q.points ?? 0);
-
-        if (typeof picked === "number" && picked === correct) {
-          computed += pts;
-        } else {
-          wrongQuestions.push({
-            id: Number(q.id),
-            content: String(q.content ?? ""),
-            choices: Array.isArray(q.choices) ? q.choices : [],
-            points: pts,
-            answer_index: correct,
-            picked_index: typeof picked === "number" ? picked : null,
-          });
-        }
-      }
-
-      // DB score가 비었거나(0)인데 computed가 있으면 computed를 사용
-      if (!attempt.score && computed > 0) score = computed;
-    }
-
-    return NextResponse.json({
-      ok: true,
-      attemptId,
-      score,
-      totalQuestions,
-      totalPoints: 100, // ✅ 화면은 100점 만점 고정
-      wrongCount: wrongQuestions.length,
-      wrongQuestions,
+      return {
+        questionId: q?.id ?? qid,
+        content: q?.content ?? "",
+        choices: pickChoices(q),
+        selectedIndex,
+        correctIndex,
+        status,
+        isCorrect,
+      };
     });
+
+    return NextResponse.json({ ok: true, attempt, graded, totalQuestions: graded.length });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: "RESULT_CRASH", message: e?.message ?? String(e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "RESULT_API_UNHANDLED", detail: String(e?.message ?? e) },
+      { status: 500 }
+    );
   }
 }

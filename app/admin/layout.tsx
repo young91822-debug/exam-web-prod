@@ -1,60 +1,29 @@
 // app/admin/layout.tsx
-"use client";
+import type { ReactNode } from "react";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
 
-import { usePathname, useRouter } from "next/navigation";
-import { ReactNode } from "react";
+export default async function AdminLayout({
+  children,
+}: {
+  children: ReactNode;
+}) {
+  // ✅ Next 16+에서는 cookies()가 Promise로 올 수 있어서 await 필요
+  const c = await cookies();
 
-export default function AdminLayout({ children }: { children: ReactNode }) {
-  const router = useRouter();
-  const pathname = usePathname();
+  const empId = c.get("empId")?.value || c.get("emp_id")?.value || "";
+  const role = c.get("role")?.value || "";
 
-  const pill = (active: boolean): React.CSSProperties => ({
-    padding: "6px 12px",
-    borderRadius: 999,
-    border: "1px solid #ddd",
-    background: active ? "#000" : "#fff",
-    color: active ? "#fff" : "#111",
-    cursor: "pointer",
-    fontSize: 13,
-  });
+  // ✅ 관리자 접근 제한 (원하면 조건 바꿔도 됨)
+  // - empId 없으면 로그인으로
+  if (!empId) redirect("/login");
 
-  const isActive = (href: string) => pathname === href || pathname?.startsWith(href + "/");
+  // - role 체크를 쓸 거면 아래처럼 (role을 안쓰면 이 블록 삭제)
+  // if (role !== "admin") redirect("/login");
 
   return (
-    <div style={{ minHeight: "100vh", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
-      <div style={{ borderBottom: "1px solid #eee", background: "#fff" }}>
-        <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 24px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ fontWeight: 900 }}>관리자</div>
-
-            <button style={pill(isActive("/admin/accounts"))} onClick={() => router.push("/admin/accounts")}>
-              계정관리
-            </button>
-            <button style={pill(isActive("/admin/questions"))} onClick={() => router.push("/admin/questions")}>
-              문제등록
-            </button>
-            <button style={pill(isActive("/admin/results"))} onClick={() => router.push("/admin/results")}>
-              응시현황
-            </button>
-          </div>
-
-          <button
-            style={{
-              padding: "6px 12px",
-              borderRadius: 999,
-              border: "1px solid #000",
-              background: "#fff",
-              cursor: "pointer",
-              fontSize: 13,
-            }}
-            onClick={() => router.push("/exam")}
-          >
-            응시페이지로
-          </button>
-        </div>
-      </div>
-
-      <div style={{ maxWidth: 1100, margin: "0 auto", padding: 24 }}>{children}</div>
+    <div style={{ minHeight: "100vh" }}>
+      {children}
     </div>
   );
 }
