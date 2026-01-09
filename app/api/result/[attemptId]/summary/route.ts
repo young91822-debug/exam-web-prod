@@ -1,13 +1,29 @@
-import { NextResponse } from "next/server";
+// app/api/result/[attemptId]/summary/route.ts
+import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../../../lib/supabaseAdmin";
 
+export const dynamic = "force-dynamic";
+
+function s(v: any) {
+  return String(v ?? "").trim();
+}
+function toInt(v: any) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : NaN;
+}
+
 export async function GET(
-  req: Request,
-  { params }: { params: { attemptId: string } }
+  _req: NextRequest,
+  context: { params: Promise<{ attemptId: string }> }
 ) {
-  const attemptId = Number(params.attemptId);
-  if (!attemptId) {
-    return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
+  const { attemptId: raw } = await context.params;
+  const attemptId = toInt(s(raw));
+
+  if (!Number.isFinite(attemptId) || attemptId <= 0) {
+    return NextResponse.json(
+      { ok: false, error: "INVALID_ATTEMPT_ID" },
+      { status: 400 }
+    );
   }
 
   try {
@@ -19,11 +35,15 @@ export async function GET(
       .single();
 
     if (attemptErr || !attempt) {
-      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
+      return NextResponse.json(
+        { ok: false, error: "ATTEMPT_NOT_FOUND" },
+        { status: 404 }
+      );
     }
 
     // 2) 1차: wrong_questions 테이블에서 조회(가장 안정적)
     let wrongQuestionIds: (number | string)[] = [];
+
     const wq = await supabaseAdmin
       .from("wrong_questions")
       .select("question_id")

@@ -1,44 +1,54 @@
-// app/api/admin/questions/detail/route.ts
+// app/api/admin/questions/delete/route.ts
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "../../../../../lib/supabaseAdmin";
+import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
 
-// ✅ 405 방지: preflight/프록시가 OPTIONS로 찌르는 경우도 대응
-export async function OPTIONS() {
-  return NextResponse.json({ ok: true });
-}
+// ✅ TS 타입 폭발 방지: 이 파일에서만 any로 끊기
+const sb: any = supabaseAdmin;
 
-export async function GET(req: Request) {
+export async function POST(req: Request) {
   try {
-    const url = new URL(req.url);
-    const id = url.searchParams.get("id");
+    const body = await req.json().catch(() => ({}));
+    const { id } = body;
 
-    if (!id) {
-      return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
+    console.log("🔥 DELETE API id =", id);
+
+    // ✅ 방어
+    if (!id || typeof id !== "string") {
+      return NextResponse.json(
+        { ok: false, error: "INVALID_ID", received: id },
+        { status: 400 }
+      );
     }
 
-    const { data, error } = await supabaseAdmin
+    // ✅ 삭제 (원래 로직 유지)
+    // - 타입 추론이 여기서 폭발하므로 sb(any) 사용
+    const { error, count } = await sb
       .from("questions")
-      .select("*")
-      .eq("id" as any, id as any)
-      .maybeSingle();
+      .delete({ count: "exact" })
+      .eq("id", id);
+
+    console.log("🔥 DELETE count =", count);
 
     if (error) {
       return NextResponse.json(
-        { ok: false, error: "DETAIL_FAILED", detail: error.message },
+        { ok: false, error: String(error.message || error) },
         { status: 500 }
       );
     }
 
-    if (!data) {
-      return NextResponse.json({ ok: false, error: "NOT_FOUND" }, { status: 404 });
+    if (count === 0) {
+      return NextResponse.json(
+        { ok: false, error: "NOT_FOUND" },
+        { status: 404 }
+      );
     }
 
-    return NextResponse.json({ ok: true, item: data });
+    return NextResponse.json({ ok: true });
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: "DETAIL_FAILED", detail: String(e?.message ?? e) },
+      { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
       { status: 500 }
     );
   }

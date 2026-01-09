@@ -6,6 +6,9 @@ export const dynamic = "force-dynamic";
 
 const BATCH = 500;
 
+// ✅ TS 타입 폭발(무한 추론) 방지용: 이 파일에서만 any로 끊어줌
+const sb: any = supabaseAdmin;
+
 // 질문을 참조하는 컬럼명이 프로젝트마다 달라서 후보를 넉넉히 둠
 const QUESTION_FK_COL_CANDIDATES = [
   "question_id",
@@ -20,7 +23,7 @@ const QUESTION_FK_COL_CANDIDATES = [
 
 async function tableExists(table: string) {
   // head + count로 존재 여부만 가볍게 체크
-  const { error } = await supabaseAdmin.from(table).select("*", { head: true, count: "exact" }).limit(1);
+  const { error } = await sb.from(table).select("*", { head: true, count: "exact" }).limit(1);
   if (!error) return true;
 
   const msg = String(error.message || "").toLowerCase();
@@ -37,7 +40,8 @@ async function deleteByQuestionIds(table: string, ids: any[]) {
 
   // FK 컬럼 후보들로 하나씩 시도
   for (const col of QUESTION_FK_COL_CANDIDATES) {
-    const { error } = await supabaseAdmin.from(table).delete().in(col as any, ids as any);
+    // ✅ 여기서 TS 무한 타입 추론이 터지므로 sb(any)로 호출
+    const { error } = await sb.from(table).delete().in(col, ids);
 
     if (!error) return { table, ok: true, by: col };
 
@@ -61,7 +65,7 @@ export async function POST() {
     //    PostgREST는 DELETE requires WHERE라서, 반드시 in(id, [...]) 방식으로 지워야 함.
 
     // ✅ 먼저 questions 테이블에서 id 컬럼 조회가 되는지 확인
-    const test = await supabaseAdmin.from("questions").select("id").limit(1);
+    const test = await sb.from("questions").select("id").limit(1);
     if (test.error) {
       return NextResponse.json(
         { ok: false, error: "CLEAR_FAILED", detail: String(test.error.message || test.error) },
@@ -70,7 +74,7 @@ export async function POST() {
     }
 
     const childTables = [
-      "attempt_answers",         // 네 로그에 실제로 존재
+      "attempt_answers", // 네 로그에 실제로 존재
       "exam_attempt_answers",
       "attempt_questions",
       "exam_attempt_questions",
@@ -88,19 +92,26 @@ export async function POST() {
     let offset = 0;
 
     while (true) {
-      const { data: rows, error: selErr } = await supabaseAdmin
+      const { data: rows, error: selErr } = await sb
         .from("questions")
         .select("id")
         .range(offset, offset + BATCH - 1);
 
       if (selErr) {
         return NextResponse.json(
-          { ok: false, error: "CLEAR_FAILED", detail: `SELECT questions failed: ${String(selErr.message || selErr)}` },
+          {
+            ok: false,
+            error: "CLEAR_FAILED",
+            detail: `SELECT questions failed: ${String(selErr.message || selErr)}`,
+          },
           { status: 500 }
         );
       }
 
-      const ids = (rows || []).map((r: any) => r.id).filter((v: any) => v !== null && v !== undefined);
+      const ids = (rows || [])
+        .map((r: any) => r.id)
+        .filter((v: any) => v !== null && v !== undefined);
+
       if (ids.length === 0) break;
 
       // 2) FK 하위테이블 먼저 지우기 (가능한 것만 best-effort)
@@ -110,7 +121,9 @@ export async function POST() {
       }
 
       // 3) questions 삭제 (반드시 WHERE)
-      const { error: delErr } = await supabaseAdmin.from("questions").delete().in("id" as any, ids as any);
+      // ✅ 여기서도 동일하게 sb(any) 사용
+      const { error: delErr } = await sb.from("questions").delete().in("id", ids);
+
       if (delErr) {
         return NextResponse.json(
           {

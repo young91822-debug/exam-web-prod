@@ -6,6 +6,9 @@ export const dynamic = "force-dynamic";
 
 const TABLE = "questions";
 
+// ✅ TS 타입 폭발 방지: 이 파일에서만 any로 끊기
+const sb: any = supabaseAdmin;
+
 function s(v: any) {
   return String(v ?? "").trim();
 }
@@ -14,6 +17,7 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const id = s(body?.id);
+
     if (!id) {
       return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
     }
@@ -36,16 +40,17 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "EMPTY_PATCH" }, { status: 400 });
     }
 
-    const { data, error } = await supabaseAdmin
+    // ✅ 업데이트 (로직 유지, 타입추론은 sb(any)로 차단)
+    const { data, error } = await sb
       .from(TABLE)
       .update(patch)
-      .eq("id" as any, id as any)
+      .eq("id", id)
       .select("*")
       .maybeSingle();
 
     if (error) {
       return NextResponse.json(
-        { ok: false, error: "UPDATE_FAILED", detail: error.message, patch },
+        { ok: false, error: "UPDATE_FAILED", detail: String(error.message || error), patch },
         { status: 500 }
       );
     }
