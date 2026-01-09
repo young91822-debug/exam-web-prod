@@ -14,12 +14,13 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
+  // ✅ 로그인 API에서 실제로 쓰는 쿠키 기준
   const empId = req.cookies.get("empId")?.value || "";
-  const isAdmin = req.cookies.get("isAdmin")?.value === "1";
+  const role = req.cookies.get("role")?.value || "";
 
   // ✅ 관리자만
   if (pathname.startsWith("/admin")) {
-    if (!empId || !isAdmin) {
+    if (!empId || role !== "admin") {
       const url = req.nextUrl.clone();
       url.pathname = "/login";
       url.searchParams.set("next", pathname);
