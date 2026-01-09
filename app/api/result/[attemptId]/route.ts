@@ -46,6 +46,7 @@ function pickChoices(q: any): string[] {
   return [];
 }
 
+// ✅ Next 16.1.1(Turbopack)에서 context.params는 Promise로 옴
 export async function GET(
   _req: NextRequest,
   context: { params: Promise<{ attemptId: string }> }
@@ -57,63 +58,4 @@ export async function GET(
     return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
   }
 
-  const { data: attempt } = await supabaseAdmin
-    .from("exam_attempts")
-    .select("*")
-    .eq("id", attemptId)
-    .maybeSingle();
-
-  if (!attempt) {
-    return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
-  }
-
-  const { data: answers } = await supabaseAdmin
-    .from("exam_attempt_answers")
-    .select("question_id, selected_index")
-    .eq("attempt_id", attemptId);
-
-  const selectedByQid = new Map<string, number>();
-  for (const r of answers ?? []) {
-    const qid = s((r as any)?.question_id);
-    const idx = n((r as any)?.selected_index, null);
-    if (qid && idx !== null) selectedByQid.set(qid, idx);
-  }
-
-  const questionIds = Array.from(selectedByQid.keys());
-
-  const { data: questions } = await supabaseAdmin
-    .from("questions")
-    .select("*")
-    .in("id", questionIds);
-
-  const qById = new Map<string, any>();
-  for (const q of questions ?? []) qById.set(String(q.id), q);
-
-  const graded = questionIds.map((qid) => {
-    const q = qById.get(qid) ?? {};
-    const selectedIndex = selectedByQid.get(qid) ?? null;
-    const correctIndex = pickCorrectIndex(q);
-
-    const status = selectedIndex == null ? "unsubmitted" : "submitted";
-    const isCorrect = status === "submitted" && correctIndex != null
-      ? selectedIndex === correctIndex
-      : false;
-
-    return {
-      questionId: qid,
-      content: q?.content ?? "",
-      choices: pickChoices(q),
-      selectedIndex,
-      correctIndex,
-      status,
-      isCorrect,
-    };
-  });
-
-  return NextResponse.json({
-    ok: true,
-    attempt,
-    graded,
-    totalQuestions: graded.length,
-  });
-}
+  const { data: attempt, error: aErr } =
