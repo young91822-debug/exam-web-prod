@@ -29,6 +29,110 @@ async function fetchAny(url: string) {
   return { ok: res.ok, status: res.status, text, json };
 }
 
+/** ✅ 다양한 API 형태를 "화면용" 하나로 통일 */
+function normalizePayload(payload: any) {
+  const rawAttempt =
+    payload?.attempt ??
+    payload?.data?.attempt ??
+    payload?.result?.attempt ??
+    payload ??
+    null;
+
+  // attempt 정규화
+  const attempt = rawAttempt
+    ? {
+        empId:
+          rawAttempt?.empId ??
+          rawAttempt?.emp_id ??
+          rawAttempt?.empid ??
+          rawAttempt?.user_id ??
+          rawAttempt?.userId ??
+          "-",
+        score: rawAttempt?.score ?? payload?.score ?? payload?.result?.score ?? 0,
+        totalPoints:
+          rawAttempt?.total_points ??
+          rawAttempt?.totalPoints ??
+          payload?.totalPoints ??
+          payload?.result?.totalPoints ??
+          "-", // 없으면 '-' 유지
+        startedAt: rawAttempt?.started_at ?? rawAttempt?.startedAt ?? null,
+        submittedAt: rawAttempt?.submitted_at ?? rawAttempt?.submittedAt ?? null,
+      }
+    : null;
+
+  // graded 정규화
+  const rawGraded =
+    payload?.graded ??
+    payload?.wrongQuestions ??
+    payload?.data?.graded ??
+    payload?.result?.graded ??
+    [];
+
+  const graded = Array.isArray(rawGraded)
+    ? rawGraded.map((g: any) => {
+        const choices = Array.isArray(g?.choices)
+          ? g.choices
+          : Array.isArray(g?.options)
+          ? g.options
+          : [];
+
+        const selectedIndex =
+          typeof g?.selectedIndex === "number"
+            ? g.selectedIndex
+            : typeof g?.chosenIndex === "number"
+            ? g.chosenIndex
+            : typeof g?.chosen_index === "number"
+            ? g.chosen_index
+            : typeof g?.answerIndex === "number"
+            ? g.answerIndex
+            : typeof g?.answer_index === "number"
+            ? g.answer_index
+            : null;
+
+        const correctIndex =
+          typeof g?.correctIndex === "number"
+            ? g.correctIndex
+            : typeof g?.correct_index === "number"
+            ? g.correct_index
+            : typeof g?.answerIndex === "number"
+            ? g.answerIndex
+            : typeof g?.answer_index === "number"
+            ? g.answer_index
+            : null;
+
+        const content =
+          g?.content ??
+          g?.question ??
+          g?.questionText ??
+          g?.title ??
+          "";
+
+        const questionId = g?.questionId ?? g?.question_id ?? g?.id ?? null;
+
+        const isCorrect =
+          typeof g?.isCorrect === "boolean"
+            ? g.isCorrect
+            : typeof g?.is_correct === "boolean"
+            ? g.is_correct
+            : correctIndex !== null &&
+              selectedIndex !== null &&
+              Number(correctIndex) === Number(selectedIndex);
+
+        return {
+          questionId,
+          content,
+          choices,
+          selectedIndex,
+          correctIndex,
+          isCorrect,
+          status: g?.status,
+        };
+      })
+    : [];
+
+  return { attempt, graded };
+}
+
 export default function ExamResultPage() {
   const p = useParams();
   const router = useRouter();
@@ -56,28 +160,32 @@ export default function ExamResultPage() {
       setLoading(true);
       setErr(null);
 
-      // ✅ 프로젝트마다 결과 API 경로가 달라서 "순서대로" 시도
+      // ✅ graded가 있는 "상세 API"를 최우선으로
       const tries = [
-        `/api/result/${attemptId}`,
+        `/api/result/${attemptId}`, // ✅ graded 있음 (너가 올린 route.ts)
         `/api/result/${attemptId}/summary`,
-        `/api/admin/result-detail?attemptId=${attemptId}`, // 최후 fallback (있으면 씀)
+        `/api/admin/result-detail?attemptId=${attemptId}`,
       ];
 
       for (const url of tries) {
         const r = await fetchAny(url);
 
-        // ok:true 형태거나, ok는 없지만 JSON이 있으면 일단 표시
-        const looksOk = r.ok && (r.json?.ok === true || r.json);
+        // ✅ 성공 판정: HTTP ok가 아니어도 json.ok===true면 성공으로 인정
+        const looksOk =
+          (r.json && r.json.ok === true) ||
+          (r.ok && r.json != null);
+
         if (looksOk) {
           if (dead) return;
           setPayload(r.json);
           setDebug({ used: url, status: r.status });
           setLoading(false);
           return;
+        } else {
+          if (!dead) {
+            setDebug((prev: any) => prev ?? { lastTried: url, status: r.status, textLen: (r.text || "").length });
+          }
         }
-
-        // 계속 실패하면 다음 후보로
-        if (!debug) setDebug({ lastTried: url, status: r.status, textLen: (r.text || "").length });
       }
 
       if (dead) return;
@@ -104,13 +212,23 @@ export default function ExamResultPage() {
         <div style={{ marginTop: 14, display: "flex", gap: 8 }}>
           <button
             onClick={() => router.push("/exam")}
-            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white" }}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid #ddd",
+              background: "white",
+            }}
           >
             다시 시험 보기
           </button>
           <button
             onClick={() => location.reload()}
-            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white" }}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid #ddd",
+              background: "white",
+            }}
           >
             새로고침
           </button>
@@ -119,33 +237,60 @@ export default function ExamResultPage() {
     );
   }
 
-  // ✅ 여기서부터는 payload 구조가 어떤 형태든 “최대한” 표시
-  const attempt = payload?.attempt ?? payload?.data?.attempt ?? payload?.result?.attempt ?? null;
-  const graded = payload?.graded ?? payload?.wrongQuestions ?? payload?.data?.graded ?? payload?.result?.graded ?? [];
+  const { attempt, graded } = normalizePayload(payload);
 
-  const score = attempt?.score ?? payload?.score ?? payload?.result?.score ?? "-";
-  const totalPoints = attempt?.total_points ?? payload?.totalPoints ?? payload?.result?.totalPoints ?? "-";
-  const startedAt = attempt?.started_at ?? attempt?.startedAt;
-  const submittedAt = attempt?.submitted_at ?? attempt?.submittedAt;
+  const score = attempt?.score ?? "-";
+  const totalPoints = attempt?.totalPoints ?? "-";
+  const startedAt = attempt?.startedAt ?? null;
+  const submittedAt = attempt?.submittedAt ?? null;
 
   return (
     <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 12,
+          alignItems: "center",
+        }}
+      >
         <div>
           <div style={{ fontSize: 18, fontWeight: 900 }}>시험 결과</div>
-          <div style={{ marginTop: 6, fontSize: 13, opacity: 0.75 }}>attemptId: {attemptId}</div>
+          <div style={{ marginTop: 6, fontSize: 13, opacity: 0.75 }}>
+            attemptId: {attemptId}
+          </div>
         </div>
         <button
           onClick={() => router.push("/exam")}
-          style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", fontWeight: 800 }}
+          style={{
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "1px solid #ddd",
+            background: "white",
+            fontWeight: 800,
+          }}
         >
           다시 시험 보기
         </button>
       </div>
 
-      <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 14, padding: 14 }}>
+      <div
+        style={{
+          marginTop: 12,
+          border: "1px solid #eee",
+          borderRadius: 14,
+          padding: 14,
+        }}
+      >
         <div style={{ fontWeight: 900, marginBottom: 8 }}>요약</div>
-        <div style={{ display: "grid", gridTemplateColumns: "140px 1fr", rowGap: 6, columnGap: 10 }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "140px 1fr",
+            rowGap: 6,
+            columnGap: 10,
+          }}
+        >
           <div style={{ opacity: 0.7 }}>점수</div>
           <div style={{ fontWeight: 900 }}>
             {score} / {totalPoints}
@@ -167,7 +312,8 @@ export default function ExamResultPage() {
         <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
           {graded.map((g: any, idx: number) => {
             const isWrong = g?.isCorrect === false || g?.status === "wrong";
-            const isUnsubmitted = g?.status === "unsubmitted" || g?.selectedIndex == null;
+            const isUnsubmitted =
+              g?.status === "unsubmitted" || g?.selectedIndex == null;
 
             const borderColor = isWrong ? "#ff3b30" : isUnsubmitted ? "#bbb" : "#eee";
             const bg = isWrong ? "rgba(255,59,48,0.04)" : isUnsubmitted ? "rgba(0,0,0,0.03)" : "white";
@@ -177,7 +323,15 @@ export default function ExamResultPage() {
             const correctIndex = typeof g?.correctIndex === "number" ? g.correctIndex : null;
 
             return (
-              <div key={String(g?.questionId ?? idx)} style={{ border: `2px solid ${borderColor}`, background: bg, borderRadius: 14, padding: 14 }}>
+              <div
+                key={String(g?.questionId ?? idx)}
+                style={{
+                  border: `2px solid ${borderColor}`,
+                  background: bg,
+                  borderRadius: 14,
+                  padding: 14,
+                }}
+              >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                   <div style={{ fontWeight: 900 }}>
                     Q{idx + 1}. {g?.content ?? ""}
@@ -189,13 +343,30 @@ export default function ExamResultPage() {
 
                 <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
                   {choices.map((c: any, i: number) => {
-                    const tag = correctIndex === i ? "정답" : (!isUnsubmitted && selectedIndex === i ? "내 선택" : "");
+                    const tag =
+                      correctIndex === i
+                        ? "정답"
+                        : !isUnsubmitted && selectedIndex === i
+                        ? "내 선택"
+                        : "";
                     return (
-                      <div key={i} style={{ border: "1px solid #eee", borderRadius: 12, padding: "10px 12px", display: "flex", justifyContent: "space-between", gap: 12 }}>
+                      <div
+                        key={i}
+                        style={{
+                          border: "1px solid #eee",
+                          borderRadius: 12,
+                          padding: "10px 12px",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          gap: 12,
+                        }}
+                      >
                         <div style={{ whiteSpace: "pre-wrap" }}>
                           {i + 1}. {String(c ?? "")}
                         </div>
-                        <div style={{ fontSize: 12, fontWeight: 900, opacity: tag ? 0.9 : 0.2 }}>{tag || "•"}</div>
+                        <div style={{ fontSize: 12, fontWeight: 900, opacity: tag ? 0.9 : 0.2 }}>
+                          {tag || "•"}
+                        </div>
                       </div>
                     );
                   })}
