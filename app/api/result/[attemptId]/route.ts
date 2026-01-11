@@ -15,6 +15,27 @@ function n(v: any, d = 0) {
   return Number.isFinite(x) ? x : d;
 }
 
+function pickAttemptUuid(attempt: any): string | null {
+  // ✅ exam_attempts 안에 있을 법한 UUID 후보들
+  const candidates = [
+    attempt?.attempt_id,      // 흔함
+    attempt?.attempt_uuid,
+    attempt?.attempt_uid,
+    attempt?.uuid,
+    attempt?.id_uuid,
+    attempt?.public_id,
+    attempt?.session_id,
+    attempt?.exam_attempt_id,
+  ];
+
+  for (const v of candidates) {
+    const str = s(v);
+    // uuid v4 형태 대충 체크
+    if (/^[0-9a-fA-F-]{36}$/.test(str)) return str;
+  }
+  return null;
+}
+
 export async function GET(
   _req: NextRequest,
   context: { params: Promise<{ attemptId: string }> }
@@ -30,7 +51,7 @@ export async function GET(
       return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
-    // 1) attempt  ✅ 여기만 변경: attempts -> exam_attempts
+    // 1) attempt (숫자 PK)
     const { data: attempt, error: e1 } = await supabaseAdmin
       .from("exam_attempts")
       .select("*")
@@ -44,17 +65,35 @@ export async function GET(
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
     }
 
-    // 2) answers
+    // ✅ 2) attempt_answers는 attempt_id(UUID)를 요구함 → attempt에서 UUID 찾아서 조회
+    const attemptUuid = pickAttemptUuid(attempt);
+    if (!attemptUuid) {
+      return NextResponse.json(
+        {
+          ok: true,
+          attempt,
+          graded: [],
+          totalQuestions: 0,
+          hint: {
+            message: "attempt_answers.attempt_id is uuid, but exam_attempts does not expose a uuid column",
+            need: "Add uuid column (e.g., attempt_uuid) to exam_attempts OR store numeric attempt_id in attempt_answers",
+          },
+        },
+        { status: 200 }
+      );
+    }
+
+    // 2) answers (UUID로 조회)
     const { data: answers, error: e2 } = await supabaseAdmin
       .from("attempt_answers")
       .select("*")
-      .eq("attempt_id", attemptId);
+      .eq("attempt_id", attemptUuid);
 
     if (e2) {
-      return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: e2 }, { status: 500 });
+      return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: e2, attemptUuid }, { status: 500 });
     }
 
-    // 3) questions (answers의 question_id로 조회)
+    // 3) questions
     const qids = Array.from(
       new Set((answers ?? []).map((a: any) => a?.question_id).filter(Boolean))
     );
@@ -81,16 +120,18 @@ export async function GET(
         a?.chosen_index ?? a?.chosenIndex ?? a?.answer_index ?? a?.answerIndex ?? null;
 
       const isCorrect =
-        correctIndex !== null &&
-        chosenIndex !== null &&
-        Number(correctIndex) === Number(chosenIndex);
+        a?.is_correct !== undefined && a?.is_correct !== null
+          ? Boolean(a.is_correct)
+          : correctIndex !== null &&
+            chosenIndex !== null &&
+            Number(correctIndex) === Number(chosenIndex);
 
       return {
         questionId: a.question_id,
-        question: q?.content ?? q?.question ?? q?.title ?? "",
+        content: q?.content ?? q?.question ?? q?.title ?? "",
         choices: q?.choices ?? q?.options ?? [],
         correctIndex,
-        chosenIndex,
+        selectedIndex: chosenIndex,
         isCorrect,
         points: n(q?.points, 0),
       };
@@ -99,6 +140,7 @@ export async function GET(
     return NextResponse.json({
       ok: true,
       attempt,
+      attemptUuid,
       graded,
       totalQuestions: graded.length,
     });
