@@ -20,7 +20,6 @@ export async function GET(
   context: { params: Promise<{ attemptId: string }> }
 ) {
   try {
-    // ✅ Next 16 타입: params가 Promise
     const { attemptId: raw } = await context.params;
     const attemptId = s(raw);
 
@@ -31,15 +30,15 @@ export async function GET(
       return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
-    // 1) attempt
+    // 1) attempt  ✅ 여기만 변경: attempts -> exam_attempts
     const { data: attempt, error: e1 } = await supabaseAdmin
-      .from("attempts")
+      .from("exam_attempts")
       .select("*")
       .eq("id", attemptId)
       .maybeSingle();
 
     if (e1) {
-      return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED" }, { status: 500 });
+      return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: e1 }, { status: 500 });
     }
     if (!attempt) {
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
@@ -52,7 +51,7 @@ export async function GET(
       .eq("attempt_id", attemptId);
 
     if (e2) {
-      return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED" }, { status: 500 });
+      return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: e2 }, { status: 500 });
     }
 
     // 3) questions (answers의 question_id로 조회)
@@ -66,7 +65,7 @@ export async function GET(
       .in("id", qids.length ? qids : [-1]);
 
     if (e3) {
-      return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED" }, { status: 500 });
+      return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: e3 }, { status: 500 });
     }
 
     const qMap = new Map<any, any>();
