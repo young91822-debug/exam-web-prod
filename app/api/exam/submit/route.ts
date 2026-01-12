@@ -31,11 +31,16 @@ function isNumericId(v: any) {
   return /^\d+$/.test(t);
 }
 
+function isUUID(v: any) {
+  const t = s(v);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
+}
+
 /**
- * ✅ question_id / attempt_id 같은 "id"는
+ * ✅ question_id 같은 "id"는
  * - 숫자 형태면 number로
  * - 아니면 string으로
- * DB 컬럼 타입이 bigint/int인 경우 string 넣으면 JOIN/매칭이 깨질 수 있어서 이걸로 고정.
+ * (questions.id가 bigint/int면 number가 안전)
  */
 function normalizeId(v: any): number | string | null {
   const t = s(v);
@@ -123,11 +128,15 @@ function normalizeAnswers(body: any): AnswerItem[] {
   return [];
 }
 
+/**
+ * ✅ 핵심 수정:
+ * attemptId는 숫자/UUID 둘 다 허용해야 함 (지금 시험 화면 attemptId가 UUID임)
+ */
 async function resolveAttemptId(
   req: Request,
   client: any,
   body: any
-): Promise<{ attemptId: number | null; resolvedBy: string; detail?: any }> {
+): Promise<{ attemptId: string | number | null; resolvedBy: string; detail?: any }> {
   // 0) querystring
   try {
     const u = new URL(req.url);
@@ -135,8 +144,13 @@ async function resolveAttemptId(
       u.searchParams.get("attemptId") ||
       u.searchParams.get("attempt_id") ||
       u.searchParams.get("attemptID");
-    const qNum = n(q, null);
-    if (qNum && qNum > 0) return { attemptId: qNum, resolvedBy: "QUERY" };
+
+    if (q) {
+      const qs = s(q);
+      if (isUUID(qs)) return { attemptId: qs, resolvedBy: "QUERY_UUID" };
+      const qNum = n(qs, null);
+      if (qNum !== null && qNum > 0) return { attemptId: qNum, resolvedBy: "QUERY_NUMBER" };
+    }
   } catch {}
 
   // 1) body
@@ -149,14 +163,23 @@ async function resolveAttemptId(
     body?.id ??
     body?.attempt?.id;
 
-  const bodyNum = n(fromBody, null);
-  if (bodyNum && bodyNum > 0) return { attemptId: bodyNum, resolvedBy: "BODY" };
+  if (fromBody !== undefined && fromBody !== null && fromBody !== "") {
+    const bs = s(fromBody);
+    if (isUUID(bs)) return { attemptId: bs, resolvedBy: "BODY_UUID" };
+    const bodyNum = n(bs, null);
+    if (bodyNum !== null && bodyNum > 0) return { attemptId: bodyNum, resolvedBy: "BODY_NUMBER" };
+  }
 
   // 2) cookie attemptId (옵션)
-  const cAttempt = n(getCookie(req, "attemptId") || getCookie(req, "attempt_id"), null);
-  if (cAttempt && cAttempt > 0) return { attemptId: cAttempt, resolvedBy: "COOKIE_ATTEMPTID" };
+  const cAttemptRaw = getCookie(req, "attemptId") || getCookie(req, "attempt_id");
+  if (cAttemptRaw) {
+    const cs = s(cAttemptRaw);
+    if (isUUID(cs)) return { attemptId: cs, resolvedBy: "COOKIE_UUID" };
+    const cNum = n(cs, null);
+    if (cNum !== null && cNum > 0) return { attemptId: cNum, resolvedBy: "COOKIE_NUMBER" };
+  }
 
-  // 3) empId 최신 STARTED
+  // 3) empId 최신 STARTED (⚠️ id가 UUID일 수도 있으니 Number() 절대 금지)
   const empId =
     s(body?.empId ?? body?.emp_id) ||
     s(getCookie(req, "empId")) ||
@@ -174,7 +197,14 @@ async function resolveAttemptId(
       .maybeSingle();
 
     if (!error && a?.id) {
-      return { attemptId: Number(a.id), resolvedBy: "EMPID_LATEST_STARTED", detail: { empId } };
+      // id가 UUID면 그대로 string, 숫자면 number
+      const aid = String(a.id);
+      if (isUUID(aid)) return { attemptId: aid, resolvedBy: "EMPID_LATEST_STARTED_UUID", detail: { empId } };
+      const aidNum = n(aid, null);
+      if (aidNum !== null && aidNum > 0) return { attemptId: aidNum, resolvedBy: "EMPID_LATEST_STARTED_NUMBER", detail: { empId } };
+
+      // 혹시 예외 타입이면 그냥 string으로라도 넘김
+      return { attemptId: aid, resolvedBy: "EMPID_LATEST_STARTED_FALLBACK", detail: { empId } };
     }
   }
 
@@ -208,10 +238,11 @@ export async function POST(req: Request) {
       );
     }
 
+    // ✅ UUID/number 둘 다 그대로 eq("id", attemptId) 가능 (Supabase가 처리)
     const { data: attempt, error: aErr } = await client
       .from("exam_attempts")
       .select("*")
-      .eq("id", attemptId)
+      .eq("id", attemptId as any)
       .maybeSingle();
 
     if (aErr) {
@@ -224,22 +255,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
     }
 
-    /**
-     * ✅ questions 조회도 id 타입을 맞춰서 in() 해줘야 함
-     * - 숫자면 number 배열로
-     * - 문자열이면 string 배열로
-     * 혼합이면 string으로 통일(안전)
-     */
+    // questions 조회 (id 타입 맞춤)
     const normalizedQids = items
       .map((x) => normalizeId(x.questionId))
       .filter((x) => x !== null) as Array<number | string>;
 
     const uniqueQids = Array.from(new Set(normalizedQids.map((x) => String(x))));
     const allNumeric = uniqueQids.every((x) => /^\d+$/.test(x));
-
     const qidsForQuery = allNumeric ? uniqueQids.map((x) => Number(x)) : uniqueQids;
 
-    const { data: questions, error: qErr } = await client.from("questions").select("*").in("id", qidsForQuery);
+    const { data: questions, error: qErr } = await client.from("questions").select("*").in("id", qidsForQuery as any);
 
     if (qErr) {
       return NextResponse.json(
@@ -269,8 +294,7 @@ export async function POST(req: Request) {
         totalPoints += points;
 
         const correctIndex = pickCorrectIndex(q);
-        const isCorrect =
-          correctIndex !== null ? Number(it.selectedIndex) === Number(correctIndex) : false;
+        const isCorrect = correctIndex !== null ? Number(it.selectedIndex) === Number(correctIndex) : false;
 
         if (isCorrect) {
           correctCount += 1;
@@ -279,12 +303,10 @@ export async function POST(req: Request) {
           wrongQuestionIds.push(String(qid));
         }
 
-        // ✅ attempt.answers fallback 저장용
         answerMapForAttempt[String(qid)] = Number(it.selectedIndex);
 
         return {
-          attempt_id: attemptId,
-          // ✅ 핵심: 숫자 ID는 number로 넣기 (DB bigint/int이면 이게 맞음)
+          attempt_id: attemptId as any, // ✅ UUID든 number든 그대로 저장
           question_id: qid,
           selected_index: Number(it.selectedIndex),
           is_correct: isCorrect,
@@ -294,7 +316,11 @@ export async function POST(req: Request) {
 
     if (rows.length === 0) {
       return NextResponse.json(
-        { ok: false, error: "NO_VALID_ROWS", detail: { attemptId, items: items.length, questions: (questions ?? []).length } },
+        {
+          ok: false,
+          error: "NO_VALID_ROWS",
+          detail: { attemptId, items: items.length, questions: (questions ?? []).length },
+        },
         { status: 400 }
       );
     }
@@ -303,7 +329,7 @@ export async function POST(req: Request) {
     const { error: delErr } = await client
       .from("exam_attempt_answers")
       .delete()
-      .eq("attempt_id", attemptId);
+      .eq("attempt_id", attemptId as any);
 
     if (delErr) {
       return NextResponse.json(
@@ -331,9 +357,9 @@ export async function POST(req: Request) {
         correct_count: correctCount,
         total_points: totalPoints,
         total_questions: rows.length,
-        answers: answerMapForAttempt, // ✅ fallback용 저장(결과 API가 이걸 읽게 만들 수도 있음)
+        answers: answerMapForAttempt,
       })
-      .eq("id", attemptId);
+      .eq("id", attemptId as any);
 
     if (upErr) {
       return NextResponse.json(
@@ -351,7 +377,7 @@ export async function POST(req: Request) {
       correctCount,
       wrongQuestionIds,
       savedAnswers: rows.length,
-      marker: "SUBMIT_OK_SAVED_TO_exam_attempt_answers_AND_exam_attempts.answers",
+      marker: "SUBMIT_OK_UUID_OR_NUMBER_ATTEMPT",
       debug: {
         qidsAllNumeric: allNumeric,
         qidsCount: uniqueQids.length,
