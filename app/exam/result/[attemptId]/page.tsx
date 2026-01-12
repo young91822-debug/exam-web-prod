@@ -29,16 +29,39 @@ async function fetchAny(url: string) {
   return { ok: res.ok, status: res.status, text, json };
 }
 
-/** ✅ 다양한 API 형태를 "화면용" 하나로 통일 */
+/** ✅ index 값 강제 숫자화 (number | "1" | null → number|null) */
+function toIndex(v: any): number | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (!s) return null;
+    const x = Number(s);
+    return Number.isFinite(x) ? x : null;
+  }
+  return null;
+}
+
+function pickChoices(g: any): any[] {
+  if (Array.isArray(g?.choices)) return g.choices;
+  if (Array.isArray(g?.options)) return g.options;
+  if (Array.isArray(g?.choice_list)) return g.choice_list;
+  if (Array.isArray(g?.choice_texts)) return g.choice_texts;
+  return [];
+}
+
+/** ✅ 다양한 API 형태를 "화면용" 하나로 통일 + selectedIndex를 attempt.answers로 보강 */
 function normalizePayload(payload: any) {
+  // attempt 후보
   const rawAttempt =
     payload?.attempt ??
     payload?.data?.attempt ??
     payload?.result?.attempt ??
+    payload?.attemptInfo ??
+    payload?.data ??
     payload ??
     null;
 
-  // attempt 정규화
   const attempt = rawAttempt
     ? {
         empId:
@@ -54,60 +77,65 @@ function normalizePayload(payload: any) {
           rawAttempt?.totalPoints ??
           payload?.totalPoints ??
           payload?.result?.totalPoints ??
-          "-", // 없으면 '-' 유지
-        startedAt: rawAttempt?.started_at ?? rawAttempt?.startedAt ?? null,
-        submittedAt: rawAttempt?.submitted_at ?? rawAttempt?.submittedAt ?? null,
+          "-",
+        startedAt: rawAttempt?.started_at ?? rawAttempt?.startedAt ?? rawAttempt?.created_at ?? null,
+        submittedAt: rawAttempt?.submitted_at ?? rawAttempt?.submittedAt ?? rawAttempt?.ended_at ?? null,
+        // ✅ 여기 중요: /api/result 는 attempt.answers를 내려줌
+        answers:
+          rawAttempt?.answers && typeof rawAttempt.answers === "object"
+            ? (rawAttempt.answers as Record<string, any>)
+            : null,
       }
     : null;
 
-  // graded 정규화
+  // graded 후보
   const rawGraded =
     payload?.graded ??
     payload?.wrongQuestions ??
     payload?.data?.graded ??
     payload?.result?.graded ??
+    payload?.data?.wrongQuestions ??
     [];
 
   const graded = Array.isArray(rawGraded)
     ? rawGraded.map((g: any) => {
-        const choices = Array.isArray(g?.choices)
-          ? g.choices
-          : Array.isArray(g?.options)
-          ? g.options
-          : [];
+        const questionId = g?.questionId ?? g?.question_id ?? g?.id ?? null;
 
-        const selectedIndex =
-          typeof g?.selectedIndex === "number"
-            ? g.selectedIndex
-            : typeof g?.chosenIndex === "number"
-            ? g.chosenIndex
-            : typeof g?.chosen_index === "number"
-            ? g.chosen_index
-            : typeof g?.answerIndex === "number"
-            ? g.answerIndex
-            : typeof g?.answer_index === "number"
-            ? g.answer_index
+        // 1) graded 내부에서 먼저 찾기
+        const selectedFromG =
+          toIndex(g?.selectedIndex) ??
+          toIndex(g?.selected_index) ??
+          toIndex(g?.chosenIndex) ??
+          toIndex(g?.chosen_index) ??
+          toIndex(g?.answerIndex) ??
+          toIndex(g?.answer_index);
+
+        const correctFromG =
+          toIndex(g?.correctIndex) ??
+          toIndex(g?.correct_index) ??
+          toIndex(g?.correctAnswerIndex) ??
+          toIndex(g?.correct_answer_index) ??
+          toIndex(g?.answerIndex) ??
+          toIndex(g?.answer_index);
+
+        // 2) graded에 없으면 attempt.answers[questionId]에서 보강
+        const selectedFromAttempt =
+          selectedFromG === null && attempt?.answers && questionId
+            ? toIndex((attempt.answers as any)[String(questionId)])
             : null;
 
-        const correctIndex =
-          typeof g?.correctIndex === "number"
-            ? g.correctIndex
-            : typeof g?.correct_index === "number"
-            ? g.correct_index
-            : typeof g?.answerIndex === "number"
-            ? g.answerIndex
-            : typeof g?.answer_index === "number"
-            ? g.answer_index
-            : null;
+        const selectedIndex = selectedFromG ?? selectedFromAttempt;
+        const correctIndex = correctFromG;
 
         const content =
           g?.content ??
           g?.question ??
           g?.questionText ??
           g?.title ??
+          g?.question_title ??
           "";
 
-        const questionId = g?.questionId ?? g?.question_id ?? g?.id ?? null;
+        const choices = pickChoices(g);
 
         const isCorrect =
           typeof g?.isCorrect === "boolean"
@@ -160,36 +188,23 @@ export default function ExamResultPage() {
       setLoading(true);
       setErr(null);
 
-      // ✅ graded가 있는 "상세 API"를 최우선으로
-      const tries = [
-        `/api/result/${attemptId}`, // ✅ graded 있음 (너가 올린 route.ts)
-        `/api/result/${attemptId}/summary`,
-        `/api/admin/result-detail?attemptId=${attemptId}`,
-      ];
+      // ✅ 핵심: "내 선택" 보장하려면 attempt.answers가 있는 /api/result 를 써야 함
+      const url = `/api/result/${attemptId}`;
 
-      for (const url of tries) {
-        const r = await fetchAny(url);
+      const r = await fetchAny(url);
 
-        // ✅ 성공 판정: HTTP ok가 아니어도 json.ok===true면 성공으로 인정
-        const looksOk =
-          (r.json && r.json.ok === true) ||
-          (r.ok && r.json != null);
-
-        if (looksOk) {
-          if (dead) return;
-          setPayload(r.json);
-          setDebug({ used: url, status: r.status });
-          setLoading(false);
-          return;
-        } else {
-          if (!dead) {
-            setDebug((prev: any) => prev ?? { lastTried: url, status: r.status, textLen: (r.text || "").length });
-          }
-        }
+      const looksOk = r.json && r.json.ok === true;
+      if (looksOk) {
+        if (dead) return;
+        setPayload(r.json);
+        setDebug({ used: url, status: r.status });
+        setLoading(false);
+        return;
       }
 
       if (dead) return;
-      setErr("RESULT_API_NOT_FOUND_OR_FAILED");
+      setErr(r.json?.error || "RESULT_API_FAILED");
+      setDebug({ used: url, status: r.status, body: r.json ?? r.text });
       setLoading(false);
     }
 
@@ -197,7 +212,6 @@ export default function ExamResultPage() {
     return () => {
       dead = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attemptId]);
 
   if (loading) return <div style={{ padding: 16 }}>결과 불러오는 중…</div>;
@@ -212,23 +226,13 @@ export default function ExamResultPage() {
         <div style={{ marginTop: 14, display: "flex", gap: 8 }}>
           <button
             onClick={() => router.push("/exam")}
-            style={{
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-              background: "white",
-            }}
+            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white" }}
           >
             다시 시험 보기
           </button>
           <button
             onClick={() => location.reload()}
-            style={{
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #ddd",
-              background: "white",
-            }}
+            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white" }}
           >
             새로고침
           </button>
@@ -246,51 +250,22 @@ export default function ExamResultPage() {
 
   return (
     <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          gap: 12,
-          alignItems: "center",
-        }}
-      >
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
         <div>
           <div style={{ fontSize: 18, fontWeight: 900 }}>시험 결과</div>
-          <div style={{ marginTop: 6, fontSize: 13, opacity: 0.75 }}>
-            attemptId: {attemptId}
-          </div>
+          <div style={{ marginTop: 6, fontSize: 13, opacity: 0.75 }}>attemptId: {attemptId}</div>
         </div>
         <button
           onClick={() => router.push("/exam")}
-          style={{
-            padding: "10px 12px",
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            background: "white",
-            fontWeight: 800,
-          }}
+          style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", fontWeight: 800 }}
         >
           다시 시험 보기
         </button>
       </div>
 
-      <div
-        style={{
-          marginTop: 12,
-          border: "1px solid #eee",
-          borderRadius: 14,
-          padding: 14,
-        }}
-      >
+      <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 14, padding: 14 }}>
         <div style={{ fontWeight: 900, marginBottom: 8 }}>요약</div>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "140px 1fr",
-            rowGap: 6,
-            columnGap: 10,
-          }}
-        >
+        <div style={{ display: "grid", gridTemplateColumns: "140px 1fr", rowGap: 6, columnGap: 10 }}>
           <div style={{ opacity: 0.7 }}>점수</div>
           <div style={{ fontWeight: 900 }}>
             {score} / {totalPoints}
@@ -304,33 +279,26 @@ export default function ExamResultPage() {
         </div>
       </div>
 
-      <div style={{ marginTop: 12, fontSize: 12, opacity: 0.6 }}>
-        debug: {JSON.stringify(debug)}
-      </div>
+      <div style={{ marginTop: 12, fontSize: 12, opacity: 0.6 }}>debug: {JSON.stringify(debug)}</div>
 
       {Array.isArray(graded) && graded.length > 0 ? (
         <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
           {graded.map((g: any, idx: number) => {
+            const selectedIndex = toIndex(g?.selectedIndex);
+            const correctIndex = toIndex(g?.correctIndex);
+
             const isWrong = g?.isCorrect === false || g?.status === "wrong";
-            const isUnsubmitted =
-              g?.status === "unsubmitted" || g?.selectedIndex == null;
+            const isUnsubmitted = g?.status === "unsubmitted" || selectedIndex == null;
 
             const borderColor = isWrong ? "#ff3b30" : isUnsubmitted ? "#bbb" : "#eee";
             const bg = isWrong ? "rgba(255,59,48,0.04)" : isUnsubmitted ? "rgba(0,0,0,0.03)" : "white";
 
             const choices = Array.isArray(g?.choices) ? g.choices : [];
-            const selectedIndex = typeof g?.selectedIndex === "number" ? g.selectedIndex : null;
-            const correctIndex = typeof g?.correctIndex === "number" ? g.correctIndex : null;
 
             return (
               <div
                 key={String(g?.questionId ?? idx)}
-                style={{
-                  border: `2px solid ${borderColor}`,
-                  background: bg,
-                  borderRadius: 14,
-                  padding: 14,
-                }}
+                style={{ border: `2px solid ${borderColor}`, background: bg, borderRadius: 14, padding: 14 }}
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                   <div style={{ fontWeight: 900 }}>
@@ -346,7 +314,7 @@ export default function ExamResultPage() {
                     const tag =
                       correctIndex === i
                         ? "정답"
-                        : !isUnsubmitted && selectedIndex === i
+                        : selectedIndex !== null && selectedIndex === i
                         ? "내 선택"
                         : "";
                     return (
@@ -373,7 +341,7 @@ export default function ExamResultPage() {
                 </div>
 
                 <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
-                  <div>내 선택: {isUnsubmitted ? "-" : selectedIndex != null ? selectedIndex + 1 : "-"}</div>
+                  <div>내 선택: {selectedIndex != null ? selectedIndex + 1 : "-"}</div>
                   <div>정답: {correctIndex != null ? correctIndex + 1 : "-"}</div>
                 </div>
               </div>

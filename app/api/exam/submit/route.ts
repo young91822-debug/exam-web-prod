@@ -26,6 +26,24 @@ function n(v: any, d: number | null = null) {
   return Number.isFinite(x) ? x : d;
 }
 
+function isNumericId(v: any) {
+  const t = s(v);
+  return /^\d+$/.test(t);
+}
+
+/**
+ * ✅ question_id / attempt_id 같은 "id"는
+ * - 숫자 형태면 number로
+ * - 아니면 string으로
+ * DB 컬럼 타입이 bigint/int인 경우 string 넣으면 JOIN/매칭이 깨질 수 있어서 이걸로 고정.
+ */
+function normalizeId(v: any): number | string | null {
+  const t = s(v);
+  if (!t) return null;
+  if (isNumericId(t)) return Number(t);
+  return t;
+}
+
 function getCookie(req: Request, name: string) {
   const raw = req.headers.get("cookie") || "";
   const parts = raw.split(";").map((x) => x.trim());
@@ -74,7 +92,14 @@ function pickCorrectIndex(q: any): number | null {
 type AnswerItem = { questionId: string; selectedIndex: number };
 
 function normalizeAnswers(body: any): AnswerItem[] {
-  const raw = body?.answers ?? body?.selected ?? body?.answerMap ?? body?.items ?? body?.payload?.answers ?? null;
+  const raw =
+    body?.answers ??
+    body?.selected ??
+    body?.answerMap ??
+    body?.items ??
+    body?.payload?.answers ??
+    null;
+
   if (!raw) return [];
 
   if (Array.isArray(raw)) {
@@ -106,7 +131,10 @@ async function resolveAttemptId(
   // 0) querystring
   try {
     const u = new URL(req.url);
-    const q = u.searchParams.get("attemptId") || u.searchParams.get("attempt_id") || u.searchParams.get("attemptID");
+    const q =
+      u.searchParams.get("attemptId") ||
+      u.searchParams.get("attempt_id") ||
+      u.searchParams.get("attemptID");
     const qNum = n(q, null);
     if (qNum && qNum > 0) return { attemptId: qNum, resolvedBy: "QUERY" };
   } catch {}
@@ -167,7 +195,7 @@ export async function POST(req: Request) {
 
     if (!attemptId) {
       return NextResponse.json(
-        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { resolvedBy: r.resolvedBy, ...r.detail } },
+        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { resolvedBy: r.resolvedBy, ...(r.detail ?? {}) } },
         { status: 400 }
       );
     }
@@ -196,8 +224,22 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
     }
 
-    const qids = Array.from(new Set(items.map((x) => x.questionId)));
-    const { data: questions, error: qErr } = await client.from("questions").select("*").in("id", qids);
+    /**
+     * ✅ questions 조회도 id 타입을 맞춰서 in() 해줘야 함
+     * - 숫자면 number 배열로
+     * - 문자열이면 string 배열로
+     * 혼합이면 string으로 통일(안전)
+     */
+    const normalizedQids = items
+      .map((x) => normalizeId(x.questionId))
+      .filter((x) => x !== null) as Array<number | string>;
+
+    const uniqueQids = Array.from(new Set(normalizedQids.map((x) => String(x))));
+    const allNumeric = uniqueQids.every((x) => /^\d+$/.test(x));
+
+    const qidsForQuery = allNumeric ? uniqueQids.map((x) => Number(x)) : uniqueQids;
+
+    const { data: questions, error: qErr } = await client.from("questions").select("*").in("id", qidsForQuery);
 
     if (qErr) {
       return NextResponse.json(
@@ -217,27 +259,33 @@ export async function POST(req: Request) {
 
     const rows = items
       .map((it) => {
-        const q = qById.get(String(it.questionId));
+        const qid = normalizeId(it.questionId);
+        if (qid === null) return null;
+
+        const q = qById.get(String(qid));
         if (!q) return null;
 
         const points = n(q?.points, 0) ?? 0;
         totalPoints += points;
 
         const correctIndex = pickCorrectIndex(q);
-        const isCorrect = correctIndex !== null ? Number(it.selectedIndex) === Number(correctIndex) : false;
+        const isCorrect =
+          correctIndex !== null ? Number(it.selectedIndex) === Number(correctIndex) : false;
 
         if (isCorrect) {
           correctCount += 1;
           score += points;
         } else {
-          wrongQuestionIds.push(String(it.questionId));
+          wrongQuestionIds.push(String(qid));
         }
 
-        answerMapForAttempt[String(it.questionId)] = Number(it.selectedIndex);
+        // ✅ attempt.answers fallback 저장용
+        answerMapForAttempt[String(qid)] = Number(it.selectedIndex);
 
         return {
           attempt_id: attemptId,
-          question_id: String(it.questionId),
+          // ✅ 핵심: 숫자 ID는 number로 넣기 (DB bigint/int이면 이게 맞음)
+          question_id: qid,
           selected_index: Number(it.selectedIndex),
           is_correct: isCorrect,
         };
@@ -246,13 +294,17 @@ export async function POST(req: Request) {
 
     if (rows.length === 0) {
       return NextResponse.json(
-        { ok: false, error: "NO_VALID_ROWS", detail: { attemptId, qidsCount: qids.length } },
+        { ok: false, error: "NO_VALID_ROWS", detail: { attemptId, items: items.length, questions: (questions ?? []).length } },
         { status: 400 }
       );
     }
 
     // 재제출 대비: 기존 삭제 후 insert
-    const { error: delErr } = await client.from("exam_attempt_answers").delete().eq("attempt_id", attemptId);
+    const { error: delErr } = await client
+      .from("exam_attempt_answers")
+      .delete()
+      .eq("attempt_id", attemptId);
+
     if (delErr) {
       return NextResponse.json(
         { ok: false, error: "ANSWERS_DELETE_FAILED", detail: String((delErr as any)?.message ?? delErr) },
@@ -261,6 +313,7 @@ export async function POST(req: Request) {
     }
 
     const { error: insErr } = await client.from("exam_attempt_answers").insert(rows);
+
     if (insErr) {
       return NextResponse.json(
         { ok: false, error: "ANSWERS_INSERT_FAILED", detail: String((insErr as any)?.message ?? insErr) },
@@ -278,7 +331,7 @@ export async function POST(req: Request) {
         correct_count: correctCount,
         total_points: totalPoints,
         total_questions: rows.length,
-        answers: answerMapForAttempt, // ✅ fallback용 저장
+        answers: answerMapForAttempt, // ✅ fallback용 저장(결과 API가 이걸 읽게 만들 수도 있음)
       })
       .eq("id", attemptId);
 
@@ -299,6 +352,10 @@ export async function POST(req: Request) {
       wrongQuestionIds,
       savedAnswers: rows.length,
       marker: "SUBMIT_OK_SAVED_TO_exam_attempt_answers_AND_exam_attempts.answers",
+      debug: {
+        qidsAllNumeric: allNumeric,
+        qidsCount: uniqueQids.length,
+      },
     });
   } catch (e: any) {
     return NextResponse.json(
