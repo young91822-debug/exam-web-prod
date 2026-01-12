@@ -123,7 +123,6 @@ function normalizeAnswers(body: any): AnswerItem[] {
 
 /** attemptId 원본 받기 (숫자 or UUID) */
 function resolveAttemptIdRaw(req: Request, body: any) {
-  // querystring
   try {
     const u = new URL(req.url);
     const q =
@@ -138,7 +137,6 @@ function resolveAttemptIdRaw(req: Request, body: any) {
     }
   } catch {}
 
-  // body
   const fromBody =
     body?.attemptId ??
     body?.attempt_id ??
@@ -155,7 +153,6 @@ function resolveAttemptIdRaw(req: Request, body: any) {
     if (bodyNum !== null && bodyNum > 0) return { attemptIdRaw: bodyNum as string | number, resolvedBy: "BODY_NUMBER" };
   }
 
-  // cookie
   const cAttemptRaw = getCookie(req, "attemptId") || getCookie(req, "attempt_id");
   if (cAttemptRaw) {
     const cs = s(cAttemptRaw);
@@ -168,12 +165,17 @@ function resolveAttemptIdRaw(req: Request, body: any) {
 }
 
 /**
- * ✅ 핵심: UUID가 와도 제출되게.
- * - DB에 미제출 attempt가 없으면 새로 만들고(INSERT)
- * - 그 bigint id로 제출 처리
+ * ✅ UUID가 와도 제출되게:
+ * - empId의 미제출 attempt를 pick
+ * - 없으면 새 attempt INSERT (여기서 total_questions NOT NULL 반드시 채움)
  */
-async function getOrCreateAttemptIdByEmpId(client: any, empId: string, totalQuestionsGuess: number) {
-  // 1) 미제출(진행중) attempt 있으면 그걸 사용
+async function getOrCreateAttemptIdByEmpId(
+  client: any,
+  empId: string,
+  totalQuestions: number,
+  totalPointsGuess: number
+) {
+  // 1) 미제출 attempt pick
   const { data: picked, error: pickErr } = await client
     .from("exam_attempts")
     .select("id, emp_id, status, started_at, submitted_at")
@@ -188,15 +190,19 @@ async function getOrCreateAttemptIdByEmpId(client: any, empId: string, totalQues
     if (idNum !== null) return { attemptId: idNum, mode: "PICKED", picked };
   }
 
-  // 2) 없으면 새로 생성 (start API가 레코드 안 만드는 상태를 여기서 보정)
+  // 2) 없으면 생성 (✅ total_questions NOT NULL 해결)
   const nowIso = new Date().toISOString();
+
   const insertRow: any = {
     emp_id: empId,
     status: "STARTED",
     started_at: nowIso,
+    total_questions: totalQuestions,   // ✅ NOT NULL
+    total_points: totalPointsGuess,    // (있으면 좋음)
+    score: 0,                          // (NOT NULL일 수도 있어서 안전)
+    correct_count: 0,                  // (NOT NULL일 수도 있어서 안전)
   };
 
-  // 테이블에 total_questions 컬럼이 있으면 들어가게 시도(없으면 DB가 무시 못함 → 에러라서 안전하게 2단계로)
   const { data: created, error: insErr } = await client
     .from("exam_attempts")
     .insert(insertRow)
@@ -204,18 +210,18 @@ async function getOrCreateAttemptIdByEmpId(client: any, empId: string, totalQues
     .maybeSingle();
 
   if (insErr) {
-    return { attemptId: null as number | null, mode: "CREATE_FAILED", error: String((insErr as any)?.message ?? insErr) };
+    return {
+      attemptId: null as number | null,
+      mode: "CREATE_FAILED",
+      error: String((insErr as any)?.message ?? insErr),
+      sent: { ...insertRow, answers: undefined },
+    };
   }
 
   const createdId = n(created?.id, null);
   if (createdId === null) {
     return { attemptId: null as number | null, mode: "CREATE_FAILED", error: "CREATED_ID_NOT_NUMERIC", created };
   }
-
-  // total_questions 컬럼이 있으면 업데이트 시도(없으면 에러 나는데 그건 무시)
-  try {
-    await client.from("exam_attempts").update({ total_questions: totalQuestionsGuess }).eq("id", createdId);
-  } catch {}
 
   return { attemptId: createdId, mode: "CREATED", created };
 }
@@ -231,13 +237,15 @@ export async function POST(req: Request) {
 
     const items = normalizeAnswers(body);
     if (items.length === 0) {
-      return NextResponse.json({ ok: false, error: "NO_ANSWERS", detail: { keys: Object.keys(body ?? {}) } }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "NO_ANSWERS", detail: { keys: Object.keys(body ?? {}) } },
+        { status: 400 }
+      );
     }
 
     const r0 = resolveAttemptIdRaw(req, body);
     const attemptIdRaw = r0.attemptIdRaw;
 
-    // empId는 UUID fallback/생성에 필수
     const empId =
       s(body?.empId ?? body?.emp_id) ||
       s(getCookie(req, "empId")) ||
@@ -257,10 +265,43 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 최종으로 쓸 attemptId(bigint)
+    // 先 questions 조회해서 totalPointsGuess 계산 (attempt 생성 시 total_points 넣기 위해)
+    const normalizedQids = items
+      .map((x) => normalizeQid(x.questionId))
+      .filter((x) => x !== null) as Array<number | string>;
+
+    const uniqueQids = Array.from(new Set(normalizedQids.map((x) => String(x))));
+    const allNumeric = uniqueQids.every((x) => /^\d+$/.test(x));
+    const qidsForQuery = allNumeric ? uniqueQids.map((x) => Number(x)) : uniqueQids;
+
+    const { data: questions, error: qErr } = await client
+      .from("questions")
+      .select("*")
+      .in("id", qidsForQuery as any);
+
+    if (qErr) {
+      return NextResponse.json(
+        { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String((qErr as any)?.message ?? qErr) },
+        { status: 500 }
+      );
+    }
+
+    const qById = new Map<string, any>();
+    for (const q of questions ?? []) qById.set(String(q.id), q);
+
+    // totalPointsGuess
+    let totalPointsGuess = 0;
+    for (const it of items) {
+      const qid = normalizeQid(it.questionId);
+      const q = qById.get(String(qid));
+      const pts = n(q?.points, 0) ?? 0;
+      totalPointsGuess += pts;
+    }
+
+    // ✅ 최종 attemptId(bigint)
     let attemptId: number | null = null;
     let resolvedBy = r0.resolvedBy;
-    const resolveDetail: any = {};
+    const resolveDetail: any = { empId };
 
     if (typeof attemptIdRaw === "number") {
       attemptId = attemptIdRaw;
@@ -273,8 +314,7 @@ export async function POST(req: Request) {
         );
       }
 
-      // ✅ DB에 매핑 컬럼이 없으니: empId로 pick 없으면 create
-      const oc = await getOrCreateAttemptIdByEmpId(client, empId, items.length);
+      const oc = await getOrCreateAttemptIdByEmpId(client, empId, items.length, totalPointsGuess);
       if (!oc.attemptId) {
         return NextResponse.json(
           {
@@ -289,11 +329,10 @@ export async function POST(req: Request) {
       attemptId = oc.attemptId;
       resolvedBy = `${resolvedBy}=>${oc.mode}_BY_EMPID`;
       resolveDetail.clientAttemptUuid = uuid;
-      resolveDetail.empId = empId;
       resolveDetail.pickCreate = oc;
     }
 
-    // attempt 조회 (없으면 여기서도 생성했으니 보통 존재)
+    // attempt 조회
     const { data: attempt, error: aErr } = await client
       .from("exam_attempts")
       .select("*")
@@ -307,29 +346,13 @@ export async function POST(req: Request) {
       );
     }
     if (!attempt) {
-      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId, resolvedBy, ...resolveDetail } }, { status: 404 });
-    }
-
-    // questions 조회/채점
-    const normalizedQids = items
-      .map((x) => normalizeQid(x.questionId))
-      .filter((x) => x !== null) as Array<number | string>;
-
-    const uniqueQids = Array.from(new Set(normalizedQids.map((x) => String(x))));
-    const allNumeric = uniqueQids.every((x) => /^\d+$/.test(x));
-    const qidsForQuery = allNumeric ? uniqueQids.map((x) => Number(x)) : uniqueQids;
-
-    const { data: questions, error: qErr } = await client.from("questions").select("*").in("id", qidsForQuery as any);
-    if (qErr) {
       return NextResponse.json(
-        { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String((qErr as any)?.message ?? qErr) },
-        { status: 500 }
+        { ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId, resolvedBy, ...resolveDetail } },
+        { status: 404 }
       );
     }
 
-    const qById = new Map<string, any>();
-    for (const q of questions ?? []) qById.set(String(q.id), q);
-
+    // 채점/rows 생성
     let totalPoints = 0;
     let score = 0;
     let correctCount = 0;
@@ -360,7 +383,7 @@ export async function POST(req: Request) {
         answerMapForAttempt[String(qid)] = Number(it.selectedIndex);
 
         return {
-          attempt_id: attemptId, // ✅ bigint
+          attempt_id: attemptId,
           question_id: qid,
           selected_index: Number(it.selectedIndex),
           is_correct: isCorrect,
@@ -375,7 +398,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 재제출 대비: 기존 삭제 후 insert
+    // 기존 삭제 후 insert
     const { error: delErr } = await client.from("exam_attempt_answers").delete().eq("attempt_id", attemptId);
     if (delErr) {
       return NextResponse.json(
@@ -415,7 +438,7 @@ export async function POST(req: Request) {
 
     return NextResponse.json({
       ok: true,
-      attemptId, // ✅ bigint (이걸로 결과 페이지 가야함)
+      attemptId,
       resolvedBy,
       score,
       totalPoints,
@@ -423,8 +446,8 @@ export async function POST(req: Request) {
       wrongQuestionIds,
       savedAnswers: rows.length,
       marker: "SUBMIT_PATCH_2026-01-12_v3_CREATE_ATTEMPT",
-      redirectUrl: `/exam/result/${attemptId}`, // ✅ 프론트가 이걸 쓰면 완벽
-      debug: { ...resolveDetail },
+      redirectUrl: `/exam/result/${attemptId}`,
+      debug: { ...resolveDetail, qidsAllNumeric: allNumeric, qidsCount: uniqueQids.length },
     });
   } catch (e: any) {
     return NextResponse.json(
