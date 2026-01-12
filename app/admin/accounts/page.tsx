@@ -1,40 +1,50 @@
+// app/admin/accounts/page.tsx
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-type Account = {
-  id: number;
-  emp_id: string;
-  name: string | null;
-  is_active: boolean;
-  created_at: string;
-};
+type Account = any;
+
+type ListResp =
+  | { ok: true; items: Account[] }
+  | { ok: false; error: string; detail?: any };
+
+type PostResp =
+  | { ok: true; item: Account; mode?: string; tempPassword?: string; marker?: string }
+  | { ok: false; error: string; detail?: any };
+
+function s(v: any) {
+  return String(v ?? "").trim();
+}
 
 export default function AdminAccountsPage() {
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState<Account[]>([]);
-  const [err, setErr] = useState<string | null>(null);
-  const [okMsg, setOkMsg] = useState<string | null>(null);
-
-  // form
   const [empId, setEmpId] = useState("");
   const [name, setName] = useState("");
   const [isActive, setIsActive] = useState(true);
 
-  const canCreate = useMemo(() => empId.trim().length > 0, [empId]);
+  const [items, setItems] = useState<Account[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState<string>("");
+  const [err, setErr] = useState<string>("");
 
   async function load() {
+    setErr("");
     setLoading(true);
-    setErr(null);
     try {
-      const res = await fetch("/api/admin/accounts", { method: "GET" });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok || !j?.ok) {
-        throw new Error(j?.detail || j?.error || `LOAD_FAILED (${res.status})`);
+      const res = await fetch("/api/admin/accounts", { cache: "no-store" });
+      const text = await res.text();
+      const json = (text ? JSON.parse(text) : null) as ListResp;
+
+      if (!res.ok || !json?.ok) {
+        setItems([]);
+        setErr((json as any)?.error || `HTTP_${res.status}`);
+        return;
       }
-      setRows(j.rows || []);
+
+      setItems(Array.isArray((json as any).items) ? (json as any).items : []);
     } catch (e: any) {
-      setErr(String(e?.message || e));
+      setItems([]);
+      setErr(String(e?.message ?? e));
     } finally {
       setLoading(false);
     }
@@ -44,210 +54,194 @@ export default function AdminAccountsPage() {
     load();
   }, []);
 
-  async function onCreate() {
-    setErr(null);
-    setOkMsg(null);
+  const listCount = useMemo(() => items?.length ?? 0, [items]);
 
+  async function onCreate() {
+    setErr("");
+    setMsg("");
     const payload = {
-      empId: empId.trim(),
-      name: name.trim() || null,
-      isActive,
+      empId: s(empId),
+      name: s(name), // "이름(선택)"
+      is_active: !!isActive,
     };
 
+    if (!payload.empId) {
+      setErr("응시자ID(emp_id)를 입력해줘.");
+      return;
+    }
+
+    setLoading(true);
     try {
       const res = await fetch("/api/admin/accounts", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // ✅ 버튼 눌렀는데 “반응이 없다” 방지: body 반드시 넣기
+        headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
+        cache: "no-store",
       });
 
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok || !j?.ok) {
-        throw new Error(j?.detail || j?.error || `CREATE_FAILED (${res.status})`);
+      const text = await res.text();
+      const json = (text ? JSON.parse(text) : null) as PostResp;
+
+      if (!res.ok || !json?.ok) {
+        setErr((json as any)?.error || `HTTP_${res.status}`);
+        return;
       }
 
-      setOkMsg(`생성 완료: ${j.emp_id}`);
+      const createdEmpId =
+        (json as any)?.item?.emp_id ??
+        (json as any)?.item?.empId ??
+        payload.empId;
+
+      const tempPw = (json as any)?.tempPassword;
+
+      // ✅ 여기서 undefined 안 뜨게 보장
+      setMsg(`생성 완료: ${createdEmpId}${tempPw ? ` (기본비번: ${tempPw})` : ""}`);
+
+      // ✅ 생성 후 목록 다시 불러오기
+      await load();
+
+      // 입력값 일부 초기화(원하면 빼도 됨)
       setEmpId("");
       setName("");
       setIsActive(true);
-
-      await load();
     } catch (e: any) {
-      setErr(String(e?.message || e));
-    }
-  }
-
-  async function onToggle(row: Account) {
-    setErr(null);
-    setOkMsg(null);
-
-    try {
-      const res = await fetch("/api/admin/accounts", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: row.id, isActive: !row.is_active }),
-      });
-
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok || !j?.ok) {
-        throw new Error(j?.detail || j?.error || `UPDATE_FAILED (${res.status})`);
-      }
-      setOkMsg(`변경 완료: ${row.emp_id}`);
-      await load();
-    } catch (e: any) {
-      setErr(String(e?.message || e));
+      setErr(String(e?.message ?? e));
+    } finally {
+      setLoading(false);
     }
   }
 
   return (
-    <div style={{ padding: 24, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
-      <h1 style={{ fontSize: 20, fontWeight: 800, marginBottom: 12 }}>응시자 계정 관리</h1>
+    <div style={{ padding: 24 }}>
+      <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 12 }}>응시자 계정 관리</h2>
 
-      {/* 메시지 */}
-      {err && (
-        <div style={{ marginBottom: 12, padding: 10, border: "1px solid #fecaca", background: "#fff1f2", borderRadius: 12 }}>
-          <b>에러</b>: {err}
+      {err ? (
+        <div style={{ background: "#ffecec", color: "#b40000", padding: 12, borderRadius: 10, marginBottom: 12 }}>
+          에러: {err}
         </div>
-      )}
-      {okMsg && (
-        <div style={{ marginBottom: 12, padding: 10, border: "1px solid #bbf7d0", background: "#f0fdf4", borderRadius: 12 }}>
-          {okMsg}
-        </div>
-      )}
+      ) : null}
 
-      {/* 생성 폼 */}
-      <div style={{ border: "1px solid #e5e7eb", borderRadius: 14, padding: 14, marginBottom: 14 }}>
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "end" }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <label style={{ fontSize: 12, color: "#6b7280" }}>응시자ID(emp_id) *</label>
+      {msg ? (
+        <div style={{ background: "#e9f8ee", color: "#116b2b", padding: 12, borderRadius: 10, marginBottom: 12 }}>
+          {msg}
+        </div>
+      ) : null}
+
+      <div
+        style={{
+          border: "1px solid #e5e5e5",
+          borderRadius: 12,
+          padding: 14,
+          marginBottom: 18,
+        }}
+      >
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ minWidth: 240 }}>
+            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>응시자ID(emp_id) *</div>
             <input
               value={empId}
               onChange={(e) => setEmpId(e.target.value)}
               placeholder="예: 201978"
-              style={{ width: 220, padding: "10px 12px", borderRadius: 12, border: "1px solid #e5e7eb" }}
+              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
             />
           </div>
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <label style={{ fontSize: 12, color: "#6b7280" }}>이름(선택)</label>
+          <div style={{ minWidth: 240 }}>
+            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>이름(선택)</div>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="예: 홍길동"
-              style={{ width: 220, padding: "10px 12px", borderRadius: 12, border: "1px solid #e5e7eb" }}
+              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
             />
           </div>
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <label style={{ fontSize: 12, color: "#6b7280" }}>사용 여부</label>
+          <div style={{ minWidth: 140 }}>
+            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>사용 여부</div>
             <select
               value={isActive ? "Y" : "N"}
               onChange={(e) => setIsActive(e.target.value === "Y")}
-              style={{ width: 160, padding: "10px 12px", borderRadius: 12, border: "1px solid #e5e7eb" }}
+              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
             >
               <option value="Y">사용</option>
               <option value="N">미사용</option>
             </select>
           </div>
 
-          {/* ✅ submit 이슈 방지: type="button" */}
           <button
-            type="button"
             onClick={onCreate}
-            disabled={!canCreate}
+            disabled={loading}
             style={{
-              padding: "10px 14px",
-              borderRadius: 12,
-              border: "1px solid #111827",
-              background: canCreate ? "#111827" : "#9ca3af",
-              color: "white",
-              fontWeight: 800,
-              cursor: canCreate ? "pointer" : "not-allowed",
+              padding: "10px 16px",
+              borderRadius: 10,
+              border: "1px solid #222",
+              background: "#222",
+              color: "#fff",
+              fontWeight: 700,
+              cursor: "pointer",
+              opacity: loading ? 0.7 : 1,
             }}
           >
             생성
           </button>
 
           <button
-            type="button"
             onClick={load}
+            disabled={loading}
             style={{
-              padding: "10px 14px",
-              borderRadius: 12,
-              border: "1px solid #e5e7eb",
-              background: "white",
-              fontWeight: 800,
+              padding: "10px 16px",
+              borderRadius: 10,
+              border: "1px solid #ddd",
+              background: "#fff",
               cursor: "pointer",
+              opacity: loading ? 0.7 : 1,
             }}
           >
             새로고침
           </button>
         </div>
 
-        <div style={{ marginTop: 8, color: "#6b7280", fontSize: 12 }}>
-          * “생성” 눌렀는데 아무 반응 없으면: 브라우저 개발자도구 → Network에서 <b>/api/admin/accounts</b> POST가 찍히는지 확인
+        <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
+          * “생성” 눌렀는데 목록이 안 바뀌면 DevTools → Network에서 <b>/api/admin/accounts</b> GET/POST 응답을 확인
         </div>
       </div>
 
-      {/* 목록 */}
-      <div style={{ border: "1px solid #e5e7eb", borderRadius: 14, overflow: "hidden" }}>
-        <div style={{ padding: 12, borderBottom: "1px solid #e5e7eb", display: "flex", justifyContent: "space-between" }}>
-          <div style={{ fontWeight: 800 }}>
-            목록 {loading ? "(로딩중...)" : `(${rows.length}건)`}
+      <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, overflow: "hidden" }}>
+        <div style={{ padding: 12, fontWeight: 700 }}>목록 ({listCount}건)</div>
+
+        <div style={{ borderTop: "1px solid #eee" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", padding: 12, fontWeight: 700 }}>
+            <div>ID</div>
+            <div>emp_id</div>
+            <div>이름</div>
+            <div>사용</div>
+            <div>생성일</div>
           </div>
-        </div>
 
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr style={{ background: "#f9fafb", textAlign: "left" }}>
-                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>ID</th>
-                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>emp_id</th>
-                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>이름</th>
-                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>사용</th>
-                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>생성일</th>
-                <th style={{ padding: 10, borderBottom: "1px solid #e5e7eb" }}>관리</th>
-              </tr>
-            </thead>
-            <tbody>
-              {!loading && rows.length === 0 && (
-                <tr>
-                  <td colSpan={6} style={{ padding: 14, color: "#6b7280" }}>
-                    아직 계정이 없습니다.
-                  </td>
-                </tr>
-              )}
-
-              {rows.map((r) => (
-                <tr key={r.id}>
-                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>{r.id}</td>
-                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6", fontWeight: 800 }}>{r.emp_id}</td>
-                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>{r.name || "-"}</td>
-                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>{r.is_active ? "사용" : "미사용"}</td>
-                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>
-                    {new Date(r.created_at).toLocaleString()}
-                  </td>
-                  <td style={{ padding: 10, borderBottom: "1px solid #f3f4f6" }}>
-                    <button
-                      type="button"
-                      onClick={() => onToggle(r)}
-                      style={{
-                        padding: "8px 10px",
-                        borderRadius: 10,
-                        border: "1px solid #e5e7eb",
-                        background: "white",
-                        fontWeight: 800,
-                        cursor: "pointer",
-                      }}
-                    >
-                      {r.is_active ? "미사용으로" : "사용으로"}
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div style={{ borderTop: "1px solid #eee" }}>
+            {items.length === 0 ? (
+              <div style={{ padding: 12, opacity: 0.7 }}>아직 계정이 없습니다.</div>
+            ) : (
+              items.map((it: any) => (
+                <div
+                  key={String(it?.id ?? it?.emp_id ?? Math.random())}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr",
+                    padding: 12,
+                    borderTop: "1px solid #f2f2f2",
+                    alignItems: "center",
+                  }}
+                >
+                  <div style={{ wordBreak: "break-all" }}>{String(it?.id ?? "-")}</div>
+                  <div>{String(it?.emp_id ?? it?.empId ?? "-")}</div>
+                  <div>{String(it?.name ?? it?.display_name ?? it?.fullname ?? it?.username ?? "-")}</div>
+                  <div>{it?.is_active ? "사용" : "미사용"}</div>
+                  <div>{String(it?.created_at ?? it?.createdAt ?? "-")}</div>
+                </div>
+              ))
+            )}
+          </div>
         </div>
       </div>
     </div>
