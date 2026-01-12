@@ -35,7 +35,7 @@ function isUUID(v: any) {
 }
 
 /** questions.id 정규화 */
-function normalizeId(v: any): number | string | null {
+function normalizeQid(v: any): number | string | null {
   const t = s(v);
   if (!t) return null;
   if (isNumericId(t)) return Number(t);
@@ -122,7 +122,7 @@ function normalizeAnswers(body: any): AnswerItem[] {
 }
 
 /** attemptId 원본 받기 (숫자 or UUID) */
-async function resolveAttemptIdRaw(req: Request, body: any) {
+function resolveAttemptIdRaw(req: Request, body: any) {
   // querystring
   try {
     const u = new URL(req.url);
@@ -168,21 +168,13 @@ async function resolveAttemptIdRaw(req: Request, body: any) {
 }
 
 /**
- * ✅ 응급처치 핵심:
- * UUID가 DB에 저장이 안 되어 있어도 제출이 되게,
- * empId 기준 "가장 최근 미제출 attempt"를 찾아 bigint id로 제출 처리.
+ * ✅ 핵심: UUID가 와도 제출되게.
+ * - DB에 미제출 attempt가 없으면 새로 만들고(INSERT)
+ * - 그 bigint id로 제출 처리
  */
-async function fallbackAttemptIdByEmpId(client: any, req: Request, body: any) {
-  const empId =
-    s(body?.empId ?? body?.emp_id) ||
-    s(getCookie(req, "empId")) ||
-    s(getCookie(req, "emp_id")) ||
-    "";
-
-  if (!empId) return { attemptId: null as number | null, detail: { empId: "" } };
-
-  // STARTED / 진행중이면서 submitted_at이 null인 최신 attempt
-  const { data, error } = await client
+async function getOrCreateAttemptIdByEmpId(client: any, empId: string, totalQuestionsGuess: number) {
+  // 1) 미제출(진행중) attempt 있으면 그걸 사용
+  const { data: picked, error: pickErr } = await client
     .from("exam_attempts")
     .select("id, emp_id, status, started_at, submitted_at")
     .eq("emp_id", empId)
@@ -191,12 +183,41 @@ async function fallbackAttemptIdByEmpId(client: any, req: Request, body: any) {
     .limit(1)
     .maybeSingle();
 
-  if (error) {
-    return { attemptId: null as number | null, detail: { empId, error: String((error as any)?.message ?? error) } };
+  if (!pickErr && picked?.id != null) {
+    const idNum = n(picked.id, null);
+    if (idNum !== null) return { attemptId: idNum, mode: "PICKED", picked };
   }
 
-  const idNum = n(data?.id, null);
-  return { attemptId: idNum, detail: { empId, picked: data ?? null } };
+  // 2) 없으면 새로 생성 (start API가 레코드 안 만드는 상태를 여기서 보정)
+  const nowIso = new Date().toISOString();
+  const insertRow: any = {
+    emp_id: empId,
+    status: "STARTED",
+    started_at: nowIso,
+  };
+
+  // 테이블에 total_questions 컬럼이 있으면 들어가게 시도(없으면 DB가 무시 못함 → 에러라서 안전하게 2단계로)
+  const { data: created, error: insErr } = await client
+    .from("exam_attempts")
+    .insert(insertRow)
+    .select("id, emp_id, status, started_at, submitted_at")
+    .maybeSingle();
+
+  if (insErr) {
+    return { attemptId: null as number | null, mode: "CREATE_FAILED", error: String((insErr as any)?.message ?? insErr) };
+  }
+
+  const createdId = n(created?.id, null);
+  if (createdId === null) {
+    return { attemptId: null as number | null, mode: "CREATE_FAILED", error: "CREATED_ID_NOT_NUMERIC", created };
+  }
+
+  // total_questions 컬럼이 있으면 업데이트 시도(없으면 에러 나는데 그건 무시)
+  try {
+    await client.from("exam_attempts").update({ total_questions: totalQuestionsGuess }).eq("id", createdId);
+  } catch {}
+
+  return { attemptId: createdId, mode: "CREATED", created };
 }
 
 export async function POST(req: Request) {
@@ -208,12 +229,30 @@ export async function POST(req: Request) {
   try {
     const body = await readBody(req);
 
-    const r0 = await resolveAttemptIdRaw(req, body);
+    const items = normalizeAnswers(body);
+    if (items.length === 0) {
+      return NextResponse.json({ ok: false, error: "NO_ANSWERS", detail: { keys: Object.keys(body ?? {}) } }, { status: 400 });
+    }
+
+    const r0 = resolveAttemptIdRaw(req, body);
     const attemptIdRaw = r0.attemptIdRaw;
+
+    // empId는 UUID fallback/생성에 필수
+    const empId =
+      s(body?.empId ?? body?.emp_id) ||
+      s(getCookie(req, "empId")) ||
+      s(getCookie(req, "emp_id")) ||
+      "";
 
     if (!attemptIdRaw) {
       return NextResponse.json(
         { ok: false, error: "INVALID_ATTEMPT_ID", detail: { resolvedBy: r0.resolvedBy, ...(r0.detail ?? {}) } },
+        { status: 400 }
+      );
+    }
+    if (!empId) {
+      return NextResponse.json(
+        { ok: false, error: "MISSING_EMPID", detail: { note: "empId cookie/body required for UUID fallback" } },
         { status: 400 }
       );
     }
@@ -226,7 +265,6 @@ export async function POST(req: Request) {
     if (typeof attemptIdRaw === "number") {
       attemptId = attemptIdRaw;
     } else {
-      // UUID가 들어오면: DB id(bigint)로 직접 조회하면 무조건 터짐 → empId로 fallback
       const uuid = s(attemptIdRaw);
       if (!isUUID(uuid)) {
         return NextResponse.json(
@@ -235,39 +273,27 @@ export async function POST(req: Request) {
         );
       }
 
-      const fb = await fallbackAttemptIdByEmpId(client, req, body);
-      if (!fb.attemptId) {
+      // ✅ DB에 매핑 컬럼이 없으니: empId로 pick 없으면 create
+      const oc = await getOrCreateAttemptIdByEmpId(client, empId, items.length);
+      if (!oc.attemptId) {
         return NextResponse.json(
           {
             ok: false,
-            error: "ATTEMPT_ID_UUID_NOT_MAPPED",
-            detail: {
-              attempt_uuid: uuid,
-              resolvedBy,
-              note: "exam_attempts.id is bigint but client sent UUID; fallback by empId failed",
-              fallback: fb.detail,
-              keys: Object.keys(body ?? {}),
-            },
+            error: "ATTEMPT_CREATE_OR_PICK_FAILED",
+            detail: { empId, clientAttemptUuid: uuid, resolvedBy, ...oc },
           },
-          { status: 400 }
+          { status: 500 }
         );
       }
 
-      attemptId = fb.attemptId;
-      resolvedBy = `${resolvedBy}=>FALLBACK_LATEST_UNSUBMITTED_BY_EMPID`;
-      resolveDetail.mappedFromUuid = uuid;
-      resolveDetail.fallback = fb.detail;
+      attemptId = oc.attemptId;
+      resolvedBy = `${resolvedBy}=>${oc.mode}_BY_EMPID`;
+      resolveDetail.clientAttemptUuid = uuid;
+      resolveDetail.empId = empId;
+      resolveDetail.pickCreate = oc;
     }
 
-    const items = normalizeAnswers(body);
-    if (items.length === 0) {
-      return NextResponse.json(
-        { ok: false, error: "NO_ANSWERS", detail: { resolvedBy, attemptId, ...resolveDetail } },
-        { status: 400 }
-      );
-    }
-
-    // ✅ bigint id로만 attempt 조회
+    // attempt 조회 (없으면 여기서도 생성했으니 보통 존재)
     const { data: attempt, error: aErr } = await client
       .from("exam_attempts")
       .select("*")
@@ -284,20 +310,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId, resolvedBy, ...resolveDetail } }, { status: 404 });
     }
 
-    // questions 조회
+    // questions 조회/채점
     const normalizedQids = items
-      .map((x) => normalizeId(x.questionId))
+      .map((x) => normalizeQid(x.questionId))
       .filter((x) => x !== null) as Array<number | string>;
 
     const uniqueQids = Array.from(new Set(normalizedQids.map((x) => String(x))));
     const allNumeric = uniqueQids.every((x) => /^\d+$/.test(x));
     const qidsForQuery = allNumeric ? uniqueQids.map((x) => Number(x)) : uniqueQids;
 
-    const { data: questions, error: qErr } = await client
-      .from("questions")
-      .select("*")
-      .in("id", qidsForQuery as any);
-
+    const { data: questions, error: qErr } = await client.from("questions").select("*").in("id", qidsForQuery as any);
     if (qErr) {
       return NextResponse.json(
         { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String((qErr as any)?.message ?? qErr) },
@@ -316,7 +338,7 @@ export async function POST(req: Request) {
 
     const rows = items
       .map((it) => {
-        const qid = normalizeId(it.questionId);
+        const qid = normalizeQid(it.questionId);
         if (qid === null) return null;
 
         const q = qById.get(String(qid));
@@ -353,7 +375,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 기존 삭제 후 insert
+    // 재제출 대비: 기존 삭제 후 insert
     const { error: delErr } = await client.from("exam_attempt_answers").delete().eq("attempt_id", attemptId);
     if (delErr) {
       return NextResponse.json(
@@ -393,15 +415,16 @@ export async function POST(req: Request) {
 
     return NextResponse.json({
       ok: true,
-      attemptId, // ✅ bigint
+      attemptId, // ✅ bigint (이걸로 결과 페이지 가야함)
       resolvedBy,
       score,
       totalPoints,
       correctCount,
       wrongQuestionIds,
       savedAnswers: rows.length,
-      marker: "SUBMIT_OK_FALLBACK_BY_EMPID_WHEN_UUID_SENT",
-      debug: { qidsAllNumeric: allNumeric, qidsCount: uniqueQids.length, ...resolveDetail },
+      marker: "SUBMIT_PATCH_2026-01-12_v3_CREATE_ATTEMPT",
+      redirectUrl: `/exam/result/${attemptId}`, // ✅ 프론트가 이걸 쓰면 완벽
+      debug: { ...resolveDetail },
     });
   } catch (e: any) {
     return NextResponse.json(
