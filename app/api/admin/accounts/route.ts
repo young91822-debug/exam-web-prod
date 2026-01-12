@@ -1,15 +1,12 @@
 // app/api/admin/accounts/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
+import crypto from "crypto";
 
 export const dynamic = "force-dynamic";
 
 function s(v: any) {
   return String(v ?? "").trim();
-}
-function n(v: any, d: number | null = null) {
-  const x = Number(v);
-  return Number.isFinite(x) ? x : d;
 }
 function b(v: any, d = true) {
   if (v === undefined || v === null || v === "") return d;
@@ -34,6 +31,16 @@ async function readBody(req: Request): Promise<any> {
   }
 }
 
+/**
+ * password_hash 생성 (crypto.scrypt)
+ * 저장 포맷: scrypt$<saltB64>$<hashB64>
+ */
+function makePasswordHash(plain: string) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(plain, salt, 64);
+  return `scrypt$${salt.toString("base64")}$${hash.toString("base64")}`;
+}
+
 export async function GET() {
   try {
     const { data, error } = await supabaseAdmin
@@ -42,12 +49,18 @@ export async function GET() {
       .order("created_at", { ascending: false });
 
     if (error) {
-      return NextResponse.json({ ok: false, error: "ACCOUNTS_LIST_FAILED", detail: error.message }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "ACCOUNTS_LIST_FAILED", detail: error.message },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({ ok: true, items: data ?? [] });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: "ACCOUNTS_LIST_FAILED", detail: String(e?.message ?? e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "ACCOUNTS_LIST_FAILED", detail: String(e?.message ?? e) },
+      { status: 500 }
+    );
   }
 }
 
@@ -55,68 +68,119 @@ export async function POST(req: Request) {
   try {
     const body = await readBody(req);
 
-    // 화면/프론트가 어떤 키로 보내도 다 받게
     const empId = s(body.empId ?? body.emp_id ?? body.employeeId ?? body.employee_id);
-    const name = s(body.name ?? body.displayName ?? body.koreanName ?? body.fullname); // "이름(선택)" 값
+    const name = s(body.name ?? body.displayName ?? body.koreanName ?? body.fullname);
     const isActive = b(body.isActive ?? body.is_active ?? body.active ?? body.use, true);
 
-    // ✅ 핵심: accounts.username NOT NULL 대응
-    // 우선순위: body.username -> body.name -> empId
+    // accounts.username NOT NULL 대응
     const username = s(body.username) || name || empId;
 
     if (!empId) {
       return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
     }
     if (!username) {
-      // empId도 없고 name도 없으면 여기로 오는데, empId 체크에서 이미 걸러짐
       return NextResponse.json({ ok: false, error: "MISSING_USERNAME" }, { status: 400 });
     }
 
-    // 1) username/emp_id/is_active 처럼 "거의 확실히 존재하는 컬럼만"으로 안전하게 upsert
-    const baseRow: any = {
-      emp_id: empId,
-      username,            // ✅ NOT NULL 채움
-      is_active: isActive, // ✅ 사용여부
-    };
-
-    const { data: upserted, error: upErr } = await supabaseAdmin
+    // 1) 먼저 기존 계정 있는지 확인 (있으면 비번 건드리지 말 것)
+    const { data: exists, error: exErr } = await supabaseAdmin
       .from("accounts")
-      .upsert(baseRow, { onConflict: "emp_id" })
-      .select("*")
+      .select("id, emp_id")
+      .eq("emp_id", empId)
       .maybeSingle();
 
-    if (upErr) {
+    if (exErr) {
       return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_UPSERT_FAILED", detail: upErr.message, sent: baseRow },
+        { ok: false, error: "ACCOUNTS_EXIST_CHECK_FAILED", detail: exErr.message },
         { status: 500 }
       );
     }
 
-    // 2) name 컬럼이 테이블에 있으면 업데이트(없으면 에러 나는데 그건 무시하고 진행)
-    //    -> username NOT NULL 문제는 이미 해결됐으니, 부가정보만 "있으면" 저장
-    if (name && upserted?.id) {
-      const tryCols = [
-        { col: "name", val: name },
-        { col: "display_name", val: name },
-        { col: "fullname", val: name },
-      ];
+    // ✅ 신규 생성 시 기본 비밀번호
+    // - body.password / body.pw / body.passwordPlain 보내면 그걸로 생성 가능
+    // - 없으면 기본값 1234
+    const plainPassword = s(body.password ?? body.pw ?? body.passwordPlain) || "1234";
 
-      for (const t of tryCols) {
-        const { error: nameErr } = await supabaseAdmin
-          .from("accounts")
-          .update({ [t.col]: t.val })
-          .eq("id", upserted.id);
+    if (exists?.id) {
+      // ====== UPDATE (기존 계정) ======
+      const updateRow: any = { username, is_active: isActive };
 
-        if (!nameErr) break; // 하나라도 성공하면 종료
+      const { data: updated, error: upErr } = await supabaseAdmin
+        .from("accounts")
+        .update(updateRow)
+        .eq("id", exists.id)
+        .select("*")
+        .maybeSingle();
+
+      if (upErr) {
+        return NextResponse.json(
+          { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: upErr.message, sent: updateRow },
+          { status: 500 }
+        );
       }
-    }
 
-    return NextResponse.json({
-      ok: true,
-      item: upserted,
-      saved: { empId, username, isActive, name: name || null },
-      marker: "ACCOUNTS_CREATED_OR_UPDATED_WITH_USERNAME_NOT_NULL",
-    });
+      // name 컬럼이 있으면 저장 시도(없으면 실패해도 무시)
+      if (name) {
+        const tryCols = ["name", "display_name", "fullname"];
+        for (const col of tryCols) {
+          const { error: nameErr } = await supabaseAdmin
+            .from("accounts")
+            .update({ [col]: name })
+            .eq("id", exists.id);
+          if (!nameErr) break;
+        }
+      }
+
+      return NextResponse.json({
+        ok: true,
+        item: updated,
+        mode: "UPDATED",
+        marker: "ACCOUNTS_UPDATED_PASSWORD_UNCHANGED",
+      });
+    } else {
+      // ====== INSERT (신규 계정) ======
+      const password_hash = makePasswordHash(plainPassword);
+
+      const insertRow: any = {
+        emp_id: empId,
+        username,
+        is_active: isActive,
+        password_hash, // ✅ NOT NULL 충족
+      };
+
+      const { data: inserted, error: insErr } = await supabaseAdmin
+        .from("accounts")
+        .insert(insertRow)
+        .select("*")
+        .maybeSingle();
+
+      if (insErr) {
+        return NextResponse.json(
+          { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: insErr.message, sent: { ...insertRow, password_hash: "****" } },
+          { status: 500 }
+        );
+      }
+
+      // name 컬럼 있으면 저장 시도(없으면 무시)
+      if (name && inserted?.id) {
+        const tryCols = ["name", "display_name", "fullname"];
+        for (const col of tryCols) {
+          const { error: nameErr } = await supabaseAdmin
+            .from("accounts")
+            .update({ [col]: name })
+            .eq("id", inserted.id);
+          if (!nameErr) break;
+        }
+      }
+
+      return NextResponse.json({
+        ok: true,
+        item: inserted,
+        mode: "CREATED",
+        tempPassword: plainPassword, // ✅ 화면에서 "기본 비번" 안내 가능
+        marker: "ACCOUNTS_CREATED_WITH_PASSWORD_HASH",
+      });
+    }
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "ACCOUNTS_CREATE_FAILED", detail: String(e?.message ?? e) },
