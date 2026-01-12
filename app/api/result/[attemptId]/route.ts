@@ -15,25 +15,11 @@ function n(v: any, d = 0) {
   return Number.isFinite(x) ? x : d;
 }
 
-function pickAttemptUuid(attempt: any): string | null {
-  // ✅ exam_attempts 안에 있을 법한 UUID 후보들
-  const candidates = [
-    attempt?.attempt_id,      // 흔함
-    attempt?.attempt_uuid,
-    attempt?.attempt_uid,
-    attempt?.uuid,
-    attempt?.id_uuid,
-    attempt?.public_id,
-    attempt?.session_id,
-    attempt?.exam_attempt_id,
-  ];
-
-  for (const v of candidates) {
-    const str = s(v);
-    // uuid v4 형태 대충 체크
-    if (/^[0-9a-fA-F-]{36}$/.test(str)) return str;
-  }
-  return null;
+function pickChoices(q: any): string[] {
+  const c = q?.choices ?? q?.options ?? q?.choice_list ?? q?.choice_texts ?? [];
+  if (Array.isArray(c)) return c.map((x) => String(x ?? ""));
+  if (typeof c === "string") return c.split("\n").map((x) => x.trim()).filter(Boolean);
+  return [];
 }
 
 export async function GET(
@@ -65,73 +51,70 @@ export async function GET(
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
     }
 
-    // ✅ 2) attempt_answers는 attempt_id(UUID)를 요구함 → attempt에서 UUID 찾아서 조회
-    const attemptUuid = pickAttemptUuid(attempt);
-    if (!attemptUuid) {
-      return NextResponse.json(
-        {
-          ok: true,
-          attempt,
-          graded: [],
-          totalQuestions: 0,
-          hint: {
-            message: "attempt_answers.attempt_id is uuid, but exam_attempts does not expose a uuid column",
-            need: "Add uuid column (e.g., attempt_uuid) to exam_attempts OR store numeric attempt_id in attempt_answers",
-          },
-        },
-        { status: 200 }
-      );
+    // ✅ 핵심: exam_attempts 안에 question_ids + answers(맵)가 이미 있음
+    const questionIds: string[] = Array.isArray(attempt?.question_ids)
+      ? attempt.question_ids.map((x: any) => String(x))
+      : [];
+
+    const answersMap: Record<string, any> =
+      (attempt?.answers && typeof attempt.answers === "object") ? attempt.answers : {};
+
+    // question_ids가 비었으면 answers 키로라도 시도
+    const qids = questionIds.length
+      ? questionIds
+      : Object.keys(answersMap || {}).map((k) => String(k));
+
+    if (!qids.length) {
+      return NextResponse.json({
+        ok: true,
+        attempt,
+        graded: [],
+        totalQuestions: 0,
+        hint: { message: "No question_ids/answers in exam_attempts." },
+      });
     }
 
-    // 2) answers (UUID로 조회)
-    const { data: answers, error: e2 } = await supabaseAdmin
-      .from("attempt_answers")
-      .select("*")
-      .eq("attempt_id", attemptUuid);
-
-    if (e2) {
-      return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: e2, attemptUuid }, { status: 500 });
-    }
-
-    // 3) questions
-    const qids = Array.from(
-      new Set((answers ?? []).map((a: any) => a?.question_id).filter(Boolean))
-    );
-
-    const { data: questions, error: e3 } = await supabaseAdmin
+    // 2) questions 조회 (uuid in)
+    const { data: questions, error: e2 } = await supabaseAdmin
       .from("questions")
       .select("*")
-      .in("id", qids.length ? qids : [-1]);
+      .in("id", qids);
 
-    if (e3) {
-      return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: e3 }, { status: 500 });
+    if (e2) {
+      return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: e2 }, { status: 500 });
     }
 
-    const qMap = new Map<any, any>();
-    for (const q of questions ?? []) qMap.set(q.id, q);
+    const qMap = new Map<string, any>();
+    for (const q of questions ?? []) qMap.set(String(q?.id), q);
 
-    const graded = (answers ?? []).map((a: any) => {
-      const q = qMap.get(a.question_id);
+    // 3) graded 구성 (question_ids 순서 유지)
+    const order = questionIds.length ? questionIds : qids;
+
+    const graded = order.map((qid: string) => {
+      const q = qMap.get(String(qid));
 
       const correctIndex =
         q?.correct_index ?? q?.correctIndex ?? q?.answer_index ?? q?.answerIndex ?? null;
 
+      const chosenIndexRaw =
+        answersMap?.[qid] ?? answersMap?.[String(qid)] ?? null;
+
       const chosenIndex =
-        a?.chosen_index ?? a?.chosenIndex ?? a?.answer_index ?? a?.answerIndex ?? null;
+        chosenIndexRaw === null || chosenIndexRaw === undefined ? null : n(chosenIndexRaw, NaN);
 
       const isCorrect =
-        a?.is_correct !== undefined && a?.is_correct !== null
-          ? Boolean(a.is_correct)
-          : correctIndex !== null &&
-            chosenIndex !== null &&
-            Number(correctIndex) === Number(chosenIndex);
+        correctIndex !== null &&
+        chosenIndex !== null &&
+        Number.isFinite(Number(correctIndex)) &&
+        Number.isFinite(Number(chosenIndex)) &&
+        Number(correctIndex) === Number(chosenIndex);
 
       return {
-        questionId: a.question_id,
+        questionId: qid,
         content: q?.content ?? q?.question ?? q?.title ?? "",
-        choices: q?.choices ?? q?.options ?? [],
-        correctIndex,
-        selectedIndex: chosenIndex,
+        choices: pickChoices(q),
+        correctIndex: correctIndex === null ? null : Number(correctIndex),
+        selectedIndex: chosenIndex === null || !Number.isFinite(chosenIndex) ? null : Number(chosenIndex),
         isCorrect,
         points: n(q?.points, 0),
       };
@@ -139,10 +122,20 @@ export async function GET(
 
     return NextResponse.json({
       ok: true,
-      attempt,
-      attemptUuid,
+      attempt: {
+        id: attempt.id,
+        emp_id: attempt.emp_id,
+        started_at: attempt.started_at,
+        submitted_at: attempt.submitted_at,
+        total_questions: attempt.total_questions,
+        total_points: attempt.total_points,
+        score: attempt.score,
+        correct_count: attempt.correct_count,
+        status: attempt.status,
+      },
       graded,
       totalQuestions: graded.length,
+      wrongCount: graded.filter((g: any) => g?.isCorrect === false).length,
     });
   } catch (err: any) {
     return NextResponse.json(
