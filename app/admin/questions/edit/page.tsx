@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import type { CSSProperties } from "react";
 
 export default function QuestionEditPage() {
   const router = useRouter();
@@ -21,7 +22,6 @@ export default function QuestionEditPage() {
 
   const canSave = useMemo(() => {
     if (!content.trim()) return false;
-    // 보기 2개 이상은 채워져 있어야 한다고 가정(원하면 조건 바꿔도 됨)
     const filled = choices.filter((c) => c.trim()).length;
     return filled >= 2;
   }, [content, choices]);
@@ -33,9 +33,10 @@ export default function QuestionEditPage() {
       setErr("");
       setLoading(true);
       try {
-        const res = await fetch(`/api/admin/questions/detail?id=${encodeURIComponent(id)}`, {
-          cache: "no-store",
-        });
+        const res = await fetch(
+          `/api/admin/questions/detail?id=${encodeURIComponent(id)}`,
+          { cache: "no-store" }
+        );
 
         const json = await res.json().catch(() => ({}));
         if (!res.ok || !json?.ok) {
@@ -48,17 +49,26 @@ export default function QuestionEditPage() {
         setPoints(Number(item.points ?? 1));
         setIsActive(item.is_active === false ? false : true);
 
-        // ✅ DB에 choices/correct_index가 있으면 로드
-        const dbChoices = Array.isArray(item.choices) ? item.choices : null;
-        if (dbChoices) {
-          const a = [0, 1, 2, 3].map((i) => String(dbChoices[i] ?? ""));
+        // ✅ DB 구조 대응:
+        // 1) choice1~choice4 컬럼 (현재 너 DB 스샷에 있음)
+        // 2) (혹시 남아있으면) choices 배열 컬럼도 fallback
+        const byChoiceCols = [item.choice1, item.choice2, item.choice3, item.choice4].some(
+          (v) => v != null
+        );
+
+        if (byChoiceCols) {
+          const a = [0, 1, 2, 3].map((i) => String(item[`choice${i + 1}`] ?? ""));
+          setChoices(a);
+        } else if (Array.isArray(item.choices)) {
+          const a = [0, 1, 2, 3].map((i) => String(item.choices?.[i] ?? ""));
           setChoices(a);
         } else {
           setChoices(["", "", "", ""]);
         }
 
-        const ci = Number(item.correct_index);
-        setCorrectIndex(Number.isFinite(ci) ? ci : 0);
+        // ✅ 정답 컬럼: answer_index (DB 스샷 기준)
+        const ai = Number(item.answer_index);
+        setCorrectIndex(Number.isFinite(ai) ? ai : 0);
       } finally {
         setLoading(false);
       }
@@ -88,8 +98,10 @@ export default function QuestionEditPage() {
           content,
           points,
           is_active: isActive,
+          // ✅ 보기 4개는 계속 배열로 관리하고, API에서 choice1~4로 매핑해서 저장
           choices,
-          correct_index: correctIndex,
+          // ✅ DB는 answer_index
+          answer_index: correctIndex,
         }),
       });
 
@@ -106,25 +118,53 @@ export default function QuestionEditPage() {
   }
 
   return (
-    <div style={{ padding: 24, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif", maxWidth: 980, margin: "0 auto" }}>
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
+    <div
+      style={{
+        padding: 24,
+        fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+        maxWidth: 980,
+        margin: "0 auto",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+          gap: 12,
+        }}
+      >
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 800, margin: 0 }}>문항 수정</h1>
-          <div style={{ fontSize: 13, opacity: 0.75, marginTop: 6 }}>ID: {id ?? "-"}</div>
+          <div style={{ fontSize: 13, opacity: 0.75, marginTop: 6 }}>
+            ID: {id ?? "-"}
+          </div>
         </div>
 
         <div style={{ display: "flex", gap: 8 }}>
           <button onClick={() => router.back()} disabled={loading} style={btnStyle}>
             취소
           </button>
-          <button onClick={onSave} disabled={loading || !canSave} style={{ ...btnStyle, borderColor: "#abefc6" }}>
+          <button
+            onClick={onSave}
+            disabled={loading || !canSave}
+            style={{ ...btnStyle, borderColor: "#abefc6" }}
+          >
             저장
           </button>
         </div>
       </div>
 
       {err ? (
-        <div style={{ marginTop: 12, padding: 10, background: "#fff3f2", border: "1px solid #f2b8b5", borderRadius: 10 }}>
+        <div
+          style={{
+            marginTop: 12,
+            padding: 10,
+            background: "#fff3f2",
+            border: "1px solid #f2b8b5",
+            borderRadius: 10,
+          }}
+        >
           <b style={{ color: "#b42318" }}>{err}</b>
         </div>
       ) : null}
@@ -137,7 +177,13 @@ export default function QuestionEditPage() {
             value={content}
             onChange={(e) => setContent(e.target.value)}
             rows={6}
-            style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", fontFamily: "inherit" }}
+            style={{
+              width: "100%",
+              padding: 10,
+              borderRadius: 10,
+              border: "1px solid #ddd",
+              fontFamily: "inherit",
+            }}
             disabled={loading}
           />
         </div>
@@ -191,10 +237,17 @@ export default function QuestionEditPage() {
           <div style={{ flex: "0 0 240px", border: "1px solid #eee", borderRadius: 12, padding: 14, background: "#fff" }}>
             <div style={{ fontSize: 13, opacity: 0.8, marginBottom: 6 }}>상태</div>
             <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input type="checkbox" checked={isActive} onChange={(e) => setIsActive(e.target.checked)} disabled={loading} />
+              <input
+                type="checkbox"
+                checked={isActive}
+                onChange={(e) => setIsActive(e.target.checked)}
+                disabled={loading}
+              />
               사용(ON)
             </label>
-            <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>OFF로 바꾸면 목록에서 OFF로 표시됩니다.</div>
+            <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+              OFF로 바꾸면 목록에서 OFF로 표시됩니다.
+            </div>
           </div>
         </div>
       </div>
@@ -202,7 +255,7 @@ export default function QuestionEditPage() {
   );
 }
 
-const btnStyle: React.CSSProperties = {
+const btnStyle: CSSProperties = {
   border: "1px solid #ddd",
   background: "#fff",
   padding: "8px 12px",
