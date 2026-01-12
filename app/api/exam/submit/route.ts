@@ -25,22 +25,18 @@ function n(v: any, d: number | null = null) {
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
 }
-
 function isNumericId(v: any) {
   const t = s(v);
   return /^\d+$/.test(t);
 }
-
 function isUUID(v: any) {
   const t = s(v);
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
 }
 
 /**
- * ✅ question_id 같은 "id"는
- * - 숫자 형태면 number로
- * - 아니면 string으로
- * (questions.id가 bigint/int면 number가 안전)
+ * questions.id가 bigint/int면 number가 안전
+ * (여기는 문제ID 정규화용)
  */
 function normalizeId(v: any): number | string | null {
   const t = s(v);
@@ -129,14 +125,68 @@ function normalizeAnswers(body: any): AnswerItem[] {
 }
 
 /**
- * ✅ 핵심 수정:
- * attemptId는 숫자/UUID 둘 다 허용해야 함 (지금 시험 화면 attemptId가 UUID임)
+ * ✅ UUID 입력(프론트 attemptId) -> exam_attempts의 bigint id로 변환
+ * 어떤 컬럼명인지 모를 때를 대비해서 "가능한 후보 컬럼"을 순서대로 조회 시도.
+ *
+ * - 컬럼이 없으면 supabase가 에러를 주는데, 그건 무시하고 다음 후보로 진행
+ * - 하나라도 매칭되면 bigint id 반환
+ */
+async function resolveBigintAttemptIdFromUuid(
+  client: any,
+  uuid: string
+): Promise<{ id: number | null; tried: string[]; matchedBy?: string; lastErr?: string }> {
+  const candidates = [
+    "attempt_uuid",
+    "attempt_uid",
+    "attemptId",
+    "attempt_id",
+    "uuid",
+    "uid",
+    "public_id",
+    "public_uuid",
+    "external_id",
+    "session_id",
+    "token",
+  ];
+
+  const tried: string[] = [];
+  let lastErr: string | undefined;
+
+  for (const col of candidates) {
+    tried.push(col);
+    try {
+      const { data, error } = await client
+        .from("exam_attempts")
+        .select("id")
+        .eq(col, uuid)
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        lastErr = String((error as any)?.message ?? error);
+        // 컬럼 없음/타입 불일치 등 → 다음 후보
+        continue;
+      }
+      if (data?.id != null) {
+        const idNum = n(data.id, null);
+        if (idNum !== null) return { id: idNum, tried, matchedBy: col };
+      }
+    } catch (e: any) {
+      lastErr = String(e?.message ?? e);
+      continue;
+    }
+  }
+
+  return { id: null, tried, lastErr };
+}
+
+/**
+ * ✅ attemptId 파싱: 숫자면 그대로, UUID면 일단 문자열로 받기
  */
 async function resolveAttemptId(
   req: Request,
-  client: any,
   body: any
-): Promise<{ attemptId: string | number | null; resolvedBy: string; detail?: any }> {
+): Promise<{ attemptIdRaw: string | number | null; resolvedBy: string; detail?: any }> {
   // 0) querystring
   try {
     const u = new URL(req.url);
@@ -147,9 +197,9 @@ async function resolveAttemptId(
 
     if (q) {
       const qs = s(q);
-      if (isUUID(qs)) return { attemptId: qs, resolvedBy: "QUERY_UUID" };
+      if (isUUID(qs)) return { attemptIdRaw: qs, resolvedBy: "QUERY_UUID" };
       const qNum = n(qs, null);
-      if (qNum !== null && qNum > 0) return { attemptId: qNum, resolvedBy: "QUERY_NUMBER" };
+      if (qNum !== null && qNum > 0) return { attemptIdRaw: qNum, resolvedBy: "QUERY_NUMBER" };
     }
   } catch {}
 
@@ -165,50 +215,21 @@ async function resolveAttemptId(
 
   if (fromBody !== undefined && fromBody !== null && fromBody !== "") {
     const bs = s(fromBody);
-    if (isUUID(bs)) return { attemptId: bs, resolvedBy: "BODY_UUID" };
+    if (isUUID(bs)) return { attemptIdRaw: bs, resolvedBy: "BODY_UUID" };
     const bodyNum = n(bs, null);
-    if (bodyNum !== null && bodyNum > 0) return { attemptId: bodyNum, resolvedBy: "BODY_NUMBER" };
+    if (bodyNum !== null && bodyNum > 0) return { attemptIdRaw: bodyNum, resolvedBy: "BODY_NUMBER" };
   }
 
   // 2) cookie attemptId (옵션)
   const cAttemptRaw = getCookie(req, "attemptId") || getCookie(req, "attempt_id");
   if (cAttemptRaw) {
     const cs = s(cAttemptRaw);
-    if (isUUID(cs)) return { attemptId: cs, resolvedBy: "COOKIE_UUID" };
+    if (isUUID(cs)) return { attemptIdRaw: cs, resolvedBy: "COOKIE_UUID" };
     const cNum = n(cs, null);
-    if (cNum !== null && cNum > 0) return { attemptId: cNum, resolvedBy: "COOKIE_NUMBER" };
+    if (cNum !== null && cNum > 0) return { attemptIdRaw: cNum, resolvedBy: "COOKIE_NUMBER" };
   }
 
-  // 3) empId 최신 STARTED (⚠️ id가 UUID일 수도 있으니 Number() 절대 금지)
-  const empId =
-    s(body?.empId ?? body?.emp_id) ||
-    s(getCookie(req, "empId")) ||
-    s(getCookie(req, "emp_id")) ||
-    "";
-
-  if (empId) {
-    const { data: a, error } = await client
-      .from("exam_attempts")
-      .select("id, emp_id, status, started_at")
-      .eq("emp_id", empId)
-      .eq("status", "STARTED")
-      .order("started_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (!error && a?.id) {
-      // id가 UUID면 그대로 string, 숫자면 number
-      const aid = String(a.id);
-      if (isUUID(aid)) return { attemptId: aid, resolvedBy: "EMPID_LATEST_STARTED_UUID", detail: { empId } };
-      const aidNum = n(aid, null);
-      if (aidNum !== null && aidNum > 0) return { attemptId: aidNum, resolvedBy: "EMPID_LATEST_STARTED_NUMBER", detail: { empId } };
-
-      // 혹시 예외 타입이면 그냥 string으로라도 넘김
-      return { attemptId: aid, resolvedBy: "EMPID_LATEST_STARTED_FALLBACK", detail: { empId } };
-    }
-  }
-
-  return { attemptId: null, resolvedBy: "NONE", detail: { url: req.url, keys: Object.keys(body ?? {}) } };
+  return { attemptIdRaw: null, resolvedBy: "NONE", detail: { url: req.url, keys: Object.keys(body ?? {}) } };
 }
 
 export async function POST(req: Request) {
@@ -220,29 +241,70 @@ export async function POST(req: Request) {
   try {
     const body = await readBody(req);
 
-    const r = await resolveAttemptId(req, client, body);
-    const attemptId = r.attemptId;
+    // 1) attemptId 원본(숫자 or UUID) 받기
+    const r0 = await resolveAttemptId(req, body);
+    const attemptIdRaw = r0.attemptIdRaw;
 
-    if (!attemptId) {
+    if (!attemptIdRaw) {
       return NextResponse.json(
-        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { resolvedBy: r.resolvedBy, ...(r.detail ?? {}) } },
+        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { resolvedBy: r0.resolvedBy, ...(r0.detail ?? {}) } },
         { status: 400 }
       );
     }
 
+    // 2) ✅ DB의 exam_attempts.id(bigint)로 쓸 최종 attemptId 만들기
+    let attemptId: number | null = null;
+    let resolvedBy = r0.resolvedBy;
+    let resolveDetail: any = {};
+
+    if (typeof attemptIdRaw === "number") {
+      attemptId = attemptIdRaw;
+    } else {
+      const uuid = s(attemptIdRaw);
+      if (!isUUID(uuid)) {
+        return NextResponse.json(
+          { ok: false, error: "INVALID_ATTEMPT_ID_FORMAT", detail: { attemptIdRaw, resolvedBy } },
+          { status: 400 }
+        );
+      }
+
+      // UUID -> bigint id 변환 시도
+      const rr = await resolveBigintAttemptIdFromUuid(client, uuid);
+      if (!rr.id) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "ATTEMPT_ID_UUID_NOT_MAPPED",
+            detail: {
+              attempt_uuid: uuid,
+              resolvedBy,
+              triedColumns: rr.tried,
+              lastErr: rr.lastErr,
+            },
+          },
+          { status: 400 }
+        );
+      }
+
+      attemptId = rr.id;
+      resolvedBy = `${resolvedBy}=>MAPPED_UUID_TO_BIGINT(${rr.matchedBy})`;
+      resolveDetail = { mappedFromUuid: uuid, matchedBy: rr.matchedBy, triedColumns: rr.tried };
+    }
+
+    // 3) answers 파싱
     const items = normalizeAnswers(body);
     if (items.length === 0) {
       return NextResponse.json(
-        { ok: false, error: "NO_ANSWERS", detail: { resolvedBy: r.resolvedBy, attemptId } },
+        { ok: false, error: "NO_ANSWERS", detail: { resolvedBy, attemptId, ...resolveDetail } },
         { status: 400 }
       );
     }
 
-    // ✅ UUID/number 둘 다 그대로 eq("id", attemptId) 가능 (Supabase가 처리)
+    // 4) attempt 조회 (✅ bigint id만 사용)
     const { data: attempt, error: aErr } = await client
       .from("exam_attempts")
       .select("*")
-      .eq("id", attemptId as any)
+      .eq("id", attemptId)
       .maybeSingle();
 
     if (aErr) {
@@ -252,10 +314,13 @@ export async function POST(req: Request) {
       );
     }
     if (!attempt) {
-      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
+      return NextResponse.json(
+        { ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId, resolvedBy, ...resolveDetail } },
+        { status: 404 }
+      );
     }
 
-    // questions 조회 (id 타입 맞춤)
+    // 5) questions 조회
     const normalizedQids = items
       .map((x) => normalizeId(x.questionId))
       .filter((x) => x !== null) as Array<number | string>;
@@ -264,7 +329,10 @@ export async function POST(req: Request) {
     const allNumeric = uniqueQids.every((x) => /^\d+$/.test(x));
     const qidsForQuery = allNumeric ? uniqueQids.map((x) => Number(x)) : uniqueQids;
 
-    const { data: questions, error: qErr } = await client.from("questions").select("*").in("id", qidsForQuery as any);
+    const { data: questions, error: qErr } = await client
+      .from("questions")
+      .select("*")
+      .in("id", qidsForQuery as any);
 
     if (qErr) {
       return NextResponse.json(
@@ -306,7 +374,7 @@ export async function POST(req: Request) {
         answerMapForAttempt[String(qid)] = Number(it.selectedIndex);
 
         return {
-          attempt_id: attemptId as any, // ✅ UUID든 number든 그대로 저장
+          attempt_id: attemptId, // ✅ bigint only
           question_id: qid,
           selected_index: Number(it.selectedIndex),
           is_correct: isCorrect,
@@ -319,17 +387,17 @@ export async function POST(req: Request) {
         {
           ok: false,
           error: "NO_VALID_ROWS",
-          detail: { attemptId, items: items.length, questions: (questions ?? []).length },
+          detail: { attemptId, resolvedBy, items: items.length, questions: (questions ?? []).length, ...resolveDetail },
         },
         { status: 400 }
       );
     }
 
-    // 재제출 대비: 기존 삭제 후 insert
+    // 6) 기존 삭제 후 insert
     const { error: delErr } = await client
       .from("exam_attempt_answers")
       .delete()
-      .eq("attempt_id", attemptId as any);
+      .eq("attempt_id", attemptId);
 
     if (delErr) {
       return NextResponse.json(
@@ -347,6 +415,7 @@ export async function POST(req: Request) {
       );
     }
 
+    // 7) attempt 업데이트
     const nowIso = new Date().toISOString();
     const { error: upErr } = await client
       .from("exam_attempts")
@@ -359,7 +428,7 @@ export async function POST(req: Request) {
         total_questions: rows.length,
         answers: answerMapForAttempt,
       })
-      .eq("id", attemptId as any);
+      .eq("id", attemptId);
 
     if (upErr) {
       return NextResponse.json(
@@ -370,17 +439,18 @@ export async function POST(req: Request) {
 
     return NextResponse.json({
       ok: true,
-      attemptId,
-      resolvedBy: r.resolvedBy,
+      attemptId, // ✅ bigint id
+      resolvedBy,
       score,
       totalPoints,
       correctCount,
       wrongQuestionIds,
       savedAnswers: rows.length,
-      marker: "SUBMIT_OK_UUID_OR_NUMBER_ATTEMPT",
+      marker: "SUBMIT_OK_UUID_MAPPED_TO_BIGINT_OR_DIRECT_BIGINT",
       debug: {
         qidsAllNumeric: allNumeric,
         qidsCount: uniqueQids.length,
+        ...resolveDetail,
       },
     });
   } catch (e: any) {
