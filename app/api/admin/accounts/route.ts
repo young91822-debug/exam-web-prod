@@ -16,7 +16,6 @@ function b(v: any, d = true) {
   if (["0", "false", "n", "no", "off", "미사용"].includes(t)) return false;
   return d;
 }
-
 async function readBody(req: Request): Promise<any> {
   try {
     return await req.json();
@@ -30,6 +29,40 @@ async function readBody(req: Request): Promise<any> {
     }
   }
 }
+function getCookie(cookieHeader: string, name: string) {
+  const parts = cookieHeader.split(";").map((v) => v.trim());
+  for (const p of parts) {
+    const idx = p.indexOf("=");
+    if (idx < 0) continue;
+    const k = p.slice(0, idx).trim();
+    const v = p.slice(idx + 1).trim();
+    if (k === name) return decodeURIComponent(v);
+  }
+  return "";
+}
+
+/** ✅ 관리자 팀 조회 (쿠키 empId → accounts.team) */
+async function requireAdminTeam(req: Request) {
+  const cookieHeader = req.headers.get("cookie") || "";
+  const empId = getCookie(cookieHeader, "empId");
+  const role = getCookie(cookieHeader, "role");
+
+  if (!empId) return { ok: false as const, status: 401, error: "NO_SESSION" };
+  if (role !== "admin") return { ok: false as const, status: 403, error: "NOT_ADMIN" };
+
+  const { data, error } = await supabaseAdmin
+    .from("accounts")
+    .select("username, emp_id, team, is_active")
+    .or(`username.eq.${empId},emp_id.eq.${empId}`)
+    .maybeSingle();
+
+  if (error) return { ok: false as const, status: 500, error: "DB_QUERY_FAILED", detail: error.message };
+  if (!data) return { ok: false as const, status: 401, error: "ACCOUNT_NOT_FOUND" };
+  if ((data as any).is_active === false) return { ok: false as const, status: 403, error: "ACCOUNT_DISABLED" };
+
+  const team = String((data as any).team ?? "").trim() || "A";
+  return { ok: true as const, team, empId };
+}
 
 /**
  * password_hash 생성 (crypto.scrypt)
@@ -41,11 +74,21 @@ function makePasswordHash(plain: string) {
   return `scrypt$${salt.toString("base64")}$${hash.toString("base64")}`;
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
+    const auth = await requireAdminTeam(req);
+    if (!auth.ok) {
+      return NextResponse.json(
+        { ok: false, error: auth.error, detail: (auth as any).detail },
+        { status: auth.status }
+      );
+    }
+
+    // ✅ 민감정보(password_hash 등) 제외하고 필요한 컬럼만
     const { data, error } = await supabaseAdmin
       .from("accounts")
-      .select("*")
+      .select("id, emp_id, username, name, team, is_active, created_at")
+      .eq("team", auth.team)
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -55,7 +98,12 @@ export async function GET() {
       );
     }
 
-    return NextResponse.json({ ok: true, items: data ?? [] });
+    return NextResponse.json({
+      ok: true,
+      team: auth.team,
+      items: data ?? [],
+      marker: "ACCOUNTS_TEAM_FILTER_v1_NO_HASH",
+    });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "ACCOUNTS_LIST_FAILED", detail: String(e?.message ?? e) },
@@ -66,26 +114,31 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
+    const auth = await requireAdminTeam(req);
+    if (!auth.ok) {
+      return NextResponse.json(
+        { ok: false, error: auth.error, detail: (auth as any).detail },
+        { status: auth.status }
+      );
+    }
+
     const body = await readBody(req);
 
     const empId = s(body.empId ?? body.emp_id ?? body.employeeId ?? body.employee_id);
     const name = s(body.name ?? body.displayName ?? body.koreanName ?? body.fullname);
     const isActive = b(body.isActive ?? body.is_active ?? body.active ?? body.use, true);
-
-    // accounts.username NOT NULL 대응
     const username = s(body.username) || name || empId;
 
-    if (!empId) {
-      return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
-    }
-    if (!username) {
-      return NextResponse.json({ ok: false, error: "MISSING_USERNAME" }, { status: 400 });
-    }
+    if (!empId) return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
+    if (!username) return NextResponse.json({ ok: false, error: "MISSING_USERNAME" }, { status: 400 });
 
-    // 1) 먼저 기존 계정 있는지 확인 (있으면 비번 건드리지 말 것)
+    const myTeam = auth.team;
+    const plainPassword = s(body.password ?? body.pw ?? body.passwordPlain) || "1234";
+
+    // 기존 계정 확인
     const { data: exists, error: exErr } = await supabaseAdmin
       .from("accounts")
-      .select("id, emp_id")
+      .select("id, emp_id, team")
       .eq("emp_id", empId)
       .maybeSingle();
 
@@ -96,90 +149,67 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 신규 생성 시 기본 비밀번호
-    // - body.password / body.pw / body.passwordPlain 보내면 그걸로 생성 가능
-    // - 없으면 기본값 1234
-    const plainPassword = s(body.password ?? body.pw ?? body.passwordPlain) || "1234";
-
     if (exists?.id) {
-      // ====== UPDATE (기존 계정) ======
-      const updateRow: any = { username, is_active: isActive };
+      const existingTeam = String((exists as any).team ?? "").trim() || "A";
+      if (existingTeam !== myTeam) {
+        return NextResponse.json(
+          { ok: false, error: "CROSS_TEAM_ACCOUNT_FORBIDDEN", detail: { empId, existingTeam, myTeam } },
+          { status: 403 }
+        );
+      }
+
+      const updateRow: any = { username, is_active: isActive, team: myTeam };
 
       const { data: updated, error: upErr } = await supabaseAdmin
         .from("accounts")
         .update(updateRow)
         .eq("id", exists.id)
-        .select("*")
+        .select("id, emp_id, username, name, team, is_active, created_at")
         .maybeSingle();
 
       if (upErr) {
         return NextResponse.json(
-          { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: upErr.message, sent: updateRow },
+          { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: upErr.message },
           { status: 500 }
         );
       }
 
-      // name 컬럼이 있으면 저장 시도(없으면 실패해도 무시)
+      // name 컬럼 있으면 저장 시도
       if (name) {
         const tryCols = ["name", "display_name", "fullname"];
         for (const col of tryCols) {
-          const { error: nameErr } = await supabaseAdmin
-            .from("accounts")
-            .update({ [col]: name })
-            .eq("id", exists.id);
+          const { error: nameErr } = await supabaseAdmin.from("accounts").update({ [col]: name }).eq("id", exists.id);
           if (!nameErr) break;
         }
       }
 
-      return NextResponse.json({
-        ok: true,
-        item: updated,
-        mode: "UPDATED",
-        marker: "ACCOUNTS_UPDATED_PASSWORD_UNCHANGED",
-      });
+      return NextResponse.json({ ok: true, team: myTeam, item: updated, mode: "UPDATED" });
     } else {
-      // ====== INSERT (신규 계정) ======
       const password_hash = makePasswordHash(plainPassword);
 
       const insertRow: any = {
         emp_id: empId,
         username,
+        name: name || null,
         is_active: isActive,
-        password_hash, // ✅ NOT NULL 충족
+        team: myTeam,
+        password_hash,
       };
 
       const { data: inserted, error: insErr } = await supabaseAdmin
         .from("accounts")
         .insert(insertRow)
-        .select("*")
+        .select("id, emp_id, username, name, team, is_active, created_at")
         .maybeSingle();
 
       if (insErr) {
         return NextResponse.json(
-          { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: insErr.message, sent: { ...insertRow, password_hash: "****" } },
+          { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: insErr.message },
           { status: 500 }
         );
       }
 
-      // name 컬럼 있으면 저장 시도(없으면 무시)
-      if (name && inserted?.id) {
-        const tryCols = ["name", "display_name", "fullname"];
-        for (const col of tryCols) {
-          const { error: nameErr } = await supabaseAdmin
-            .from("accounts")
-            .update({ [col]: name })
-            .eq("id", inserted.id);
-          if (!nameErr) break;
-        }
-      }
-
-      return NextResponse.json({
-        ok: true,
-        item: inserted,
-        mode: "CREATED",
-        tempPassword: plainPassword, // ✅ 화면에서 "기본 비번" 안내 가능
-        marker: "ACCOUNTS_CREATED_WITH_PASSWORD_HASH",
-      });
+      return NextResponse.json({ ok: true, team: myTeam, item: inserted, mode: "CREATED", tempPassword: plainPassword });
     }
   } catch (e: any) {
     return NextResponse.json(
