@@ -53,8 +53,20 @@ export async function POST(req: Request) {
   try {
     const body = await readBody(req);
 
-    const id = s(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id);
-    const pw = s(body?.pw ?? body?.password);
+    const id = s(
+  body?.id ??
+  body?.loginId ??          // ✅ 추가
+  body?.user_id ??
+  body?.empId ??
+  body?.emp_id
+);
+
+const pw = s(
+  body?.pw ??
+  body?.password ??         // ✅ 이미 OK
+  body?.passwd ??
+  body?.loginPw
+);
 
     if (!id || !pw) {
       return NextResponse.json({ ok: false, error: "MISSING_FIELDS" }, { status: 400 });
