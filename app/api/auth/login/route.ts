@@ -21,7 +21,7 @@ async function readBody(req: Request) {
   }
 }
 
-// ✅ 관리자 아이디 목록(원하면 더 추가)
+// ??愿由ъ옄 ?꾩씠??紐⑸줉(?먰븯硫???異붽?)
 const ADMIN_IDS = new Set(["admin", "admin_gs"]);
 
 export async function POST(req: Request) {
@@ -78,4 +78,3 @@ export async function POST(req: Request) {
       { status: 500 }
     );
   }
-}
