@@ -164,7 +164,11 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "EMP_ID_EXISTS" }, { status: 409 });
     }
 
-    const payloadBase: any = { emp_id };
+    const payloadBase: any = {
+  emp_id,
+  role: "user",          // ✅ DB에 NOT NULL일 가능성 99%
+  password_hash: "",     // ✅ NOT NULL 방어
+};
     if (name) payloadBase.name = name;
 
     const { data, error } = await insertAccount(payloadBase, active);
