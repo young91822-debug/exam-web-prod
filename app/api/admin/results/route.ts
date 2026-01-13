@@ -143,7 +143,7 @@ export async function GET(req: Request) {
             for (const r of legacyRes.data || []) {
               items.push({
                 id: String(r.id), // bigint지만 문자열로 내려주자 (프론트 안전)
-                idType: "numeric",
+                idType: "num",
                 empId: String(r.emp_id ?? "-"),
                 score: Number(r.score ?? 0),
                 totalPoints: 0, // legacy에는 total_points 없을 수 있음
