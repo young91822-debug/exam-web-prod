@@ -4,21 +4,12 @@ import { NextRequest, NextResponse } from "next/server";
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  // ✅ 항상 허용
-  if (
-    pathname.startsWith("/login") ||
-    pathname.startsWith("/api") ||
-    pathname.startsWith("/_next") ||
-    pathname.startsWith("/favicon.ico")
-  ) {
-    return NextResponse.next();
-  }
+  // 로그인/정적/API는 여기까지 오지 않음 (matcher에서 제외됨)
 
-  // ✅ 로그인 API에서 실제로 쓰는 쿠키 기준
   const empId = req.cookies.get("empId")?.value || "";
   const role = req.cookies.get("role")?.value || "";
 
-  // ✅ 관리자만
+  // 관리자
   if (pathname.startsWith("/admin")) {
     if (!empId || role !== "admin") {
       const url = req.nextUrl.clone();
@@ -29,7 +20,7 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  // ✅ 시험/결과는 로그인만 하면 OK
+  // 시험/결과
   if (pathname.startsWith("/exam") || pathname.startsWith("/result")) {
     if (!empId) {
       const url = req.nextUrl.clone();
@@ -44,5 +35,5 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!.*\\..*).*)"],
+  matcher: ["/((?!api|_next|favicon.ico|.*\\..*).*)"],
 };
