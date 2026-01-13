@@ -15,7 +15,6 @@ type ApiOk = {
 };
 
 type ApiErr = { ok: false; error: string; detail?: any };
-
 type ApiResp = ApiOk | ApiErr;
 
 function fmtDate(v: any) {
@@ -23,6 +22,96 @@ function fmtDate(v: any) {
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) return String(v);
   return d.toLocaleString();
+}
+
+function toNumOrNull(v: any) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  const n = Number(String(v ?? "").trim());
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickFirst<T = any>(...vals: any[]): T | null {
+  for (const v of vals) {
+    if (v === undefined || v === null) continue;
+    // 빈 문자열은 제외
+    if (typeof v === "string" && v.trim() === "") continue;
+    return v as T;
+  }
+  return null;
+}
+
+function pickChoices(g: any): string[] {
+  const c = pickFirst<any[] | string>(
+    g?.choices,
+    g?.options,
+    g?.choice_list,
+    g?.choiceList,
+    g?.choice_texts,
+    g?.choiceTexts
+  );
+
+  if (Array.isArray(c)) return c.map((x) => String(x ?? ""));
+  if (typeof c === "string") {
+    // 혹시 "a|b|c|d" 같이 들어오면 분리
+    if (c.includes("|")) return c.split("|").map((s) => s.trim());
+    if (c.includes("\n")) return c.split("\n").map((s) => s.trim());
+    return [c];
+  }
+  return [];
+}
+
+function pickSelectedIndex(g: any): number | null {
+  return toNumOrNull(
+    pickFirst(
+      g?.selectedIndex,
+      g?.selected_index,
+      g?.selected,
+      g?.pickedIndex,
+      g?.picked_index,
+      g?.userAnswerIndex,
+      g?.user_answer_index,
+      g?.user_choice_index
+    )
+  );
+}
+
+function pickCorrectIndex(g: any): number | null {
+  return toNumOrNull(
+    pickFirst(
+      g?.correctIndex,
+      g?.correct_index,
+      g?.answerIndex,
+      g?.answer_index,
+      g?.correct,
+      g?.correctChoiceIndex
+    )
+  );
+}
+
+function normalizeStatus(g: any, attempt: any): "submitted" | "unsubmitted" {
+  // 1) graded 자체 status 우선
+  const raw = String(pickFirst(g?.status, g?.state, "") ?? "").toLowerCase();
+
+  if (raw.includes("unsubmitted") || raw.includes("not_submitted") || raw.includes("nosubmit")) return "unsubmitted";
+  if (raw.includes("submitted") || raw.includes("done") || raw.includes("complete")) return "submitted";
+
+  // 2) attempt.submitted_at 있으면 제출로 간주
+  const submittedAt = pickFirst(attempt?.submitted_at, attempt?.submittedAt, attempt?.ended_at, attempt?.endedAt);
+  if (submittedAt) return "submitted";
+
+  // 3) 선택값이 없으면 미제출로 추정
+  const sel = pickSelectedIndex(g);
+  if (sel == null) return "unsubmitted";
+
+  return "submitted";
+}
+
+function normalizeIsCorrect(g: any): boolean | null {
+  const v = pickFirst(g?.isCorrect, g?.is_correct, g?.correct, g?.is_right, g?.isRight);
+  if (typeof v === "boolean") return v;
+  if (v === 1 || v === "1" || v === "true") return true;
+  if (v === 0 || v === "0" || v === "false") return false;
+  return null;
 }
 
 export default function AdminResultDetailPage() {
@@ -62,8 +151,8 @@ export default function AdminResultDetailPage() {
         });
 
         const text = await res.text();
-
         let json: any = null;
+
         try {
           json = text ? JSON.parse(text) : null;
         } catch {
@@ -74,7 +163,6 @@ export default function AdminResultDetailPage() {
 
         if (!res.ok || !json?.ok) {
           console.error("RESULT_DETAIL_FETCH_FAILED", { status: res.status, text, json });
-
           setErr(json?.error || `HTTP_${res.status}`);
           setData(json ?? { ok: false, error: `HTTP_${res.status}`, detail: text });
         } else {
@@ -100,10 +188,25 @@ export default function AdminResultDetailPage() {
   const attempt = data && (data as any).ok ? (data as any).attempt : null;
   const gradedAll = data && (data as any).ok ? ((data as any).graded ?? []) : [];
 
-  // ✅ 오답/미제출만 표시
+  // ✅ “오답/미제출만 표시”를 더 안전하게
   const graded = useMemo(() => {
-    return gradedAll.filter((g: any) => g?.status === "unsubmitted" || g?.isCorrect === false);
-  }, [gradedAll]);
+    return gradedAll.filter((g: any) => {
+      const status = normalizeStatus(g, attempt);
+      const isCorrect = normalizeIsCorrect(g);
+
+      if (status === "unsubmitted") return true;
+
+      // 제출인데 정오답 boolean이 없으면: 선택/정답 비교로라도 판단
+      if (isCorrect == null) {
+        const sel = pickSelectedIndex(g);
+        const cor = pickCorrectIndex(g);
+        if (sel != null && cor != null) return sel !== cor; // 오답만
+        return false; // 판단 불가면 숨김(원하면 true로 바꿔서 노출 가능)
+      }
+
+      return isCorrect === false;
+    });
+  }, [gradedAll, attempt]);
 
   async function downloadExcel() {
     if (!attemptId) return;
@@ -151,18 +254,18 @@ export default function AdminResultDetailPage() {
         <div style={{ fontWeight: 800, marginBottom: 8 }}>기본 정보</div>
         <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", rowGap: 6, columnGap: 12, fontSize: 14 }}>
           <div style={{ opacity: 0.75 }}>응시자ID</div>
-          <div>{attempt?.emp_id ?? "-"}</div>
+          <div>{attempt?.emp_id ?? attempt?.empId ?? "-"}</div>
 
           <div style={{ opacity: 0.75 }}>점수</div>
           <div>
-            {attempt?.score ?? 0} / {attempt?.total_points ?? "-"}
+            {attempt?.score ?? attempt?.total_score ?? 0} / {attempt?.total_points ?? attempt?.totalPoints ?? "-"}
           </div>
 
           <div style={{ opacity: 0.75 }}>응시 시작</div>
-          <div>{fmtDate(attempt?.started_at)}</div>
+          <div>{fmtDate(pickFirst(attempt?.started_at, attempt?.startedAt, attempt?.created_at, attempt?.createdAt))}</div>
 
           <div style={{ opacity: 0.75 }}>제출 시각</div>
-          <div>{fmtDate(attempt?.submitted_at)}</div>
+          <div>{fmtDate(pickFirst(attempt?.submitted_at, attempt?.submittedAt, attempt?.ended_at, attempt?.endedAt))}</div>
 
           <div style={{ opacity: 0.75 }}>상태</div>
           <div>{attempt?.status ?? "-"}</div>
@@ -174,24 +277,28 @@ export default function AdminResultDetailPage() {
       {/* 문제 리스트 */}
       <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
         {graded.length === 0 ? (
-          <div style={{ padding: 16, border: "1px solid #eee", borderRadius: 14 }}>
-            표시할 오답/미제출 문제가 없습니다.
-          </div>
+          <div style={{ padding: 16, border: "1px solid #eee", borderRadius: 14 }}>표시할 오답/미제출 문제가 없습니다.</div>
         ) : (
           graded.map((g: any, idx: number) => {
-            const isUnsubmitted = g?.status === "unsubmitted";
-            const isWrong = g?.status === "submitted" && g?.isCorrect === false;
+            const status = normalizeStatus(g, attempt);
+            const isUnsubmitted = status === "unsubmitted";
 
-            const borderColor = isWrong ? "#ff3b30" : isUnsubmitted ? "#bbb" : "#eee";
-            const bg = isWrong ? "rgba(255,59,48,0.04)" : isUnsubmitted ? "rgba(0,0,0,0.03)" : "white";
+            const isCorrect = normalizeIsCorrect(g);
+            const selectedIndex = pickSelectedIndex(g);
+            const correctIndex = pickCorrectIndex(g);
 
-            const choices: any[] = Array.isArray(g?.choices) ? g.choices : [];
-            const selectedIndex = typeof g?.selectedIndex === "number" ? g.selectedIndex : null;
-            const correctIndex = typeof g?.correctIndex === "number" ? g.correctIndex : null;
+            const inferredWrong =
+              !isUnsubmitted &&
+              (isCorrect === false || (isCorrect == null && selectedIndex != null && correctIndex != null && selectedIndex !== correctIndex));
+
+            const borderColor = inferredWrong ? "#ff3b30" : isUnsubmitted ? "#bbb" : "#eee";
+            const bg = inferredWrong ? "rgba(255,59,48,0.04)" : isUnsubmitted ? "rgba(0,0,0,0.03)" : "white";
+
+            const choices = pickChoices(g);
 
             return (
               <div
-                key={String(g?.questionId ?? idx)}
+                key={String(g?.questionId ?? g?.question_id ?? g?.qid ?? idx)}
                 style={{
                   border: `2px solid ${borderColor}`,
                   background: bg,
@@ -200,11 +307,9 @@ export default function AdminResultDetailPage() {
                 }}
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ fontWeight: 800 }}>
-                    Q{idx + 1}. {g?.content ?? ""}
-                  </div>
+                  <div style={{ fontWeight: 800 }}>Q{idx + 1}. {g?.content ?? g?.question ?? g?.text ?? ""}</div>
                   <div style={{ fontSize: 12, opacity: 0.8, whiteSpace: "nowrap" }}>
-                    {isWrong ? "오답" : isUnsubmitted ? "미제출" : ""}
+                    {inferredWrong ? "오답" : isUnsubmitted ? "미제출" : ""}
                   </div>
                 </div>
 
@@ -214,9 +319,6 @@ export default function AdminResultDetailPage() {
                     const isSelected = !isUnsubmitted && selectedIndex === i;
                     const isCorrectChoice = correctIndex === i;
 
-                    // ✅ 표시 규칙
-                    // - 미제출: 정답만 표시(원하면 여기서 정답도 숨길 수 있음)
-                    // - 제출(오답): 내 선택 + 정답 모두 표시
                     let tag = "";
                     if (isCorrectChoice) tag = "정답";
                     else if (isSelected) tag = "내 선택";
