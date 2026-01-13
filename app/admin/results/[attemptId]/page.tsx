@@ -24,103 +24,22 @@ function fmtDate(v: any) {
   return d.toLocaleString();
 }
 
-function toNumOrNull(v: any) {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  const n = Number(String(v ?? "").trim());
-  return Number.isFinite(n) ? n : null;
+function s(v: any) {
+  return String(v ?? "").trim();
 }
 
-function pickFirst<T = any>(...vals: any[]): T | null {
-  for (const v of vals) {
-    if (v === undefined || v === null) continue;
-    // 빈 문자열은 제외
-    if (typeof v === "string" && v.trim() === "") continue;
-    return v as T;
-  }
-  return null;
-}
-
-function pickChoices(g: any): string[] {
-  const c = pickFirst<any[] | string>(
-    g?.choices,
-    g?.options,
-    g?.choice_list,
-    g?.choiceList,
-    g?.choice_texts,
-    g?.choiceTexts
-  );
-
-  if (Array.isArray(c)) return c.map((x) => String(x ?? ""));
-  if (typeof c === "string") {
-    // 혹시 "a|b|c|d" 같이 들어오면 분리
-    if (c.includes("|")) return c.split("|").map((s) => s.trim());
-    if (c.includes("\n")) return c.split("\n").map((s) => s.trim());
-    return [c];
-  }
-  return [];
-}
-
-function pickSelectedIndex(g: any): number | null {
-  return toNumOrNull(
-    pickFirst(
-      g?.selectedIndex,
-      g?.selected_index,
-      g?.selected,
-      g?.pickedIndex,
-      g?.picked_index,
-      g?.userAnswerIndex,
-      g?.user_answer_index,
-      g?.user_choice_index
-    )
-  );
-}
-
-function pickCorrectIndex(g: any): number | null {
-  return toNumOrNull(
-    pickFirst(
-      g?.correctIndex,
-      g?.correct_index,
-      g?.answerIndex,
-      g?.answer_index,
-      g?.correct,
-      g?.correctChoiceIndex
-    )
-  );
-}
-
-function normalizeStatus(g: any, attempt: any): "submitted" | "unsubmitted" {
-  // 1) graded 자체 status 우선
-  const raw = String(pickFirst(g?.status, g?.state, "") ?? "").toLowerCase();
-
-  if (raw.includes("unsubmitted") || raw.includes("not_submitted") || raw.includes("nosubmit")) return "unsubmitted";
-  if (raw.includes("submitted") || raw.includes("done") || raw.includes("complete")) return "submitted";
-
-  // 2) attempt.submitted_at 있으면 제출로 간주
-  const submittedAt = pickFirst(attempt?.submitted_at, attempt?.submittedAt, attempt?.ended_at, attempt?.endedAt);
-  if (submittedAt) return "submitted";
-
-  // 3) 선택값이 없으면 미제출로 추정
-  const sel = pickSelectedIndex(g);
-  if (sel == null) return "unsubmitted";
-
-  return "submitted";
-}
-
-function normalizeIsCorrect(g: any): boolean | null {
-  const v = pickFirst(g?.isCorrect, g?.is_correct, g?.correct, g?.is_right, g?.isRight);
-  if (typeof v === "boolean") return v;
-  if (v === 1 || v === "1" || v === "true") return true;
-  if (v === 0 || v === "0" || v === "false") return false;
-  return null;
+function looksLikeUuid(x: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);
 }
 
 export default function AdminResultDetailPage() {
   const params = useParams();
 
-  const attemptId = useMemo(() => {
+  // ✅ 숫자든 UUID든 "문자열 그대로" 받는다
+  const attemptKey = useMemo(() => {
     const raw = (params as any)?.attemptId ?? (params as any)?.attemptID ?? "";
-    const n = Number(raw);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    const key = s(raw);
+    return key ? key : null;
   }, [params]);
 
   const [loading, setLoading] = useState(true);
@@ -131,7 +50,7 @@ export default function AdminResultDetailPage() {
     let dead = false;
 
     async function run() {
-      if (!attemptId) {
+      if (!attemptKey) {
         if (!dead) {
           setErr("INVALID_ATTEMPT_ID");
           setData({ ok: false, error: "INVALID_ATTEMPT_ID" });
@@ -146,13 +65,18 @@ export default function AdminResultDetailPage() {
       }
 
       try {
-        const res = await fetch(`/api/admin/result-detail?attemptId=${attemptId}`, {
+        // ✅ attemptId에 그대로 넣어서 보냄 (API가 숫자/UUID 알아서 처리하게)
+        // + 혹시 API가 attemptUuid를 따로 받는 버전이면 같이 보냄(안 받으면 무시됨)
+        const qs = new URLSearchParams();
+        qs.set("attemptId", attemptKey);
+        if (looksLikeUuid(attemptKey)) qs.set("attemptUuid", attemptKey);
+
+        const res = await fetch(`/api/admin/result-detail?${qs.toString()}`, {
           cache: "no-store",
         });
 
         const text = await res.text();
         let json: any = null;
-
         try {
           json = text ? JSON.parse(text) : null;
         } catch {
@@ -162,7 +86,8 @@ export default function AdminResultDetailPage() {
         if (dead) return;
 
         if (!res.ok || !json?.ok) {
-          console.error("RESULT_DETAIL_FETCH_FAILED", { status: res.status, text, json });
+          console.error("RESULT_DETAIL_FETCH_FAILED", { status: res.status, text, json, attemptKey });
+
           setErr(json?.error || `HTTP_${res.status}`);
           setData(json ?? { ok: false, error: `HTTP_${res.status}`, detail: text });
         } else {
@@ -179,39 +104,27 @@ export default function AdminResultDetailPage() {
     }
 
     run();
-
     return () => {
       dead = true;
     };
-  }, [attemptId]);
+  }, [attemptKey]);
 
   const attempt = data && (data as any).ok ? (data as any).attempt : null;
   const gradedAll = data && (data as any).ok ? ((data as any).graded ?? []) : [];
 
-  // ✅ “오답/미제출만 표시”를 더 안전하게
+  // ✅ 오답/미제출만 표시(네가 쓰던 로직 유지)
   const graded = useMemo(() => {
-    return gradedAll.filter((g: any) => {
-      const status = normalizeStatus(g, attempt);
-      const isCorrect = normalizeIsCorrect(g);
-
-      if (status === "unsubmitted") return true;
-
-      // 제출인데 정오답 boolean이 없으면: 선택/정답 비교로라도 판단
-      if (isCorrect == null) {
-        const sel = pickSelectedIndex(g);
-        const cor = pickCorrectIndex(g);
-        if (sel != null && cor != null) return sel !== cor; // 오답만
-        return false; // 판단 불가면 숨김(원하면 true로 바꿔서 노출 가능)
-      }
-
-      return isCorrect === false;
-    });
-  }, [gradedAll, attempt]);
+    return gradedAll.filter((g: any) => g?.status === "unsubmitted" || g?.isCorrect === false);
+  }, [gradedAll]);
 
   async function downloadExcel() {
-    if (!attemptId) return;
-    const url = `/api/admin/result-detail/download?attemptId=${attemptId}`;
-    window.location.href = url;
+    if (!attemptKey) return;
+
+    const qs = new URLSearchParams();
+    qs.set("attemptId", attemptKey);
+    if (looksLikeUuid(attemptKey)) qs.set("attemptUuid", attemptKey);
+
+    window.location.href = `/api/admin/result-detail/download?${qs.toString()}`;
   }
 
   if (loading) return <div style={{ padding: 16 }}>불러오는 중...</div>;
@@ -231,7 +144,7 @@ export default function AdminResultDetailPage() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <div>
           <div style={{ fontSize: 18, fontWeight: 800 }}>결과 상세</div>
-          <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>attemptId: {attemptId}</div>
+          <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>attemptId: {attemptKey}</div>
         </div>
 
         <button
@@ -254,18 +167,18 @@ export default function AdminResultDetailPage() {
         <div style={{ fontWeight: 800, marginBottom: 8 }}>기본 정보</div>
         <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", rowGap: 6, columnGap: 12, fontSize: 14 }}>
           <div style={{ opacity: 0.75 }}>응시자ID</div>
-          <div>{attempt?.emp_id ?? attempt?.empId ?? "-"}</div>
+          <div>{attempt?.emp_id ?? "-"}</div>
 
           <div style={{ opacity: 0.75 }}>점수</div>
           <div>
-            {attempt?.score ?? attempt?.total_score ?? 0} / {attempt?.total_points ?? attempt?.totalPoints ?? "-"}
+            {attempt?.score ?? 0} / {attempt?.total_points ?? "-"}
           </div>
 
           <div style={{ opacity: 0.75 }}>응시 시작</div>
-          <div>{fmtDate(pickFirst(attempt?.started_at, attempt?.startedAt, attempt?.created_at, attempt?.createdAt))}</div>
+          <div>{fmtDate(attempt?.started_at)}</div>
 
           <div style={{ opacity: 0.75 }}>제출 시각</div>
-          <div>{fmtDate(pickFirst(attempt?.submitted_at, attempt?.submittedAt, attempt?.ended_at, attempt?.endedAt))}</div>
+          <div>{fmtDate(attempt?.submitted_at)}</div>
 
           <div style={{ opacity: 0.75 }}>상태</div>
           <div>{attempt?.status ?? "-"}</div>
@@ -280,25 +193,19 @@ export default function AdminResultDetailPage() {
           <div style={{ padding: 16, border: "1px solid #eee", borderRadius: 14 }}>표시할 오답/미제출 문제가 없습니다.</div>
         ) : (
           graded.map((g: any, idx: number) => {
-            const status = normalizeStatus(g, attempt);
-            const isUnsubmitted = status === "unsubmitted";
+            const isUnsubmitted = g?.status === "unsubmitted";
+            const isWrong = g?.status === "submitted" && g?.isCorrect === false;
 
-            const isCorrect = normalizeIsCorrect(g);
-            const selectedIndex = pickSelectedIndex(g);
-            const correctIndex = pickCorrectIndex(g);
+            const borderColor = isWrong ? "#ff3b30" : isUnsubmitted ? "#bbb" : "#eee";
+            const bg = isWrong ? "rgba(255,59,48,0.04)" : isUnsubmitted ? "rgba(0,0,0,0.03)" : "white";
 
-            const inferredWrong =
-              !isUnsubmitted &&
-              (isCorrect === false || (isCorrect == null && selectedIndex != null && correctIndex != null && selectedIndex !== correctIndex));
-
-            const borderColor = inferredWrong ? "#ff3b30" : isUnsubmitted ? "#bbb" : "#eee";
-            const bg = inferredWrong ? "rgba(255,59,48,0.04)" : isUnsubmitted ? "rgba(0,0,0,0.03)" : "white";
-
-            const choices = pickChoices(g);
+            const choices: any[] = Array.isArray(g?.choices) ? g.choices : [];
+            const selectedIndex = typeof g?.selectedIndex === "number" ? g.selectedIndex : null;
+            const correctIndex = typeof g?.correctIndex === "number" ? g.correctIndex : null;
 
             return (
               <div
-                key={String(g?.questionId ?? g?.question_id ?? g?.qid ?? idx)}
+                key={String(g?.questionId ?? idx)}
                 style={{
                   border: `2px solid ${borderColor}`,
                   background: bg,
@@ -307,13 +214,14 @@ export default function AdminResultDetailPage() {
                 }}
               >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ fontWeight: 800 }}>Q{idx + 1}. {g?.content ?? g?.question ?? g?.text ?? ""}</div>
+                  <div style={{ fontWeight: 800 }}>
+                    Q{idx + 1}. {g?.content ?? ""}
+                  </div>
                   <div style={{ fontSize: 12, opacity: 0.8, whiteSpace: "nowrap" }}>
-                    {inferredWrong ? "오답" : isUnsubmitted ? "미제출" : ""}
+                    {isWrong ? "오답" : isUnsubmitted ? "미제출" : ""}
                   </div>
                 </div>
 
-                {/* 보기 */}
                 <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
                   {choices.map((c: any, i: number) => {
                     const isSelected = !isUnsubmitted && selectedIndex === i;
@@ -345,7 +253,6 @@ export default function AdminResultDetailPage() {
                   })}
                 </div>
 
-                {/* 요약 */}
                 <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
                   <div>내 선택: {isUnsubmitted ? "-" : selectedIndex != null ? selectedIndex + 1 : "-"}</div>
                   <div>정답: {correctIndex != null ? correctIndex + 1 : "-"}</div>
