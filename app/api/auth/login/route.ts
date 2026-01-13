@@ -4,20 +4,35 @@ import crypto from "crypto";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
-
 const TABLE = "accounts";
 
 function s(v: any) {
   return String(v ?? "").trim();
 }
 
+/** DB에 이상하게 들어간 해시 정규화: <scrypt$...> / "scrypt$..." 같은거 제거 */
+function normalizeHash(raw: any) {
+  let h = String(raw ?? "").trim();
+
+  // 앞뒤 < >, 따옴표 제거
+  h = h.replace(/^[<"'`\s]+/, "").replace(/[>"'`\s]+$/, "");
+
+  // 중간에 scrypt$가 있으면 그 위치부터 잘라오기 (앞에 이상한 접두어가 붙는 케이스 방어)
+  const idx = h.indexOf("scrypt$");
+  if (idx >= 0) h = h.slice(idx);
+
+  return h;
+}
+
 /**
  * stored 포맷: scrypt$<saltB64>$<hashB64>
  */
-function verifyPasswordHash(plain: string, stored: string) {
+function verifyPasswordHash(plain: string, storedRaw: string) {
   try {
+    const stored = normalizeHash(storedRaw);
     const parts = String(stored || "").split("$");
     if (parts.length !== 3) return false;
+
     const [algo, saltB64, hashB64] = parts;
     if (algo !== "scrypt") return false;
 
@@ -37,7 +52,6 @@ function verifyPasswordHash(plain: string, stored: string) {
 /**
  * ✅ 관리자 판별 규칙
  * - DB 계정 username 또는 emp_id가 'admin'으로 시작하면 관리자
- *   (admin, admin_gs, admin_xxx 등)
  */
 function isAdminAccount(account: any) {
   const u = String(account?.username ?? "").toLowerCase();
@@ -46,8 +60,7 @@ function isAdminAccount(account: any) {
 }
 
 /**
- * ✅ 쿠키는 NextResponse.cookies.set() 말고
- * ✅ Set-Cookie 헤더를 직접 append 해서 "브라우저에 확실히" 저장되게 한다.
+ * ✅ 쿠키 Set-Cookie 헤더 append
  */
 function setLoginCookies(
   res: NextResponse,
@@ -76,7 +89,7 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
 
-    // ✅ (핵심1) 프론트에서 뭐라고 보내든 다 받아먹게
+    // ✅ 프론트 키가 뭐든 다 받기
     const loginId = s(
       body.loginId ?? body.username ?? body.userId ?? body.empId ?? body.id
     );
@@ -89,23 +102,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ (핵심2) 마스터 비번 우회 (실서버에서도 급할 때만)
-    // Vercel 환경변수에 ADMIN_MASTER_PASSWORD를 넣으면
-    // admin* 계정은 그 비번으로 무조건 통과
-    const master = s(process.env.ADMIN_MASTER_PASSWORD);
-    const looksAdmin = loginId.toLowerCase().startsWith("admin");
-    if (master && looksAdmin && password === master) {
-      const res = NextResponse.json({
-        ok: true,
-        empId: loginId,
-        role: "admin",
-        master: true,
-      });
-      setLoginCookies(res, loginId, "admin");
-      return res;
-    }
-
-    // ✅ 1) accounts에서 먼저 찾는다 (관리자도 여기로 통합)
+    // ✅ 1) accounts에서 먼저 찾는다
     let account: any = null;
 
     // username 우선
@@ -150,25 +147,25 @@ export async function POST(req: Request) {
       account = data || null;
     }
 
-    // // ✅ 2) accounts에 없으면 (긴급용 하드코딩 admin)
-// ✅ 실서버에서도 admin/1234 허용 (원래 비번 유지)
-if (!account) {
-  if (loginId.toLowerCase() === "admin" && password === "1234") {
-    const res = NextResponse.json({
-      ok: true,
-      empId: "admin",
-      role: "admin",
-      bypass: "admin_1234",
-    });
-    setLoginCookies(res, "admin", "admin");
-    return res;
-  }
+    // ✅ (핵심) admin/1234는 account가 있어도/없어도 무조건 통과
+    if (loginId.toLowerCase() === "admin" && password === "1234") {
+      const res = NextResponse.json({
+        ok: true,
+        empId: "admin",
+        role: "admin",
+        bypass: "admin_1234",
+      });
+      setLoginCookies(res, "admin", "admin");
+      return res;
+    }
 
-  return NextResponse.json(
-    { ok: false, error: "INVALID_CREDENTIALS" },
-    { status: 401 }
-  );
-}
+    // accounts에 없으면 실패
+    if (!account) {
+      return NextResponse.json(
+        { ok: false, error: "INVALID_CREDENTIALS" },
+        { status: 401 }
+      );
+    }
 
     if (account.is_active === false) {
       return NextResponse.json(
@@ -177,24 +174,24 @@ if (!account) {
       );
     }
 
-    // ✅ (핵심3) password_hash가 scrypt 포맷 아니면 명확히 에러 내려서 원인 잡기
-    const stored = String(account.password_hash ?? "");
-    if (!stored.startsWith("scrypt$")) {
-      // 여기서 그냥 INVALID로 묻지 말고 "해시포맷 문제"라고 알려줘야 디버깅이 됨
+    // ✅ 해시 정규화 + 검증
+    const storedNorm = normalizeHash(account.password_hash);
+    if (!storedNorm.startsWith("scrypt$")) {
       return NextResponse.json(
         {
           ok: false,
           error: "PASSWORD_HASH_FORMAT_UNSUPPORTED",
           detail: {
             expected: "scrypt$<saltB64>$<hashB64>",
-            gotPrefix: stored.slice(0, 20),
+            gotPrefix: String(account.password_hash ?? "").slice(0, 40),
+            normalizedPrefix: storedNorm.slice(0, 40),
           },
         },
         { status: 401 }
       );
     }
 
-    const ok = verifyPasswordHash(password, stored);
+    const ok = verifyPasswordHash(password, storedNorm);
     if (!ok) {
       return NextResponse.json(
         { ok: false, error: "INVALID_CREDENTIALS" },
@@ -203,8 +200,6 @@ if (!account) {
     }
 
     const empId = account.emp_id || account.username;
-
-    // ✅ 여기서 관리자/사용자 역할 결정
     const role: "admin" | "user" = isAdminAccount(account) ? "admin" : "user";
 
     const res = NextResponse.json({
