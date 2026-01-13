@@ -29,15 +29,16 @@ function isUuid(x: string) {
 }
 
 function pickChoices(q: any): string[] {
-  const c = q?.choices ?? q?.options ?? q?.choice_list ?? q?.choiceList ?? [];
+  const c = q?.choices ?? q?.options ?? q?.choice_list ?? q?.choiceList ?? q?.choice_texts ?? q?.choiceTexts ?? [];
   if (Array.isArray(c)) return c.map((x) => String(x ?? ""));
   if (typeof c === "string") {
     try {
       const parsed = JSON.parse(c);
       if (Array.isArray(parsed)) return parsed.map((x) => String(x ?? ""));
     } catch {}
-    if (c.includes("|")) return c.split("|").map((x) => x.trim());
-    if (c.includes(",")) return c.split(",").map((x) => x.trim());
+    if (c.includes("|")) return c.split("|").map((x) => x.trim()).filter(Boolean);
+    if (c.includes("\n")) return c.split("\n").map((x) => x.trim()).filter(Boolean);
+    if (c.includes(",")) return c.split(",").map((x) => x.trim()).filter(Boolean);
     return [c];
   }
   return [];
@@ -61,7 +62,7 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
-/** attempt.answers에서 map/ids 추출 (없어도 됨) */
+/** attempt.answers에서 map/ids 추출 */
 function parseAttemptAnswers(attempt: any): { map: Record<string, number>; questionIds: string[] } {
   let a: any = attempt?.answers;
 
@@ -84,6 +85,7 @@ function parseAttemptAnswers(attempt: any): { map: Record<string, number>; quest
     if (k && idx !== null) map[String(k).trim()] = idx;
   }
 
+  // questionIds는 legacy에선 attempt.question_ids(ARRAY)가 더 정확하니까 여기선 보조만
   const qidsRaw = a?.questionIds ?? a?.question_ids ?? a?.questions ?? null;
 
   let questionIds: string[] = [];
@@ -99,27 +101,130 @@ function parseAttemptAnswers(attempt: any): { map: Record<string, number>; quest
   return { map, questionIds };
 }
 
+/** legacy(exam_attempts)에서 graded 만들기: question_ids + answers(map) 기반 */
+async function buildLegacyDetailFromExamAttempts(attempt: any) {
+  // question_ids(ARRAY)가 1순위
+  let questionIds: string[] = Array.isArray(attempt?.question_ids)
+    ? attempt.question_ids.map((x: any) => s(x)).filter(Boolean)
+    : [];
+
+  const parsed = parseAttemptAnswers(attempt);
+
+  // fallback: parseAttemptAnswers.questionIds or map keys
+  if (questionIds.length === 0) questionIds = parsed.questionIds;
+  if (questionIds.length === 0) questionIds = Object.keys(parsed.map || {}).map((k) => s(k)).filter(Boolean);
+
+  const selectedByQid = new Map<string, number>();
+  for (const [qid, idx] of Object.entries(parsed.map)) selectedByQid.set(String(qid).trim(), Number(idx));
+
+  // questions fetch
+  const { data: questions, error: qErr } = await supabaseAdmin
+    .from("questions")
+    .select("*")
+    .in("id", questionIds.length ? questionIds : ["__never__"]);
+
+  if (qErr) {
+    return { ok: false as const, error: "QUESTIONS_QUERY_FAILED", detail: qErr };
+  }
+
+  const qById = new Map<string, any>();
+  for (const q of questions ?? []) qById.set(String((q as any).id), q);
+
+  const graded = questionIds.map((qid) => {
+    const q = qById.get(String(qid)) ?? {};
+    const key = String(qid).trim();
+    const selectedIndex = selectedByQid.has(key) ? selectedByQid.get(key)! : null;
+    const correctIndex = pickCorrectIndex(q);
+
+    const status = selectedIndex == null ? "unsubmitted" : "submitted";
+    const isCorrect =
+      status === "submitted" && correctIndex != null ? Number(selectedIndex) === Number(correctIndex) : false;
+
+    return {
+      questionId: q?.id ?? qid,
+      content: q?.content ?? "",
+      choices: pickChoices(q),
+      selectedIndex,
+      correctIndex,
+      status,
+      isCorrect,
+    };
+  });
+
+  return {
+    ok: true as const,
+    attempt,
+    graded,
+    meta: {
+      idType: "num",
+      source: "exam_attempts",
+      attemptId: attempt?.id,
+      questionIdsCount: questionIds.length,
+      mapKeysCount: Object.keys(parsed.map).length,
+    },
+  };
+}
+
+/** UUID attempt를 legacy(exam_attempts)로 매칭: started_at 기준(±2분) */
+async function resolveLegacyByStartedAt(attemptUuidRow: any) {
+  const startedAt = attemptUuidRow?.started_at ?? attemptUuidRow?.startedAt ?? null;
+  if (!startedAt) return { ok: false as const, error: "UUID_ATTEMPT_NO_STARTED_AT" };
+
+  const d = new Date(startedAt);
+  if (Number.isNaN(d.getTime())) return { ok: false as const, error: "UUID_ATTEMPT_BAD_STARTED_AT", detail: startedAt };
+
+  // ±2분 window
+  const t0 = new Date(d.getTime() - 2 * 60 * 1000).toISOString();
+  const t1 = new Date(d.getTime() + 2 * 60 * 1000).toISOString();
+
+  // 같은 시간대 attempt가 여러 개면 submitted_at 있는 것/score 있는 것 우선
+  const { data: rows, error } = await supabaseAdmin
+    .from("exam_attempts")
+    .select("*")
+    .gte("started_at", t0)
+    .lte("started_at", t1)
+    .order("submitted_at", { ascending: false })
+    .order("id", { ascending: false })
+    .limit(5);
+
+  if (error) return { ok: false as const, error: "LEGACY_MATCH_QUERY_FAILED", detail: error };
+  if (!rows || rows.length === 0) return { ok: false as const, error: "LEGACY_MATCH_NOT_FOUND", detail: { t0, t1 } };
+
+  // best pick: emp_id 있거나 score/total_points 있는 행
+  const best =
+    rows.find((r: any) => !!r?.emp_id) ??
+    rows.find((r: any) => r?.score != null && r?.total_points != null) ??
+    rows[0];
+
+  return { ok: true as const, attempt: best, candidates: rows.map((r: any) => r?.id) };
+}
+
 export async function GET(req: Request) {
   try {
     const u = new URL(req.url);
 
-    // ✅ 어떤 이름으로 오든 attemptId 잡아냄
     const raw =
       getParamCI(u, "attemptId", "attempt_id", "attemptID", "attemptid", "id", "AttemptId", "AttemptID") ?? "";
     const attemptKey = s(raw);
 
     if (!attemptKey) {
       return NextResponse.json(
-        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { url: req.url, got: raw, allParams: Array.from(u.searchParams.entries()) } },
+        {
+          ok: false,
+          error: "INVALID_ATTEMPT_ID",
+          detail: { url: req.url, got: raw, allParams: Array.from(u.searchParams.entries()) },
+        },
         { status: 400 }
       );
     }
 
     // =====================================================
-    // ✅ 1) UUID attempt => attempts 테이블(신형)로 상세 생성
+    // ✅ 1) UUID attempt 처리
+    // - 시도 1: attempts 테이블에서 uuid row 조회(기존 유지)
+    // - 시도 2: started_at 기반으로 exam_attempts(legacy) 매칭 후 legacy 상세 반환
     // =====================================================
     if (isUuid(attemptKey)) {
-      const { data: attempt, error: aErr } = await supabaseAdmin
+      const { data: uuidAttempt, error: aErr } = await supabaseAdmin
         .from("attempts")
         .select("*")
         .eq("id", attemptKey)
@@ -128,18 +233,44 @@ export async function GET(req: Request) {
       if (aErr) {
         return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: aErr }, { status: 500 });
       }
-      if (!attempt) {
-        return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId: attemptKey, source: "attempts" } }, { status: 404 });
+      if (!uuidAttempt) {
+        return NextResponse.json(
+          { ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId: attemptKey, source: "attempts" } },
+          { status: 404 }
+        );
       }
 
-      // questionIds: attempts.questions 배열 우선
+      // ✅ 핵심: UUID row를 legacy(exam_attempts)로 매칭해서 “응시자ID/점수/내 선택” 살린다
+      const resolved = await resolveLegacyByStartedAt(uuidAttempt);
+      if (resolved.ok) {
+        const legacyDetail = await buildLegacyDetailFromExamAttempts(resolved.attempt);
+        if (!legacyDetail.ok) {
+          return NextResponse.json({ ok: false, error: legacyDetail.error, detail: legacyDetail.detail }, { status: 500 });
+        }
+
+        return NextResponse.json({
+          ok: true,
+          attempt: legacyDetail.attempt, // ✅ emp_id/score/submitted_at 포함
+          graded: legacyDetail.graded,
+          meta: {
+            ...legacyDetail.meta,
+            idType: "uuid->num",
+            source: "attempts + exam_attempts",
+            originalUuid: attemptKey,
+            matchedBy: "started_at_window_±2m",
+            legacyCandidates: resolved.candidates,
+          },
+        });
+      }
+
+      // 매칭 실패하면(극히 드뭄) 기존 UUID 응답(제한적)이라도 반환
+      // -> 여기서는 “정답만” 정도는 보이게 유지
       let questionIds: string[] = [];
-      const qs = (attempt as any)?.questions;
+      const qs = (uuidAttempt as any)?.questions;
 
       if (Array.isArray(qs)) {
         questionIds = qs.map((x: any) => s(typeof x === "object" ? x?.id ?? x?.question_id ?? x?.qid : x)).filter(Boolean);
       } else if (typeof qs === "string") {
-        // 혹시 문자열로 저장된 케이스
         try {
           const parsed = JSON.parse(qs);
           if (Array.isArray(parsed)) questionIds = parsed.map((x: any) => s(x)).filter(Boolean);
@@ -148,23 +279,13 @@ export async function GET(req: Request) {
         }
       }
 
-      // selected map: attempts.answers(있으면) 또는 attempts.answer_map 류 (최대한 호환)
+      const parsed = parseAttemptAnswers(uuidAttempt);
       const selectedByQid = new Map<string, number>();
-      const parsed = parseAttemptAnswers(attempt);
-      for (const [qid, idx] of Object.entries(parsed.map)) {
-        selectedByQid.set(String(qid).trim(), Number(idx));
-      }
+      for (const [qid, idx] of Object.entries(parsed.map)) selectedByQid.set(String(qid).trim(), Number(idx));
 
       if (questionIds.length === 0) questionIds = parsed.questionIds;
       if (questionIds.length === 0) questionIds = Array.from(selectedByQid.keys());
 
-      // wrong ids (attempts.wrongs)
-      const wrongIdsRaw = (attempt as any)?.wrongs;
-      const wrongIds = Array.isArray(wrongIdsRaw)
-        ? wrongIdsRaw.map((x: any) => s(typeof x === "object" ? x?.id ?? x?.question_id ?? x?.qid : x)).filter(Boolean)
-        : [];
-
-      // questions 조회
       const { data: questions, error: qErr } = await supabaseAdmin
         .from("questions")
         .select("*")
@@ -181,11 +302,8 @@ export async function GET(req: Request) {
         const q = qById.get(String(qid)) ?? {};
         const selectedIndex = selectedByQid.has(String(qid).trim()) ? selectedByQid.get(String(qid).trim())! : null;
         const correctIndex = pickCorrectIndex(q);
-
         const status = selectedIndex == null ? "unsubmitted" : "submitted";
-        const isCorrect =
-          status === "submitted" && correctIndex != null ? Number(selectedIndex) === Number(correctIndex) : false;
-
+        const isCorrect = status === "submitted" && correctIndex != null ? Number(selectedIndex) === Number(correctIndex) : false;
         return {
           questionId: q?.id ?? qid,
           content: q?.content ?? "",
@@ -199,21 +317,21 @@ export async function GET(req: Request) {
 
       return NextResponse.json({
         ok: true,
-        attempt,
+        attempt: uuidAttempt,
         graded,
         meta: {
           idType: "uuid",
           source: "attempts",
-          attemptId: attemptKey,
-          questionIdsCount: questionIds.length,
-          wrongIdsCount: wrongIds.length,
-          mapKeysCount: Object.keys(parsed.map).length,
+          originalUuid: attemptKey,
+          note: "Legacy match failed; returning UUID-only attempt (may lack emp_id/score).",
+          matchFail: resolved,
         },
       });
     }
 
     // =====================================================
-    // ✅ 2) 숫자 attempt => exam_attempts(레거시) 기존 로직 그대로
+    // ✅ 2) 숫자 attempt => exam_attempts(레거시)
+    // (A팀 영향 X: A팀은 /api/result/[attemptId] 쓰고, 이건 admin 전용)
     // =====================================================
     if (!isNumericId(attemptKey)) {
       return NextResponse.json(
@@ -230,99 +348,23 @@ export async function GET(req: Request) {
       );
     }
 
-    // 1) attempt (legacy)
     const { data: attempt, error: aErr } = await supabaseAdmin
       .from("exam_attempts")
       .select("*")
       .eq("id", attemptId)
       .maybeSingle();
 
-    if (aErr) {
-      return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: aErr }, { status: 500 });
-    }
-    if (!attempt) {
-      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
-    }
+    if (aErr) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: aErr }, { status: 500 });
+    if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
 
-    // 2) answers table (legacy)
-    const { data: ansRows, error: ansErr } = await supabaseAdmin
-      .from("exam_attempt_answers")
-      .select("*")
-      .eq("attempt_id", attemptId);
-
-    if (ansErr) {
-      return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: ansErr }, { status: 500 });
-    }
-
-    const selectedByQid = new Map<string, number>();
-    for (const r of ansRows ?? []) {
-      const qid = s((r as any)?.question_id ?? (r as any)?.questionId ?? (r as any)?.qid);
-      const idx =
-        n((r as any)?.selected_index, null) ??
-        n((r as any)?.selectedIndex, null) ??
-        n((r as any)?.answer_index, null) ??
-        n((r as any)?.answerIndex, null);
-
-      if (qid && idx !== null) selectedByQid.set(qid.trim(), idx);
-    }
-
-    // 3) fallback: attempt.answers(map)
-    const parsed = parseAttemptAnswers(attempt);
-    for (const [qid, idx] of Object.entries(parsed.map)) {
-      const key = String(qid).trim();
-      if (!selectedByQid.has(key)) selectedByQid.set(key, Number(idx));
-    }
-
-    // 4) questionIds 결정
-    let questionIds = parsed.questionIds;
-    if (questionIds.length === 0) questionIds = Array.from(selectedByQid.keys());
-
-    // 5) questions
-    const { data: questions, error: qErr } = await supabaseAdmin
-      .from("questions")
-      .select("*")
-      .in("id", questionIds.length ? questionIds : ["__never__"]);
-
-    if (qErr) {
-      return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: qErr }, { status: 500 });
-    }
-
-    const qById = new Map<string, any>();
-    for (const q of questions ?? []) qById.set(String((q as any).id), q);
-
-    const graded = questionIds.map((qid) => {
-      const q = qById.get(String(qid)) ?? {};
-      const selectedIndex = selectedByQid.has(String(qid).trim()) ? selectedByQid.get(String(qid).trim())! : null;
-      const correctIndex = pickCorrectIndex(q);
-
-      const status = selectedIndex == null ? "unsubmitted" : "submitted";
-      const isCorrect =
-        status === "submitted" && correctIndex != null ? Number(selectedIndex) === Number(correctIndex) : false;
-
-      return {
-        questionId: q?.id ?? qid,
-        content: q?.content ?? "",
-        choices: pickChoices(q),
-        selectedIndex,
-        correctIndex,
-        status,
-        isCorrect,
-      };
-    });
+    const legacyDetail = await buildLegacyDetailFromExamAttempts(attempt);
+    if (!legacyDetail.ok) return NextResponse.json({ ok: false, error: legacyDetail.error, detail: legacyDetail.detail }, { status: 500 });
 
     return NextResponse.json({
       ok: true,
-      attempt,
-      graded,
-      meta: {
-        idType: "num",
-        source: "exam_attempts",
-        attemptId,
-        answersRowsCount: (ansRows ?? []).length,
-        selectedKeysCount: Array.from(selectedByQid.keys()).length,
-        mapKeysCount: Object.keys(parsed.map).length,
-        questionIdsCount: questionIds.length,
-      },
+      attempt: legacyDetail.attempt,
+      graded: legacyDetail.graded,
+      meta: legacyDetail.meta,
     });
   } catch (e: any) {
     return NextResponse.json(
