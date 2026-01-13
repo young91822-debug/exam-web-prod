@@ -25,9 +25,6 @@ function n(v: any, d: number | null = null) {
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
 }
-function isNumericId(v: any) {
-  return /^\d+$/.test(s(v));
-}
 function isUUID(v: any) {
   const t = s(v);
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
@@ -123,9 +120,9 @@ function resolveAttemptIdRaw(req: Request, body: any) {
       u.searchParams.get("attemptID");
     if (q) {
       const qs = s(q);
-      if (isUUID(qs)) return { attemptIdRaw: qs as string | number, resolvedBy: "QUERY_UUID" };
       const qNum = n(qs, null);
       if (qNum !== null && qNum > 0) return { attemptIdRaw: qNum as string | number, resolvedBy: "QUERY_NUMBER" };
+      if (isUUID(qs)) return { attemptIdRaw: qs as string | number, resolvedBy: "QUERY_UUID" };
     }
   } catch {}
 
@@ -140,17 +137,17 @@ function resolveAttemptIdRaw(req: Request, body: any) {
 
   if (fromBody !== undefined && fromBody !== null && fromBody !== "") {
     const bs = s(fromBody);
-    if (isUUID(bs)) return { attemptIdRaw: bs as string | number, resolvedBy: "BODY_UUID" };
     const bodyNum = n(bs, null);
     if (bodyNum !== null && bodyNum > 0) return { attemptIdRaw: bodyNum as string | number, resolvedBy: "BODY_NUMBER" };
+    if (isUUID(bs)) return { attemptIdRaw: bs as string | number, resolvedBy: "BODY_UUID" };
   }
 
   const cAttemptRaw = getCookie(req, "attemptId") || getCookie(req, "attempt_id");
   if (cAttemptRaw) {
     const cs = s(cAttemptRaw);
-    if (isUUID(cs)) return { attemptIdRaw: cs as string | number, resolvedBy: "COOKIE_UUID" };
     const cNum = n(cs, null);
     if (cNum !== null && cNum > 0) return { attemptIdRaw: cNum as string | number, resolvedBy: "COOKIE_NUMBER" };
+    if (isUUID(cs)) return { attemptIdRaw: cs as string | number, resolvedBy: "COOKIE_UUID" };
   }
 
   return { attemptIdRaw: null as any, resolvedBy: "NONE", detail: { url: req.url, keys: Object.keys(body ?? {}) } };
@@ -162,7 +159,6 @@ function resolveAttemptIdRaw(req: Request, body: any) {
  * - 없으면 새 attempt INSERT (total_questions NOT NULL 채움)
  */
 async function getOrCreateAttemptIdByEmpId(client: any, empId: string, totalQuestions: number) {
-  // 1) 미제출 attempt pick
   const { data: picked, error: pickErr } = await client
     .from("exam_attempts")
     .select("id, emp_id, status, started_at, submitted_at, total_questions, total_points")
@@ -177,7 +173,6 @@ async function getOrCreateAttemptIdByEmpId(client: any, empId: string, totalQues
     if (idNum !== null) return { attemptId: idNum, mode: "PICKED", picked };
   }
 
-  // 2) 없으면 생성
   const nowIso = new Date().toISOString();
   const insertRow: any = {
     emp_id: empId,
@@ -230,8 +225,8 @@ function pickTimeLimitMinutes(attempt: any) {
   return 15;
 }
 
-/** attempt에 question_ids 같은 게 있으면 최대한 bigint id 배열로 뽑음 */
-function pickAttemptQuestionIds(attempt: any): string[] {
+/** attempt에 question_ids 같은 게 있으면 UUID 배열로 뽑음 */
+function pickAttemptQuestionUuids(attempt: any): string[] {
   const cands = [
     attempt?.question_ids,
     attempt?.questionIds,
@@ -245,7 +240,7 @@ function pickAttemptQuestionIds(attempt: any): string[] {
     if (!v) continue;
 
     if (Array.isArray(v)) {
-      const out = v.map((x) => s(x)).filter((x) => isNumericId(x));
+      const out = v.map((x) => s(x)).filter((x) => isUUID(x));
       if (out.length) return out;
     }
 
@@ -255,18 +250,18 @@ function pickAttemptQuestionIds(attempt: any): string[] {
       try {
         const parsed = JSON.parse(t);
         if (Array.isArray(parsed)) {
-          const out = parsed.map((x) => s(x)).filter((x) => isNumericId(x));
+          const out = parsed.map((x) => s(x)).filter((x) => isUUID(x));
           if (out.length) return out;
         }
       } catch {}
       if (t.includes(",")) {
-        const out = t.split(",").map((x) => s(x)).filter((x) => isNumericId(x));
+        const out = t.split(",").map((x) => s(x)).filter((x) => isUUID(x));
         if (out.length) return out;
       }
     }
 
     if (typeof v === "object") {
-      const out = Object.keys(v).map((k) => s(k)).filter((x) => isNumericId(x));
+      const out = Object.keys(v).map((k) => s(k)).filter((x) => isUUID(x));
       if (out.length) return out;
     }
   }
@@ -302,7 +297,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // answers
     const items = normalizeAnswers(body);
 
     // ✅ 최종 attemptId(bigint)
@@ -384,41 +378,36 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 답변은 question_id(bigint)만 취급
-    // - body가 uuid를 보내도, 현재 DB는 bigint이므로 저장/채점 불가 → 무시
+    // ✅ 답변은 UUID만 취급 (questions.id가 UUID)
     const answeredMap = new Map<string, number>();
     for (const it of items) {
       const qid = s(it.questionId);
-      if (!isNumericId(qid)) continue;
+      if (!isUUID(qid)) continue; // ✅ "0" 같은 쓰레기 자동 제거
       const sel = n(it.selectedIndex, null);
       if (sel === null) continue;
       answeredMap.set(qid, Number(sel));
     }
 
-    // ✅ 채점 대상 qids: attempt에 있으면 그걸 우선, 없으면 answered만
-    const attemptQids = pickAttemptQuestionIds(attempt);
+    // ✅ 채점 대상 qids: attempt에 UUID 목록이 있으면 우선, 없으면 answered만
+    const attemptQids = pickAttemptQuestionUuids(attempt);
     const qidsToGrade = (attemptQids.length ? attemptQids : Array.from(answeredMap.keys()))
-      .filter((x) => isNumericId(x))
+      .filter((x) => isUUID(x))
       .filter((x, i, arr) => arr.indexOf(x) === i);
 
-    // 질문 조회 (필요한 것만)
-    let questions: any[] = [];
+    // 질문 조회
     const qById = new Map<string, any>();
-
     if (qidsToGrade.length > 0) {
-      const qidsNum = qidsToGrade.map((x) => Number(x));
-      const { data: qs, error: qErr } = await client.from("questions").select("*").in("id", qidsNum as any);
+      const { data: qs, error: qErr } = await client.from("questions").select("*").in("id", qidsToGrade as any);
       if (qErr) {
         return NextResponse.json(
           { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String((qErr as any)?.message ?? qErr) },
           { status: 500 }
         );
       }
-      questions = qs ?? [];
-      for (const q of questions) qById.set(String(q.id), q);
+      for (const q of qs ?? []) qById.set(String(q.id), q);
     }
 
-    // ✅ 점수 계산 (attemptQids가 있으면 "전체문항 기준", 없으면 "답한 것 기준")
+    // ✅ 점수 계산
     let totalPoints = 0;
     let score = 0;
     let correctCount = 0;
@@ -434,22 +423,17 @@ export async function POST(req: Request) {
       const correctIndex = pickCorrectIndex(q);
       const selected = answeredMap.has(qid) ? answeredMap.get(qid)! : null;
 
-      const isCorrect =
-        selected !== null &&
-        correctIndex !== null &&
-        Number(selected) === Number(correctIndex);
+      const isCorrect = selected !== null && correctIndex !== null && Number(selected) === Number(correctIndex);
 
       if (isCorrect) {
         score += pts;
         correctCount += 1;
       } else {
-        // 미응답도 오답으로 치고 싶으면 attemptQids가 있는 경우 여기로 들어옴(=selected null)
         wrongQuestionIds.push(qid);
       }
     }
 
-    // ✅ 저장: exam_answers 사용 + question_id로 저장
-    // (기존 attempt 답안 싹 지우고 다시 넣기)
+    // ✅ 저장: exam_answers (attempt_id + question_id(uuid) + selected_index)
     const { error: delErr } = await client.from("exam_answers").delete().eq("attempt_id", attemptId);
     if (delErr) {
       return NextResponse.json(
@@ -460,7 +444,7 @@ export async function POST(req: Request) {
 
     const rows = Array.from(answeredMap.entries()).map(([qid, sel]) => ({
       attempt_id: attemptId,
-      question_id: Number(qid), // ✅ bigint FK
+      question_id: qid, // ✅ UUID
       selected_index: Number(sel),
     }));
 
@@ -472,21 +456,21 @@ export async function POST(req: Request) {
             ok: false,
             error: "ANSWERS_INSERT_FAILED",
             detail: String((insErr as any)?.message ?? insErr),
-            hint: "exam_answers에 question_id(bigint) 컬럼이 있어야 함",
+            hint: "exam_answers.question_id 는 UUID 여야 함",
           },
           { status: 500 }
         );
       }
     }
 
-    // ✅ total_questions는 "푼 문제수"로 덮어쓰지 말고, 있던 값 유지 우선
+    // total_questions는 기존 유지 우선
     const finalTotalQuestions =
       n(attempt?.total_questions, null) ??
       (attemptQids.length ? attemptQids.length : null) ??
       (qidsToGrade.length ? qidsToGrade.length : null) ??
       20;
 
-    // answers json (결과페이지/디버깅용) — 키는 question_id 문자열
+    // answers json (디버깅용) — 키는 UUID
     const answerMapForAttempt: Record<string, number> = {};
     for (const [qid, sel] of answeredMap.entries()) answerMapForAttempt[qid] = Number(sel);
 
@@ -521,7 +505,7 @@ export async function POST(req: Request) {
       correctCount,
       wrongQuestionIds,
       savedAnswers: rows.length,
-      marker: "SUBMIT_PATCH_2026-01-13_SAVE_TO_exam_answers_question_id",
+      marker: "SUBMIT_PATCH_SAVE_TO_exam_answers_question_id_UUID",
       redirectUrl: `/exam/result/${attemptId}`,
       debug: {
         ...resolveDetail,
