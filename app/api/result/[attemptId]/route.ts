@@ -1,101 +1,142 @@
+// app/api/result/[attemptId]/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
 
+function s(v: any) {
+  return String(v ?? "").trim();
+}
 function n(v: any, d: number | null = null) {
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
 }
+function isNumericId(x: string) {
+  return /^\d+$/.test(x);
+}
 
 function pickChoices(q: any): string[] {
-  const c = q?.choices ?? [];
-  if (Array.isArray(c)) return c.map(String);
+  const c = q?.choices ?? q?.options ?? q?.choice_list ?? q?.choice_texts ?? [];
+  if (Array.isArray(c)) return c.map((x) => String(x ?? ""));
+  if (typeof c === "string") return c.split("\n").map((x) => x.trim()).filter(Boolean);
   return [];
 }
 
 export async function GET(
   _req: NextRequest,
-  { params }: { params: { attemptId: string } }
+  context: { params: Promise<{ attemptId: string }> }
 ) {
-  const attemptId = Number(params.attemptId);
-  if (!Number.isFinite(attemptId)) {
-    return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
-  }
+  try {
+    const { attemptId: raw } = await context.params;
+    const attemptIdStr = s(raw);
 
-  /** 1️⃣ attempt */
-  const { data: attempt } = await supabaseAdmin
-    .from("exam_attempts")
-    .select("*")
-    .eq("id", attemptId)
-    .maybeSingle();
-
-  if (!attempt) {
-    return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
-  }
-
-  /** 2️⃣ exam_answers (🔥 bigint 기준) */
-  const { data: answers } = await supabaseAdmin
-    .from("exam_answers")
-    .select("question_id, selected_index")
-    .eq("attempt_id", attemptId);
-
-  const answerMap = new Map<number, number>();
-  for (const a of answers ?? []) {
-    if (a.question_id != null && a.selected_index != null) {
-      answerMap.set(Number(a.question_id), Number(a.selected_index));
+    if (!attemptIdStr) {
+      return NextResponse.json({ ok: false, error: "MISSING_ATTEMPT_ID" }, { status: 400 });
     }
-  }
-
-  /** 3️⃣ questions (uuid + bigint 같이 사용) */
-  const { data: questions } = await supabaseAdmin
-    .from("questions")
-    .select("id, content, choices, correct_index, points");
-
-  let score = 0;
-  let correctCount = 0;
-
-  const graded = (questions ?? []).map((q: any) => {
-    const qIdBigint = Number(q.id); // ⚠️ questions.id 가 bigint PK임
-    const selected = answerMap.get(qIdBigint) ?? null;
-    const correct = q.correct_index;
-
-    const isCorrect =
-      selected !== null &&
-      correct !== null &&
-      Number(selected) === Number(correct);
-
-    if (isCorrect) {
-      score += q.points ?? 0;
-      correctCount += 1;
+    if (!isNumericId(attemptIdStr)) {
+      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
-    return {
-      questionId: q.id,
-      content: q.content,
-      choices: pickChoices(q),
-      correctIndex: correct,
-      selectedIndex: selected,
-      isCorrect,
-      points: q.points ?? 0,
-    };
-  });
+    const attemptId = Number(attemptIdStr);
 
-  return NextResponse.json({
-    ok: true,
-    attempt: {
-      id: attempt.id,
-      emp_id: attempt.emp_id,
-      started_at: attempt.started_at,
-      submitted_at: attempt.submitted_at,
-      total_questions: attempt.total_questions,
-      total_points: attempt.total_points,
-      score,
-      correct_count: correctCount,
-      status: attempt.status,
-    },
-    graded,
-    totalQuestions: graded.length,
-    wrongCount: graded.filter((g) => !g.isCorrect).length,
-  });
+    /** 1) attempt */
+    const { data: attempt, error: e1 } = await supabaseAdmin
+      .from("exam_attempts")
+      .select("*")
+      .eq("id", attemptId)
+      .maybeSingle();
+
+    if (e1) {
+      return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: String(e1.message || e1) }, { status: 500 });
+    }
+    if (!attempt) {
+      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
+    }
+
+    /** 2) exam_answers: question_id(bigint) + selected_index(int) */
+    const { data: answers, error: eAns } = await supabaseAdmin
+      .from("exam_answers")
+      .select("question_id, selected_index")
+      .eq("attempt_id", attemptId);
+
+    if (eAns) {
+      return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: String(eAns.message || eAns) }, { status: 500 });
+    }
+
+    // question_id(bigint) => selected_index(int)
+    const ansMap = new Map<string, number>();
+    for (const a of answers ?? []) {
+      const qid = a?.question_id;
+      const sel = a?.selected_index;
+      if (qid === null || qid === undefined) continue;
+      if (sel === null || sel === undefined) continue;
+      ansMap.set(String(qid), Number(sel));
+    }
+
+    /** 3) questions 조회: id(bigint) 기반으로 매칭 */
+    const { data: questions, error: eQ } = await supabaseAdmin
+      .from("questions")
+      .select("*"); // content, choices, correct_index/answer_index, points 등 포함
+
+    if (eQ) {
+      return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String(eQ.message || eQ) }, { status: 500 });
+    }
+
+    let score = 0;
+    let correctCount = 0;
+
+    const graded = (questions ?? []).map((q: any) => {
+      const qid = String(q?.id); // 🔥 questions.id가 bigint
+      const correctIndex = q?.correct_index ?? q?.correctIndex ?? q?.answer_index ?? q?.answerIndex ?? null;
+
+      const chosen = ansMap.has(qid) ? ansMap.get(qid)! : null;
+
+      const isCorrect =
+        correctIndex !== null &&
+        chosen !== null &&
+        Number.isFinite(Number(correctIndex)) &&
+        Number.isFinite(Number(chosen)) &&
+        Number(correctIndex) === Number(chosen);
+
+      const pts = n(q?.points, 0) ?? 0;
+      if (isCorrect) {
+        score += pts;
+        correctCount += 1;
+      }
+
+      return {
+        questionId: q?.id,
+        content: q?.content ?? q?.question ?? q?.title ?? "",
+        choices: pickChoices(q),
+        correctIndex: correctIndex === null ? null : Number(correctIndex),
+        selectedIndex: chosen === null ? null : Number(chosen),
+        isCorrect,
+        points: pts,
+      };
+    });
+
+    return NextResponse.json({
+      ok: true,
+      attempt: {
+        id: attempt.id,
+        emp_id: attempt.emp_id,
+        started_at: attempt.started_at,
+        submitted_at: attempt.submitted_at,
+        total_questions: attempt.total_questions,
+        total_points: attempt.total_points,
+        score,
+        correct_count: correctCount,
+        status: attempt.status,
+        answers_source: "exam_answers(attempt_id)",
+      },
+      graded,
+      totalQuestions: graded.length,
+      wrongCount: graded.filter((g: any) => g?.isCorrect === false).length,
+    });
+  } catch (err: any) {
+    return NextResponse.json(
+      { ok: false, error: "UNEXPECTED_ERROR", detail: String(err?.message ?? err) },
+      { status: 500 }
+    );
+  }
 }
