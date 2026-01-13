@@ -18,6 +18,18 @@ function num(v: any, d: number) {
   return Number.isFinite(x) ? x : d;
 }
 
+function getCookie(cookieHeader: string, name: string) {
+  const parts = cookieHeader.split(";").map((v) => v.trim());
+  for (const p of parts) {
+    const idx = p.indexOf("=");
+    if (idx < 0) continue;
+    const k = p.slice(0, idx).trim();
+    const v = p.slice(idx + 1).trim();
+    if (k === name) return decodeURIComponent(v);
+  }
+  return "";
+}
+
 function getSupabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const service = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -32,47 +44,66 @@ function getSupabaseAdmin() {
 }
 
 const QUESTION_TABLE = "questions";
-const ATTEMPT_TABLES = ["attempts", "exam_attempts"];
+const ATTEMPT_TABLE = "attempts"; // ✅ 이제 attempts만 사용 (팀 분리 가능)
 
-async function insertAttemptSmart(client: any, userId: string) {
-  // 네 attempts row에서 user_id 먹히는 거 확인됨
-  const payloadCandidates = [{ user_id: userId }, {}];
+async function pickTeamFromAccounts(client: any, empId: string) {
+  const { data, error } = await client
+    .from("accounts")
+    .select("username, emp_id, team, is_active")
+    .or(`username.eq.${empId},emp_id.eq.${empId}`)
+    .maybeSingle();
 
-  let lastErr: any = null;
+  if (error) throw { where: "accounts", error };
+  if (!data) return { team: "A", isActive: true, found: false };
 
-  for (const table of ATTEMPT_TABLES) {
-    for (const payload of payloadCandidates) {
-      const { data, error } = await client.from(table).insert(payload).select("*").single();
-      if (!error && data) return { tableUsed: table, attempt: data, payloadUsed: payload };
-      lastErr = { tableTried: table, payloadTried: payload, error };
-    }
+  if (data.is_active === false) {
+    return { team: String(data.team || "A"), isActive: false, found: true };
   }
 
-  throw lastErr;
+  return { team: String(data.team || "A"), isActive: true, found: true };
 }
 
-export async function POST() {
+export async function POST(req: Request) {
   try {
     const { client, error: envErr } = getSupabaseAdmin();
     if (envErr) {
       return NextResponse.json({ ok: false, error: "ENV_ERROR", detail: envErr }, { status: 500 });
     }
 
-    const userId = "anonymous";
+    const cookieHeader = req.headers.get("cookie") || "";
+    const empId = getCookie(cookieHeader, "empId"); // ✅ 로그인한 사람
+    if (!empId) {
+      return NextResponse.json({ ok: false, error: "NO_SESSION" }, { status: 401 });
+    }
+
+    // ✅ accounts에서 team 읽기
+    const teamInfo = await pickTeamFromAccounts(client, empId);
+    if (!teamInfo.isActive) {
+      return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
+    }
+    const team = (teamInfo.team || "A").trim() || "A";
+
     const nowIso = new Date().toISOString();
 
-    // 1) questions 조회 (is_active 있으면 true만, 없으면 전체)
+    // 1) questions 조회: 내 팀만 + (includeOff 전략 유지)
     let qrows: any[] = [];
     {
       const r1 = await client
         .from(QUESTION_TABLE)
-        .select("id, content, choices, points, is_active")
+        .select("id, content, choices, points, is_active, team")
+        .eq("team", team) // ✅ 팀 필터
         .eq("is_active", true)
         .limit(5000);
 
       if (!r1.error) qrows = r1.data || [];
       else {
-        const r2 = await client.from(QUESTION_TABLE).select("id, content, choices, points").limit(5000);
+        // is_active 컬럼이 없거나 캐시 문제 대비 fallback
+        const r2 = await client
+          .from(QUESTION_TABLE)
+          .select("id, content, choices, points, team")
+          .eq("team", team) // ✅ 팀 필터
+          .limit(5000);
+
         if (r2.error) {
           return NextResponse.json(
             { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: r2.error },
@@ -85,7 +116,7 @@ export async function POST() {
 
     if (!qrows.length) {
       return NextResponse.json(
-        { ok: false, error: "NO_QUESTIONS", detail: "questions returned 0 rows" },
+        { ok: false, error: "NO_QUESTIONS", detail: `questions returned 0 rows for team=${team}` },
         { status: 500 }
       );
     }
@@ -95,63 +126,36 @@ export async function POST() {
     const pickedIds = picked.map((q) => String(q.id));
     const totalPoints = picked.reduce((sum, q) => sum + num(q.points, 5), 0);
 
-    // 3) attempt 생성
-    let attemptInfo: any;
-    try {
-      attemptInfo = await insertAttemptSmart(client, userId);
-    } catch (e: any) {
-      return NextResponse.json(
-        { ok: false, error: "ATTEMPT_INSERT_FAILED", detail: e?.error ?? e },
-        { status: 500 }
-      );
-    }
-
-    const attemptId = String(attemptInfo?.attempt?.id ?? "");
-    if (!attemptId) {
-      return NextResponse.json(
-        { ok: false, error: "ATTEMPT_ID_MISSING", detail: { attemptInfo } },
-        { status: 500 }
-      );
-    }
-
-    // ✅ 4) 매핑 테이블이 없으니 attempts row 자체에 questions/설정 저장
-    // (네 row에 questions/answers/wrongs/duration_sec/started_at/total_points 컬럼 있는 거 확인됨)
-    const patch: any = {
+    // 3) attempt 생성 (attempts만) + team 저장
+    const insertPayload: any = {
+      user_id: empId,     // ✅ anonymous 금지
+      team,               // ✅ 팀 저장
       started_at: nowIso,
-      duration_sec: 900, // 15분
+      duration_sec: 900,
       total_points: totalPoints,
-      questions: pickedIds, // ✅ 핵심: attempt에 문제 UUID 배열 저장
-      answers: [],          // 초기화
-      wrongs: [],           // 초기화
+      questions: pickedIds,
+      answers: [],
+      wrongs: [],
       submitted_at: null,
       score: 0,
     };
 
-    const { error: upErr } = await client.from(attemptInfo.tableUsed).update(patch).eq("id", attemptId);
-    if (upErr) {
-      // 그래도 프론트는 문제 풀게 해주고, 디버그로만 남김
+    const { data: attempt, error: insErr } = await client
+      .from(ATTEMPT_TABLE)
+      .insert(insertPayload)
+      .select("id")
+      .single();
+
+    if (insErr || !attempt?.id) {
       return NextResponse.json(
-        {
-          ok: true,
-          attemptId,
-          questions: picked.map((q) => ({
-            id: String(q.id),
-            content: String(q.content ?? ""),
-            choices: Array.isArray(q.choices) ? q.choices : [],
-            points: num(q.points, 5),
-          })),
-          debug: {
-            attemptTableUsed: attemptInfo.tableUsed,
-            attemptPayloadUsed: attemptInfo.payloadUsed,
-            warn: "ATTEMPT_UPDATE_FAILED_BUT_RETURNED_QUESTIONS",
-            upErr,
-          },
-        },
-        { status: 200 }
+        { ok: false, error: "ATTEMPT_INSERT_FAILED", detail: insErr ?? "no id" },
+        { status: 500 }
       );
     }
 
-    // 5) 응답
+    const attemptId = String(attempt.id);
+
+    // 4) 응답
     const outQuestions = picked.map((q) => ({
       id: String(q.id),
       content: String(q.content ?? ""),
@@ -164,8 +168,8 @@ export async function POST() {
       attemptId,
       questions: outQuestions,
       debug: {
-        attemptTableUsed: attemptInfo.tableUsed,
-        attemptPayloadUsed: attemptInfo.payloadUsed,
+        empId,
+        team,
         picked: outQuestions.length,
       },
     });
