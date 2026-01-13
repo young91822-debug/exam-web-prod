@@ -1,4 +1,3 @@
-// app/api/admin/results/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
@@ -12,68 +11,47 @@ function s(v: any) {
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    const empId = s(url.searchParams.get("empId"));
-    const onlySubmitted = s(url.searchParams.get("onlySubmitted"));
+    const page = Number(url.searchParams.get("page") ?? 1) || 1;
+    const pageSize = Number(url.searchParams.get("pageSize") ?? 50) || 50;
 
-    let q = sb
+    const from = (page - 1) * pageSize;
+    const to = from + pageSize - 1;
+
+    const { data, error } = await sb
       .from("exam_attempts")
       .select("*")
-      .order("submitted_at", { ascending: false, nullsFirst: false })
-      .order("started_at", { ascending: false });
+      .order("started_at", { ascending: false })
+      .range(from, to);
 
-    if (empId) q = q.eq("emp_id", empId);
-    if (onlySubmitted && ["1", "true", "y", "yes"].includes(onlySubmitted.toLowerCase())) {
-      q = q.not("submitted_at", "is", null);
-    }
-
-    const { data: attempts, error } = await q;
     if (error) {
-      return NextResponse.json({ ok: false, error: "DB_QUERY_FAILED", detail: error.message }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "DB_QUERY_FAILED", detail: error.message },
+        { status: 500 }
+      );
     }
 
-    const empIds = Array.from(
-      new Set((attempts ?? []).map((a: any) => s(a?.emp_id)).filter((x) => x))
-    );
+    const items = (data ?? []).map((r: any) => ({
+      id: String(r.id),
+      idType: typeof r.id === "string" && r.id.includes("-") ? "uuid" : "num",
+      empId: r.emp_id,
+      score: Number(r.score ?? 0),
+      totalPoints: Number(r.total_points ?? 0),
+      startedAt: r.started_at,
+      submittedAt: r.submitted_at,
+      totalQuestions: Number(r.total_questions ?? 0),
+      wrongCount: Number(r.wrong_count ?? 0),
+    }));
 
-    let accountsMap = new Map<string, any>();
-    if (empIds.length) {
-      const { data: accRows, error: accErr } = await sb
-        .from("accounts")
-        .select("*") // ✅ 안전: is_active 같은 특정 컬럼을 안 찍음
-        .in("emp_id", empIds);
-
-      if (!accErr && Array.isArray(accRows)) {
-        for (const r of accRows) accountsMap.set(s(r?.emp_id), r);
-      }
-    }
-
-    const rows = (attempts ?? []).map((a: any) => {
-      const acc = accountsMap.get(s(a?.emp_id)) ?? null;
-      return {
-        ...a,
-        account: acc
-          ? {
-              id: acc?.id,
-              emp_id: acc?.emp_id,
-              name: acc?.name ?? acc?.emp_name ?? null,
-              // 화면에서 쓰기 좋게 통일
-              active: Boolean(
-                acc?.is_active ??
-                  acc?.active ??
-                  acc?.enabled ??
-                  acc?.isEnabled ??
-                  acc?.use_yn ??
-                  acc?.useYn ??
-                  true
-              ),
-              created_at: acc?.created_at ?? null,
-            }
-          : null,
-      };
+    return NextResponse.json({
+      ok: true,
+      page,
+      pageSize,
+      items,
     });
-
-    return NextResponse.json({ ok: true, rows });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
+      { status: 500 }
+    );
   }
 }
