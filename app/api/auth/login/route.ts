@@ -62,11 +62,6 @@ async function readBodyAny(req: Request) {
 const ADMIN_IDS = new Set(["admin", "admin_gs"]);
 
 export async function POST(req: Request) {
-    return NextResponse.json(
-    { ok: false, error: "HIT_AUTH_LOGIN_ROUTE" },
-    { status: 418 }
-  );
-
   try {
     const body = await readBodyAny(req);
 
