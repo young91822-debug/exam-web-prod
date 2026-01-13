@@ -29,26 +29,41 @@ function getCookie(cookieHeader: string, name: string) {
   return "";
 }
 
+/**
+ * ✅ 너 DB 스키마(accounts: user_id, emp_id, team, password...)에 맞춘 관리자 팀 조회
+ * - 쿠키: empId 또는 userId 둘 중 하나라도 있으면 사용
+ * - role 쿠키는 기존 그대로 체크 (admin 아니면 차단)
+ * - DB 조회 컬럼: user_id, emp_id, team (username/is_active 제거)
+ */
 async function requireAdminTeam(req: Request) {
   const cookieHeader = req.headers.get("cookie") || "";
-  const empId = getCookie(cookieHeader, "empId");
+
+  // 기존 쿠키명이 empId였던 흐름 유지 + userId도 허용
+  const loginId = getCookie(cookieHeader, "userId") || getCookie(cookieHeader, "empId");
   const role = getCookie(cookieHeader, "role");
 
-  if (!empId) return { ok: false as const, status: 401, error: "NO_SESSION" };
+  if (!loginId) return { ok: false as const, status: 401, error: "NO_SESSION" };
   if (role !== "admin") return { ok: false as const, status: 403, error: "NOT_ADMIN" };
 
+  // ✅ accounts 테이블 실제 컬럼 기준
   const { data, error } = await supabaseAdmin
     .from("accounts")
-    .select("username, emp_id, team, is_active")
-    .or(`username.eq.${empId},emp_id.eq.${empId}`)
+    .select("user_id, emp_id, team")
+    .or(`user_id.eq.${loginId},emp_id.eq.${loginId}`)
     .maybeSingle();
 
-  if (error) return { ok: false as const, status: 500, error: "DB_QUERY_FAILED", detail: String(error.message || error) };
+  if (error) {
+    return {
+      ok: false as const,
+      status: 500,
+      error: "DB_QUERY_FAILED",
+      detail: String((error as any).message || error),
+    };
+  }
   if (!data) return { ok: false as const, status: 401, error: "ACCOUNT_NOT_FOUND" };
-  if ((data as any).is_active === false) return { ok: false as const, status: 403, error: "ACCOUNT_DISABLED" };
 
   const team = String((data as any).team ?? "").trim() || "A";
-  return { ok: true as const, team, empId };
+  return { ok: true as const, team, loginId };
 }
 
 /** 간단 CSV 파서 (따옴표/쉼표 기본 대응) */
@@ -213,22 +228,26 @@ function normalizeIncomingRows(rows: any[]): ParsedRow[] {
 
 async function insertWithFallback(payloadBase: any[]) {
   // 1) team + correct_index
-  let payload = payloadBase.map((p) => ({ ...p }));
+  const payload = payloadBase.map((p) => ({ ...p }));
 
-  let r = await supabaseAdmin.from("questions").insert(payload);
+  const r = await supabaseAdmin.from("questions").insert(payload);
   if (!r.error) return { ok: true, mode: "team+correct_index" as const };
 
-  const msg1 = String(r.error.message || r.error);
+  const msg1 = String((r.error as any).message || r.error);
 
   // 2) correct_index 컬럼 없으면 answer_index로 재시도 (team 유지)
-  if (msg1.toLowerCase().includes("column") && msg1.toLowerCase().includes("correct_index") && msg1.toLowerCase().includes("does not exist")) {
+  if (
+    msg1.toLowerCase().includes("column") &&
+    msg1.toLowerCase().includes("correct_index") &&
+    msg1.toLowerCase().includes("does not exist")
+  ) {
     const payload2 = payloadBase.map((p: any) => {
       const { correct_index, ...rest } = p;
       return { ...rest, answer_index: p.answer_index ?? null };
     });
     const r2 = await supabaseAdmin.from("questions").insert(payload2);
     if (!r2.error) return { ok: true, mode: "team+answer_index" as const };
-    return { ok: false, error: "DB_INSERT_FAILED", detail: String(r2.error.message || r2.error) };
+    return { ok: false, error: "DB_INSERT_FAILED", detail: String((r2.error as any).message || r2.error) };
   }
 
   return { ok: false, error: "DB_INSERT_FAILED", detail: msg1 };
