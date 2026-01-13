@@ -33,21 +33,13 @@ function verifyPasswordHash(plain: string, stored: string) {
  * ✅ 핵심: JSON만 보지 말고 formData / text(urlencoded 포함)도 모두 파싱
  */
 async function readBody(req: Request): Promise<any> {
-  // 1) JSON
+  // JSON 먼저
   try {
     const j = await req.json();
     if (j && typeof j === "object") return j;
   } catch {}
 
-  // 2) formData (multipart / x-www-form-urlencoded)
-  try {
-    const fd = await req.formData();
-    const obj: Record<string, any> = {};
-    for (const [k, v] of fd.entries()) obj[k] = typeof v === "string" ? v : String(v);
-    if (Object.keys(obj).length) return obj;
-  } catch {}
-
-  // 3) text → JSON 시도 → urlencoded 시도
+  // text로 받고 JSON/urlencoded 둘 다 시도
   try {
     const t = await req.text();
     if (!t) return {};
@@ -67,27 +59,29 @@ async function readBody(req: Request): Promise<any> {
   }
 }
 
-function pickFirst(body: any, keys: string[]) {
-  for (const k of keys) {
-    const v = body?.[k];
-    const sv = s(v);
-    if (sv) return sv;
-  }
-  return "";
+function s(v: any) {
+  return String(v ?? "").trim();
 }
 
 export async function POST(req: Request) {
   try {
     const body = await readBody(req);
 
-    // ✅ 어떤 키로 오든 다 받아먹기
-    const id = pickFirst(body, ["id", "loginId", "username", "user_id", "empId", "emp_id"]);
-    const pw = pickFirst(body, ["pw", "password", "pass", "passwd"]);
+    const id = s(
+      body?.id ??
+        body?.loginId ??
+        body?.username ??
+        body?.user_id ??
+        body?.empId ??
+        body?.emp_id
+    );
 
-    // ✅ 실서버에서 확인 가능한 로그 (Vercel Functions Logs에서 확인)
-    console.log("LOGIN content-type =", req.headers.get("content-type"));
-    console.log("LOGIN body keys =", Object.keys(body || {}));
-    console.log("LOGIN parsed id/pw =", id ? "[OK]" : "[EMPTY]", pw ? "[OK]" : "[EMPTY]");
+    const pw = s(
+      body?.pw ??
+        body?.password ??
+        body?.pass ??
+        body?.passwd
+    );
 
     if (!id || !pw) {
       return NextResponse.json(
@@ -97,11 +91,22 @@ export async function POST(req: Request) {
           debug: {
             contentType: req.headers.get("content-type"),
             keys: Object.keys(body || {}),
+            sample: {
+              id: body?.id,
+              loginId: body?.loginId,
+              username: body?.username,
+              pw: body?.pw,
+              password: body?.password,
+            },
           },
         },
         { status: 400 }
       );
     }
+
+    // ✅ 여기 아래부터는 기존 DB 로직 그대로
+    // ...
+
 
     // ✅ 계정 조회
     const { data, error } = await supabaseAdmin
