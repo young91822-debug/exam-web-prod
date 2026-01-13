@@ -85,7 +85,7 @@ export async function GET() {
     );
   }
 }
-
+console.log("POST /api/admin/accounts BODY =", body);
 export async function POST(req: Request) {
   try {
     const body = await readBody(req);
@@ -98,72 +98,53 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 핵심: user_id NOT NULL → emp_id를 그대로 사용
-    const basePayload = {
-      user_id: emp_id,   // 🔥 이 줄이 핵심
-      emp_id: emp_id,
-    };
-
-    // 1차: 최소 컬럼
-    let res = await sb
+    /* 1️⃣ 이미 존재하는지 먼저 확인 */
+    const { data: exists, error: selErr } = await sb
       .from("accounts")
-      .insert([basePayload])
       .select("*")
-      .single();
+      .eq("user_id", emp_id)
+      .maybeSingle();
 
-    if (!res.error) {
-      return NextResponse.json({ ok: true, row: res.data });
-    }
-
-    const msg = String(res.error?.message ?? "");
-
-    // 2차: role / password_hash NOT NULL 방어
-    if (/role|password_hash|null value/i.test(msg)) {
-      const retry = await sb
-        .from("accounts")
-        .insert([
-          {
-            ...basePayload,
-            role: "user",
-            password_hash: "",
-          },
-        ])
-        .select("*")
-        .single();
-
-      if (!retry.error) {
-        return NextResponse.json({ ok: true, row: retry.data });
-      }
-
+    if (selErr) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: "ACCOUNTS_INSERT_FAILED",
-          detail: retry.error.message,
-        },
+        { ok: false, error: "DB_QUERY_FAILED", detail: selErr.message },
         { status: 500 }
       );
     }
 
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "ACCOUNTS_INSERT_FAILED",
-        detail: res.error.message,
-      },
-      { status: 500 }
-    );
+    // ✅ 이미 있으면 "성공"으로 처리
+    if (exists) {
+      return NextResponse.json({ ok: true, row: exists });
+    }
+
+    /* 2️⃣ 없을 때만 INSERT */
+    const { data, error } = await sb
+      .from("accounts")
+      .insert([
+        {
+          user_id: emp_id,
+          emp_id: emp_id,
+        },
+      ])
+      .select("*")
+      .single();
+
+    if (error) {
+      return NextResponse.json(
+        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: error.message },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ ok: true, row: data });
   } catch (e: any) {
     return NextResponse.json(
-      {
-        ok: false,
-        error: "SERVER_ERROR",
-        detail: String(e?.message ?? e),
-      },
+      { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
       { status: 500 }
     );
   }
 }
+
 
 export async function PATCH(req: Request) {
   try {
