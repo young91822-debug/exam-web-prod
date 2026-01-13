@@ -40,7 +40,7 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
-/** attempt에 저장돼 있을 수 있는 문제목록을 최대한 찾아봄 */
+/** attempt에 저장돼 있을 수 있는 문제목록을 최대한 찾아봄 (bigint id 기반) */
 function pickAttemptQuestionIds(attempt: any): string[] {
   const cands = [
     attempt?.question_ids,
@@ -55,7 +55,7 @@ function pickAttemptQuestionIds(attempt: any): string[] {
     if (!v) continue;
 
     if (Array.isArray(v)) {
-      const out = v.map((x) => s(x)).filter(Boolean);
+      const out = v.map((x) => s(x)).filter((x) => isNumericId(x));
       if (out.length) return out;
     }
 
@@ -67,20 +67,20 @@ function pickAttemptQuestionIds(attempt: any): string[] {
       try {
         const parsed = JSON.parse(t);
         if (Array.isArray(parsed)) {
-          const out = parsed.map((x) => s(x)).filter(Boolean);
+          const out = parsed.map((x) => s(x)).filter((x) => isNumericId(x));
           if (out.length) return out;
         }
       } catch {}
 
       // 콤마 문자열 가능
       if (t.includes(",")) {
-        const out = t.split(",").map((x) => s(x)).filter(Boolean);
+        const out = t.split(",").map((x) => s(x)).filter((x) => isNumericId(x));
         if (out.length) return out;
       }
     }
 
     if (typeof v === "object") {
-      const out = Object.keys(v).map((k) => s(k)).filter(Boolean);
+      const out = Object.keys(v).map((k) => s(k)).filter((x) => isNumericId(x));
       if (out.length) return out;
     }
   }
@@ -88,7 +88,7 @@ function pickAttemptQuestionIds(attempt: any): string[] {
   return [];
 }
 
-/** attempt.answers(맵 형태)에서 qids/선택값 뽑기 */
+/** attempt.answers(맵 형태)에서 qids/선택값 뽑기 (키는 question_id 문자열) */
 function pickAttemptAnswersMap(attempt: any): Map<string, number> {
   const m = new Map<string, number>();
   const raw = attempt?.answers;
@@ -100,8 +100,9 @@ function pickAttemptAnswersMap(attempt: any): Map<string, number> {
       if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed)) {
           const key = s(k);
+          if (!isNumericId(key)) continue;
           const val = n(v, null);
-          if (key && val !== null) m.set(key, val);
+          if (val !== null) m.set(key, val);
         }
       }
     } catch {
@@ -113,8 +114,9 @@ function pickAttemptAnswersMap(attempt: any): Map<string, number> {
   if (typeof raw === "object") {
     for (const [k, v] of Object.entries(raw)) {
       const key = s(k);
+      if (!isNumericId(key)) continue;
       const val = n(v, null);
-      if (key && val !== null) m.set(key, val);
+      if (val !== null) m.set(key, val);
     }
   }
 
@@ -157,14 +159,14 @@ export async function GET(
 
     /**
      * 2) 답변 소스 우선순위
-     *  - exam_answers(attempt_id)에서 question_uuid/selected_index 읽기
+     *  - exam_answers(attempt_id)에서 question_id/selected_index 읽기
      *  - 없으면 attempt.answers(JSON) fallback
      */
     const ansMap = new Map<string, number>();
 
     const { data: answers, error: eAns } = await supabaseAdmin
       .from("exam_answers")
-      .select("question_uuid, selected_index")
+      .select("question_id, selected_index")
       .eq("attempt_id", attemptId);
 
     if (eAns) {
@@ -174,10 +176,13 @@ export async function GET(
       );
     }
 
+    // ✅ question_id는 bigint → number/string 혼재될 수 있어 "문자열 키"로 통일
     for (const a of answers ?? []) {
-      const qid = s(a?.question_uuid);
-      const sel = a?.selected_index;
+      const qidNum = (a as any)?.question_id;
+      const sel = (a as any)?.selected_index;
+      const qid = s(qidNum);
       if (!qid) continue;
+      if (!isNumericId(qid)) continue;
       if (sel === null || sel === undefined) continue;
       ansMap.set(qid, Number(sel));
     }
@@ -200,7 +205,6 @@ export async function GET(
     const qids = attemptQids.length > 0 ? attemptQids : Array.from(ansMap.keys());
 
     if (!qids.length) {
-      // 문제목록도 없고 답도 없으면(진짜 데이터 없음)
       return NextResponse.json({
         ok: true,
         attempt: {
@@ -221,12 +225,9 @@ export async function GET(
       });
     }
 
-    // 4) questions 조회
-    // - 보통 questions.id가 uuid라서 그대로 in("id", qids) 하면 됨
-    // - 혹시 numeric도 섞이면 대비
-    const uniqQids = Array.from(new Set(qids.map((x) => s(x)).filter(Boolean)));
-    const allNumeric = uniqQids.every((x) => /^\d+$/.test(x));
-    const qidsForQuery = allNumeric ? uniqQids.map((x) => Number(x)) : uniqQids;
+    // 4) questions 조회 (questions.id = bigint)
+    const uniqQids = Array.from(new Set(qids.map((x) => s(x)).filter((x) => isNumericId(x))));
+    const qidsForQuery = uniqQids.map((x) => Number(x));
 
     const { data: questions, error: eQ } = await supabaseAdmin
       .from("questions")
