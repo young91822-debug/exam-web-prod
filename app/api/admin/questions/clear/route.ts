@@ -132,7 +132,7 @@ export async function POST(req: Request) {
     const childResults: any[] = [];
     let deletedQuestions = 0;
 
-    // ✅ supabase-js range는 offset 기반. team 필터를 반드시 끼워서 "내 팀 문항만" 뽑는다.
+    // ✅ 삭제하면 당겨지므로 항상 0부터 다시
     let offset = 0;
 
     while (true) {
@@ -154,9 +154,14 @@ export async function POST(req: Request) {
         );
       }
 
+      // ✅ ids를 "number 배열"로 맞춰서 하위테이블 in()이 안정적으로 동작하게 함
       const ids = (rows || [])
-        .map((r: any) => r.id)
-        .filter((v: any) => v !== null && v !== undefined);
+        .map((r: any) => {
+          const v = r?.id;
+          const num = Number(String(v ?? "").trim());
+          return Number.isFinite(num) ? num : null;
+        })
+        .filter((v: any) => v !== null);
 
       if (ids.length === 0) break;
 
@@ -188,7 +193,7 @@ export async function POST(req: Request) {
 
       deletedQuestions += ids.length;
 
-      // ✅ 삭제하면 당겨져서 offset 올리면 누락 발생 → 항상 0부터 다시
+      // ✅ 매번 0부터 다시 조회
       offset = 0;
     }
 
