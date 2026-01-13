@@ -14,6 +14,10 @@ function n(v: any, d: number | null = null) {
 function isNumericId(x: string) {
   return /^\d+$/.test(x);
 }
+function isUUID(v: any) {
+  const t = s(v);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
+}
 
 function pickChoices(q: any): string[] {
   const c = q?.choices ?? q?.options ?? q?.choice_list ?? q?.choice_texts ?? [];
@@ -40,8 +44,8 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
-/** attempt에 저장돼 있을 수 있는 문제목록을 최대한 찾아봄 (bigint id 기반) */
-function pickAttemptQuestionIds(attempt: any): string[] {
+/** attempt에 저장돼 있을 수 있는 문제목록을 최대한 찾아봄 (UUID 기반) */
+function pickAttemptQuestionUuids(attempt: any): string[] {
   const cands = [
     attempt?.question_ids,
     attempt?.questionIds,
@@ -55,7 +59,7 @@ function pickAttemptQuestionIds(attempt: any): string[] {
     if (!v) continue;
 
     if (Array.isArray(v)) {
-      const out = v.map((x) => s(x)).filter((x) => isNumericId(x));
+      const out = v.map((x) => s(x)).filter((x) => isUUID(x));
       if (out.length) return out;
     }
 
@@ -67,20 +71,20 @@ function pickAttemptQuestionIds(attempt: any): string[] {
       try {
         const parsed = JSON.parse(t);
         if (Array.isArray(parsed)) {
-          const out = parsed.map((x) => s(x)).filter((x) => isNumericId(x));
+          const out = parsed.map((x) => s(x)).filter((x) => isUUID(x));
           if (out.length) return out;
         }
       } catch {}
 
       // 콤마 문자열 가능
       if (t.includes(",")) {
-        const out = t.split(",").map((x) => s(x)).filter((x) => isNumericId(x));
+        const out = t.split(",").map((x) => s(x)).filter((x) => isUUID(x));
         if (out.length) return out;
       }
     }
 
     if (typeof v === "object") {
-      const out = Object.keys(v).map((k) => s(k)).filter((x) => isNumericId(x));
+      const out = Object.keys(v).map((k) => s(k)).filter((x) => isUUID(x));
       if (out.length) return out;
     }
   }
@@ -88,7 +92,7 @@ function pickAttemptQuestionIds(attempt: any): string[] {
   return [];
 }
 
-/** attempt.answers(맵 형태)에서 qids/선택값 뽑기 (키는 question_id 문자열) */
+/** attempt.answers(맵 형태)에서 qids/선택값 뽑기 (키는 question_id(UUID) 문자열) */
 function pickAttemptAnswersMap(attempt: any): Map<string, number> {
   const m = new Map<string, number>();
   const raw = attempt?.answers;
@@ -100,7 +104,7 @@ function pickAttemptAnswersMap(attempt: any): Map<string, number> {
       if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed)) {
           const key = s(k);
-          if (!isNumericId(key)) continue;
+          if (!isUUID(key)) continue;
           const val = n(v, null);
           if (val !== null) m.set(key, val);
         }
@@ -114,7 +118,7 @@ function pickAttemptAnswersMap(attempt: any): Map<string, number> {
   if (typeof raw === "object") {
     for (const [k, v] of Object.entries(raw)) {
       const key = s(k);
-      if (!isNumericId(key)) continue;
+      if (!isUUID(key)) continue;
       const val = n(v, null);
       if (val !== null) m.set(key, val);
     }
@@ -123,10 +127,7 @@ function pickAttemptAnswersMap(attempt: any): Map<string, number> {
   return m;
 }
 
-export async function GET(
-  _req: NextRequest,
-  context: { params: Promise<{ attemptId: string }> }
-) {
+export async function GET(_req: NextRequest, context: { params: Promise<{ attemptId: string }> }) {
   try {
     const { attemptId: raw } = await context.params;
     const attemptIdStr = s(raw);
@@ -159,7 +160,7 @@ export async function GET(
 
     /**
      * 2) 답변 소스 우선순위
-     *  - exam_answers(attempt_id)에서 question_id/selected_index 읽기
+     *  - exam_answers(attempt_id)에서 question_id(UUID)/selected_index 읽기
      *  - 없으면 attempt.answers(JSON) fallback
      */
     const ansMap = new Map<string, number>();
@@ -176,13 +177,10 @@ export async function GET(
       );
     }
 
-    // ✅ question_id는 bigint → number/string 혼재될 수 있어 "문자열 키"로 통일
     for (const a of answers ?? []) {
-      const qidNum = (a as any)?.question_id;
+      const qid = s((a as any)?.question_id);
       const sel = (a as any)?.selected_index;
-      const qid = s(qidNum);
-      if (!qid) continue;
-      if (!isNumericId(qid)) continue;
+      if (!isUUID(qid)) continue; // ✅ "0" 같은 값 자동 제거
       if (sel === null || sel === undefined) continue;
       ansMap.set(qid, Number(sel));
     }
@@ -198,13 +196,15 @@ export async function GET(
 
     /**
      * 3) 문제 목록(qids) 만들기
-     *  - attempt에 저장된 문제목록이 있으면 그걸 사용(전체 20문항 표시 가능)
+     *  - attempt에 저장된 문제목록(UUID)이 있으면 그걸 사용(전체 20문항 유지 가능)
      *  - 없으면 "답이 있는 문제만"이라도 표시
      */
-    const attemptQids = pickAttemptQuestionIds(attempt);
+    const attemptQids = pickAttemptQuestionUuids(attempt);
     const qids = attemptQids.length > 0 ? attemptQids : Array.from(ansMap.keys());
 
-    if (!qids.length) {
+    const uniqQids = Array.from(new Set(qids.map((x) => s(x)).filter((x) => isUUID(x))));
+
+    if (!uniqQids.length) {
       return NextResponse.json({
         ok: true,
         attempt: {
@@ -225,14 +225,11 @@ export async function GET(
       });
     }
 
-    // 4) questions 조회 (questions.id = bigint)
-    const uniqQids = Array.from(new Set(qids.map((x) => s(x)).filter((x) => isNumericId(x))));
-    const qidsForQuery = uniqQids.map((x) => Number(x));
-
+    // 4) questions 조회 (questions.id = UUID)
     const { data: questions, error: eQ } = await supabaseAdmin
       .from("questions")
       .select("*")
-      .in("id", qidsForQuery as any);
+      .in("id", uniqQids as any);
 
     if (eQ) {
       return NextResponse.json(
@@ -244,7 +241,7 @@ export async function GET(
     const qById = new Map<string, any>();
     for (const q of questions ?? []) qById.set(s(q?.id), q);
 
-    // 5) graded를 "qids 순서"대로 구성 (중요: 화면에서 20문제 유지)
+    // 5) graded를 "qids 순서"대로 구성
     let score = 0;
     let correctCount = 0;
 
