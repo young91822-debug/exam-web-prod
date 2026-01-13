@@ -1,6 +1,3 @@
-console.log("ENV URL =", process.env.NEXT_PUBLIC_SUPABASE_URL);
-console.log("ENV KEY prefix =", (process.env.SUPABASE_SERVICE_ROLE_KEY || "").slice(0, 20));
-
 // app/api/auth/login/route.ts
 import { NextResponse } from "next/server";
 import crypto from "crypto";
@@ -8,18 +5,17 @@ import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
 
+const TABLE = "accounts";
+
 function s(v: any) {
   return String(v ?? "").trim();
 }
 
-/**
- * stored 포맷: scrypt$<saltB64>$<hashB64>
- */
+/** stored 포맷: scrypt$<saltB64>$<hashB64> */
 function verifyPasswordHash(plain: string, stored: string) {
   try {
     const parts = String(stored || "").split("$");
     if (parts.length !== 3) return false;
-
     const [algo, saltB64, hashB64] = parts;
     if (algo !== "scrypt") return false;
 
@@ -27,66 +23,111 @@ function verifyPasswordHash(plain: string, stored: string) {
     const expected = Buffer.from(hashB64, "base64");
     const actual = crypto.scryptSync(plain, salt, expected.length);
 
-    if (expected.length !== actual.length) return false;
     return crypto.timingSafeEqual(expected, actual);
   } catch {
     return false;
   }
 }
 
+/**
+ * ✅ 핵심: JSON만 보지 말고 formData / text(urlencoded 포함)도 모두 파싱
+ */
+async function readBody(req: Request): Promise<any> {
+  // 1) JSON
+  try {
+    const j = await req.json();
+    if (j && typeof j === "object") return j;
+  } catch {}
+
+  // 2) formData (multipart / x-www-form-urlencoded)
+  try {
+    const fd = await req.formData();
+    const obj: Record<string, any> = {};
+    for (const [k, v] of fd.entries()) obj[k] = typeof v === "string" ? v : String(v);
+    if (Object.keys(obj).length) return obj;
+  } catch {}
+
+  // 3) text → JSON 시도 → urlencoded 시도
+  try {
+    const t = await req.text();
+    if (!t) return {};
+    try {
+      const j = JSON.parse(t);
+      if (j && typeof j === "object") return j;
+    } catch {}
+    try {
+      const sp = new URLSearchParams(t);
+      const obj: Record<string, any> = {};
+      sp.forEach((v, k) => (obj[k] = v));
+      return obj;
+    } catch {}
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function pickFirst(body: any, keys: string[]) {
+  for (const k of keys) {
+    const v = body?.[k];
+    const sv = s(v);
+    if (sv) return sv;
+  }
+  return "";
+}
+
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({}));
+    const body = await readBody(req);
 
-    const id = String(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id).trim();
-    const pw = String(body?.pw ?? body?.password).trim();   
+    // ✅ 어떤 키로 오든 다 받아먹기
+    const id = pickFirst(body, ["id", "loginId", "username", "user_id", "empId", "emp_id"]);
+    const pw = pickFirst(body, ["pw", "password", "pass", "passwd"]);
+
+    // ✅ 실서버에서 확인 가능한 로그 (Vercel Functions Logs에서 확인)
+    console.log("LOGIN content-type =", req.headers.get("content-type"));
+    console.log("LOGIN body keys =", Object.keys(body || {}));
+    console.log("LOGIN parsed id/pw =", id ? "[OK]" : "[EMPTY]", pw ? "[OK]" : "[EMPTY]");
 
     if (!id || !pw) {
       return NextResponse.json(
-        { ok: false, error: "MISSING_FIELDS" },
+        {
+          ok: false,
+          error: "MISSING_FIELDS",
+          debug: {
+            contentType: req.headers.get("content-type"),
+            keys: Object.keys(body || {}),
+          },
+        },
         { status: 400 }
       );
     }
 
-    const { data: row, error } = await supabaseAdmin
-      .from("accounts")
-      .select("*")
+    // ✅ 계정 조회
+    const { data, error } = await supabaseAdmin
+      .from(TABLE)
+      .select("id, role, password_hash, is_active")
       .eq("id", id)
       .maybeSingle();
 
     if (error) {
-      return NextResponse.json(
-        { ok: false, error: "DB_ERROR", detail: error.message },
-        { status: 500 }
-      );
+      console.error("LOGIN DB error:", error);
+      return NextResponse.json({ ok: false, error: "DB_ERROR", detail: String(error.message || error) }, { status: 500 });
     }
 
-    if (!row) {
-      return NextResponse.json(
-        { ok: false, error: "INVALID_CREDENTIALS" },
-        { status: 401 }
-      );
+    if (!data || !data.is_active) {
+      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    const stored = s(row.password_hash ?? row.pw_hash ?? "");
-    const ok = verifyPasswordHash(pw, stored);
-
+    const ok = verifyPasswordHash(pw, data.password_hash);
     if (!ok) {
-      return NextResponse.json(
-        { ok: false, error: "INVALID_CREDENTIALS" },
-        { status: 401 }
-      );
+      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    return NextResponse.json({
-      ok: true,
-      user: {
-        id: row.id,
-        name: row.name ?? null,
-        isAdmin: Boolean(row.is_admin),
-      },
-    });
+    // ✅ 성공 응답 (기존 흐름 유지)
+    return NextResponse.json({ ok: true, id: data.id, role: data.role ?? "user" });
   } catch (e: any) {
+    console.error("LOGIN SERVER_ERROR:", e);
     return NextResponse.json(
       { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
       { status: 500 }
