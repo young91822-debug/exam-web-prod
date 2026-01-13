@@ -21,6 +21,42 @@ const QUESTION_FK_COL_CANDIDATES = [
   "questionNo",
 ];
 
+function getCookie(cookieHeader: string, name: string) {
+  const parts = cookieHeader.split(";").map((v) => v.trim());
+  for (const p of parts) {
+    const idx = p.indexOf("=");
+    if (idx < 0) continue;
+    const k = p.slice(0, idx).trim();
+    const v = p.slice(idx + 1).trim();
+    if (k === name) return decodeURIComponent(v);
+  }
+  return "";
+}
+
+async function requireAdminTeam(req: Request) {
+  const cookieHeader = req.headers.get("cookie") || "";
+  const empId = getCookie(cookieHeader, "empId");
+  const role = getCookie(cookieHeader, "role");
+
+  if (!empId) return { ok: false as const, status: 401, error: "NO_SESSION" };
+  if (role !== "admin") return { ok: false as const, status: 403, error: "NOT_ADMIN" };
+
+  const { data, error } = await sb
+    .from("accounts")
+    .select("username, emp_id, team, is_active")
+    .or(`username.eq.${empId},emp_id.eq.${empId}`)
+    .maybeSingle();
+
+  if (error) {
+    return { ok: false as const, status: 500, error: "DB_QUERY_FAILED", detail: String(error.message || error) };
+  }
+  if (!data) return { ok: false as const, status: 401, error: "ACCOUNT_NOT_FOUND" };
+  if (data.is_active === false) return { ok: false as const, status: 403, error: "ACCOUNT_DISABLED" };
+
+  const team = String((data as any).team ?? "").trim() || "A";
+  return { ok: true as const, team, empId };
+}
+
 async function tableExists(table: string) {
   // head + count로 존재 여부만 가볍게 체크
   const { error } = await sb.from(table).select("*", { head: true, count: "exact" }).limit(1);
@@ -40,7 +76,6 @@ async function deleteByQuestionIds(table: string, ids: any[]) {
 
   // FK 컬럼 후보들로 하나씩 시도
   for (const col of QUESTION_FK_COL_CANDIDATES) {
-    // ✅ 여기서 TS 무한 타입 추론이 터지므로 sb(any)로 호출
     const { error } = await sb.from(table).delete().in(col, ids);
 
     if (!error) return { table, ok: true, by: col };
@@ -52,20 +87,26 @@ async function deleteByQuestionIds(table: string, ids: any[]) {
       continue;
     }
 
-    // WHERE required면(설정) -> 그래도 우리는 IN을 썼으니 보통 안 뜸. 뜨면 에러 반환
+    // 그 외 에러는 반환
     return { table, ok: false, by: col, detail: msg };
   }
 
   return { table, ok: false, detail: "No matching FK column candidates found" };
 }
 
-export async function POST() {
+export async function POST(req: Request) {
   try {
-    // 1) questions의 id 전체를 배치로 긁어서 삭제
-    //    PostgREST는 DELETE requires WHERE라서, 반드시 in(id, [...]) 방식으로 지워야 함.
+    // ✅ 0) 관리자 team 인증 (A 절대 보호)
+    const auth = await requireAdminTeam(req);
+    if (!auth.ok) {
+      return NextResponse.json(
+        { ok: false, error: auth.error, detail: (auth as any).detail },
+        { status: auth.status }
+      );
+    }
 
-    // ✅ 먼저 questions 테이블에서 id 컬럼 조회가 되는지 확인
-    const test = await sb.from("questions").select("id").limit(1);
+    // ✅ 1) questions 테이블에서 id 조회 가능한지 확인 (+ team 컬럼도 확인)
+    const test = await sb.from("questions").select("id, team").limit(1);
     if (test.error) {
       return NextResponse.json(
         { ok: false, error: "CLEAR_FAILED", detail: String(test.error.message || test.error) },
@@ -74,7 +115,7 @@ export async function POST() {
     }
 
     const childTables = [
-      "attempt_answers", // 네 로그에 실제로 존재
+      "attempt_answers",
       "exam_attempt_answers",
       "attempt_questions",
       "exam_attempt_questions",
@@ -88,13 +129,14 @@ export async function POST() {
     const childResults: any[] = [];
     let deletedQuestions = 0;
 
-    // supabase-js는 offset 기반이 가능(range). id 전체를 큰 리스트로 한 번에 받지 말고 배치로 처리
+    // ✅ supabase-js range는 offset 기반. team 필터를 반드시 끼워서 "내 팀 문항만" 뽑는다.
     let offset = 0;
 
     while (true) {
       const { data: rows, error: selErr } = await sb
         .from("questions")
         .select("id")
+        .eq("team", auth.team) // ✅ 핵심: 내 팀만
         .range(offset, offset + BATCH - 1);
 
       if (selErr) {
@@ -103,6 +145,7 @@ export async function POST() {
             ok: false,
             error: "CLEAR_FAILED",
             detail: `SELECT questions failed: ${String(selErr.message || selErr)}`,
+            team: auth.team,
           },
           { status: 500 }
         );
@@ -114,15 +157,18 @@ export async function POST() {
 
       if (ids.length === 0) break;
 
-      // 2) FK 하위테이블 먼저 지우기 (가능한 것만 best-effort)
+      // ✅ 2) FK 하위테이블 먼저 지우기 (오직 "내 팀 문항 ids"로만)
       for (const t of childTables) {
         const r = await deleteByQuestionIds(t, ids);
-        childResults.push({ batch: `${offset}-${offset + ids.length - 1}`, ...r });
+        childResults.push({ team: auth.team, batch: `${offset}-${offset + ids.length - 1}`, ...r });
       }
 
-      // 3) questions 삭제 (반드시 WHERE)
-      // ✅ 여기서도 동일하게 sb(any) 사용
-      const { error: delErr } = await sb.from("questions").delete().in("id", ids);
+      // ✅ 3) questions 삭제 (오직 "내 팀 문항 ids"로만)
+      const { error: delErr } = await sb
+        .from("questions")
+        .delete()
+        .in("id", ids)
+        .eq("team", auth.team); // ✅ 이중 안전장치(혹시 같은 id 케이스는 없지만)
 
       if (delErr) {
         return NextResponse.json(
@@ -130,6 +176,7 @@ export async function POST() {
             ok: false,
             error: "CLEAR_FAILED",
             detail: `DELETE questions failed: ${String(delErr.message || delErr)}`,
+            team: auth.team,
             childResults,
           },
           { status: 500 }
@@ -137,12 +184,17 @@ export async function POST() {
       }
 
       deletedQuestions += ids.length;
-      offset += BATCH;
+
+      // ✅ offset 기반 range는 삭제하면 당겨져서 "같은 offset=0"을 계속 조회해야 함
+      // 그래서 offset을 올리면 누락이 생길 수 있음.
+      // -> 매번 offset=0에서 다시 BATCH만 가져와 계속 지우는 방식이 안전.
+      offset = 0;
     }
 
     return NextResponse.json({
       ok: true,
       cleared: true,
+      team: auth.team,
       deletedQuestions,
       childResults,
     });
