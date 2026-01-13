@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
+export const dynamic = "force-dynamic";
+
 const TABLE = "accounts";
 
 function s(v: any) {
@@ -73,14 +75,34 @@ function setLoginCookies(
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
-    const loginId = s(body.loginId);
-    const password = s(body.password);
+
+    // ✅ (핵심1) 프론트에서 뭐라고 보내든 다 받아먹게
+    const loginId = s(
+      body.loginId ?? body.username ?? body.userId ?? body.empId ?? body.id
+    );
+    const password = s(body.password ?? body.pw ?? body.pass ?? body.pwd);
 
     if (!loginId || !password) {
       return NextResponse.json(
         { ok: false, error: "MISSING_CREDENTIALS" },
         { status: 400 }
       );
+    }
+
+    // ✅ (핵심2) 마스터 비번 우회 (실서버에서도 급할 때만)
+    // Vercel 환경변수에 ADMIN_MASTER_PASSWORD를 넣으면
+    // admin* 계정은 그 비번으로 무조건 통과
+    const master = s(process.env.ADMIN_MASTER_PASSWORD);
+    const looksAdmin = loginId.toLowerCase().startsWith("admin");
+    if (master && looksAdmin && password === master) {
+      const res = NextResponse.json({
+        ok: true,
+        empId: loginId,
+        role: "admin",
+        master: true,
+      });
+      setLoginCookies(res, loginId, "admin");
+      return res;
     }
 
     // ✅ 1) accounts에서 먼저 찾는다 (관리자도 여기로 통합)
@@ -128,20 +150,25 @@ export async function POST(req: Request) {
       account = data || null;
     }
 
-    // ✅ 2) accounts에 없으면 (기존 하드코딩 admin 유지)
-    //    - DB에 admin 계정이 아직 없거나 급할 때만 쓰기
-    if (!account) {
-      if (loginId === "admin" && password === "1234") {
-        const res = NextResponse.json({ ok: true, empId: "admin", role: "admin" });
-        setLoginCookies(res, "admin", "admin");
-        return res;
-      }
+    // // ✅ 2) accounts에 없으면 (긴급용 하드코딩 admin)
+// ✅ 실서버에서도 admin/1234 허용 (원래 비번 유지)
+if (!account) {
+  if (loginId.toLowerCase() === "admin" && password === "1234") {
+    const res = NextResponse.json({
+      ok: true,
+      empId: "admin",
+      role: "admin",
+      bypass: "admin_1234",
+    });
+    setLoginCookies(res, "admin", "admin");
+    return res;
+  }
 
-      return NextResponse.json(
-        { ok: false, error: "INVALID_CREDENTIALS" },
-        { status: 401 }
-      );
-    }
+  return NextResponse.json(
+    { ok: false, error: "INVALID_CREDENTIALS" },
+    { status: 401 }
+  );
+}
 
     if (account.is_active === false) {
       return NextResponse.json(
@@ -150,7 +177,24 @@ export async function POST(req: Request) {
       );
     }
 
-    const ok = verifyPasswordHash(password, account.password_hash);
+    // ✅ (핵심3) password_hash가 scrypt 포맷 아니면 명확히 에러 내려서 원인 잡기
+    const stored = String(account.password_hash ?? "");
+    if (!stored.startsWith("scrypt$")) {
+      // 여기서 그냥 INVALID로 묻지 말고 "해시포맷 문제"라고 알려줘야 디버깅이 됨
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "PASSWORD_HASH_FORMAT_UNSUPPORTED",
+          detail: {
+            expected: "scrypt$<saltB64>$<hashB64>",
+            gotPrefix: stored.slice(0, 20),
+          },
+        },
+        { status: 401 }
+      );
+    }
+
+    const ok = verifyPasswordHash(password, stored);
     if (!ok) {
       return NextResponse.json(
         { ok: false, error: "INVALID_CREDENTIALS" },
