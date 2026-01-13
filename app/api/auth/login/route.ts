@@ -1,3 +1,6 @@
+console.log("ENV URL =", process.env.NEXT_PUBLIC_SUPABASE_URL);
+console.log("ENV KEY prefix =", (process.env.SUPABASE_SERVICE_ROLE_KEY || "").slice(0, 20));
+
 // app/api/auth/login/route.ts
 import { NextResponse } from "next/server";
 import crypto from "crypto";
@@ -35,8 +38,8 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
 
-    const id = s(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id);
-    const pw = s(body?.pw ?? body?.password);
+    const id = String(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id).trim();
+    const pw = String(body?.pw ?? body?.password).trim();   
 
     if (!id || !pw) {
       return NextResponse.json(
