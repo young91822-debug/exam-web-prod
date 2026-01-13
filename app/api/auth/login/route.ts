@@ -33,6 +33,17 @@ function verifyPasswordHash(plain: string, stored: string) {
 }
 
 /**
+ * ✅ 관리자 판별 규칙
+ * - DB 계정 username 또는 emp_id가 'admin'으로 시작하면 관리자
+ *   (admin, admin_gs, admin_xxx 등)
+ */
+function isAdminAccount(account: any) {
+  const u = String(account?.username ?? "").toLowerCase();
+  const e = String(account?.emp_id ?? "").toLowerCase();
+  return u.startsWith("admin") || e.startsWith("admin");
+}
+
+/**
  * ✅ 쿠키는 NextResponse.cookies.set() 말고
  * ✅ Set-Cookie 헤더를 직접 append 해서 "브라우저에 확실히" 저장되게 한다.
  */
@@ -72,37 +83,60 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1) 관리자 로그인 (원하면 나중에 accounts로 통합 가능)
-    if (loginId === "admin" && password === "1234") {
-      const res = NextResponse.json({ ok: true, empId: "admin", role: "admin" });
-      setLoginCookies(res, "admin", "admin");
-      return res;
-    }
-
-    // 2) 응시자 로그인: accounts에서 username(또는 emp_id)로 찾고 password_hash 검증
+    // ✅ 1) accounts에서 먼저 찾는다 (관리자도 여기로 통합)
     let account: any = null;
 
     // username 우선
     {
-      const { data } = await supabaseAdmin
+      const { data, error } = await supabaseAdmin
         .from(TABLE)
-        .select("id, username, emp_id, is_active, password_hash")
+        .select("id, username, emp_id, team, is_active, password_hash")
         .eq("username", loginId)
         .maybeSingle();
+
+      if (error) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "DB_QUERY_FAILED",
+            detail: String((error as any)?.message ?? error),
+          },
+          { status: 500 }
+        );
+      }
       account = data || null;
     }
 
     // emp_id fallback
     if (!account) {
-      const { data } = await supabaseAdmin
+      const { data, error } = await supabaseAdmin
         .from(TABLE)
-        .select("id, username, emp_id, is_active, password_hash")
+        .select("id, username, emp_id, team, is_active, password_hash")
         .eq("emp_id", loginId)
         .maybeSingle();
+
+      if (error) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "DB_QUERY_FAILED",
+            detail: String((error as any)?.message ?? error),
+          },
+          { status: 500 }
+        );
+      }
       account = data || null;
     }
 
+    // ✅ 2) accounts에 없으면 (기존 하드코딩 admin 유지)
+    //    - DB에 admin 계정이 아직 없거나 급할 때만 쓰기
     if (!account) {
+      if (loginId === "admin" && password === "1234") {
+        const res = NextResponse.json({ ok: true, empId: "admin", role: "admin" });
+        setLoginCookies(res, "admin", "admin");
+        return res;
+      }
+
       return NextResponse.json(
         { ok: false, error: "INVALID_CREDENTIALS" },
         { status: 401 }
@@ -126,8 +160,17 @@ export async function POST(req: Request) {
 
     const empId = account.emp_id || account.username;
 
-    const res = NextResponse.json({ ok: true, empId, role: "user" });
-    setLoginCookies(res, empId, "user");
+    // ✅ 여기서 관리자/사용자 역할 결정
+    const role: "admin" | "user" = isAdminAccount(account) ? "admin" : "user";
+
+    const res = NextResponse.json({
+      ok: true,
+      empId,
+      role,
+      team: account.team ?? null,
+      username: account.username ?? null,
+    });
+    setLoginCookies(res, empId, role);
     return res;
   } catch (e: any) {
     return NextResponse.json(

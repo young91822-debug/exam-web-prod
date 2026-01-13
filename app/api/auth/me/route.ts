@@ -28,15 +28,33 @@ function pickEmpId(cookieHeader: string) {
   );
 }
 
+function pickRole(cookieHeader: string) {
+  const r =
+    getCookie(cookieHeader, "role") ||
+    getCookie(cookieHeader, "userRole") ||
+    getCookie(cookieHeader, "isAdmin") ||
+    "";
+
+  if (r === "admin" || r === "user") return r;
+
+  const low = String(r).toLowerCase();
+  if (low === "true" || low === "1" || low === "yes") return "admin";
+
+  return "";
+}
+
 export async function GET(req: Request) {
   try {
     const cookieHeader = req.headers.get("cookie") || "";
     const empId = pickEmpId(cookieHeader);
+    const role = pickRole(cookieHeader);
 
     return NextResponse.json({
       ok: true,
       empId: empId || null,
-      marker: "ME_OK_NO_NEXT_HEADERS",
+      role: role || null,
+      isAdmin: role === "admin",
+      marker: "ME_OK_WITH_ROLE",
       hasCookieHeader: Boolean(cookieHeader),
     });
   } catch (e: any) {

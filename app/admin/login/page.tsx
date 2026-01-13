@@ -1,97 +1,105 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useState } from "react";
 
 export default function LoginPage() {
-  const sp = useSearchParams();
-
-  const nextPath = useMemo(() => {
-    const n = sp?.get("next");
-    if (!n) return "/exam";
-    if (!n.startsWith("/")) return "/exam";
-    if (n.startsWith("//")) return "/exam";
-    return n;
-  }, [sp]);
-
-  const err = sp?.get("err") || "";
-
   const [loginId, setLoginId] = useState("");
   const [password, setPassword] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (loading) return;
+
+    setMsg(null);
+    setLoading(true);
+
+    try {
+      const r = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ loginId, password }),
+        credentials: "include",
+        cache: "no-store",
+      });
+
+      const j = await r.json().catch(() => null);
+
+      if (!r.ok || !j?.ok) {
+        setMsg("로그인 실패: 아이디/비밀번호를 확인하세요.");
+        return;
+      }
+
+      // ✅ role 기준으로만 분기 (admin_gs 같은 계정도 자동 admin)
+      const target = j.role === "admin" ? "/admin" : "/exam";
+
+      // ✅ 쿠키 반영 확실한 강제 이동
+      window.location.href = target;
+    } catch (err) {
+      setMsg("로그인 오류: 서버 상태를 확인하세요.");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
-    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
-      <div style={{ width: 360, border: "1px solid #e5e7eb", borderRadius: 14, padding: 18 }}>
-        <h1 style={{ margin: 0, fontSize: 22, fontWeight: 800 }}>로그인</h1>
+    <div style={{ maxWidth: 420, margin: "80px auto", padding: 20 }}>
+      <h1 style={{ fontSize: 22, fontWeight: 800, marginBottom: 16 }}>
+        로그인
+      </h1>
 
-        {err && (
-          <div style={{ marginTop: 10, fontSize: 12, color: "#b91c1c" }}>
-            {err === "invalid" ? "아이디 또는 비밀번호가 올바르지 않습니다." :
-             err === "required" ? "아이디/비밀번호를 입력해 주세요." :
-             err === "db" ? "서버 오류가 발생했습니다. 잠시 후 다시 시도해 주세요." :
-             "로그인에 실패했습니다."}
-          </div>
-        )}
+      <form onSubmit={onSubmit} style={{ display: "grid", gap: 10 }}>
+        <input
+          value={loginId}
+          onChange={(e) => setLoginId(e.target.value)}
+          placeholder="아이디"
+          autoComplete="username"
+          style={{
+            width: "100%",
+            padding: 12,
+            border: "1px solid #ddd",
+            borderRadius: 10,
+            outline: "none",
+          }}
+        />
 
-        {/* ✅ fetch 없이 브라우저가 직접 POST */}
-        <form
-          method="POST"
-          action={`/api/auth/login?redirect=1&next=${encodeURIComponent(nextPath)}`}
-          style={{ marginTop: 14, display: "grid", gap: 10 }}
+        <input
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="비밀번호"
+          type="password"
+          autoComplete="current-password"
+          style={{
+            width: "100%",
+            padding: 12,
+            border: "1px solid #ddd",
+            borderRadius: 10,
+            outline: "none",
+          }}
+        />
+
+        <button
+          type="submit"
+          disabled={loading}
+          style={{
+            padding: 12,
+            borderRadius: 10,
+            border: 0,
+            cursor: loading ? "not-allowed" : "pointer",
+            fontWeight: 800,
+            opacity: loading ? 0.6 : 1,
+          }}
         >
-          <div>
-            <div style={labelStyle}>아이디(emp_id)</div>
-            <input
-              name="loginId"
-              value={loginId}
-              onChange={(e) => setLoginId(e.target.value)}
-              placeholder="예: 1001"
-              style={inputStyle}
-              autoComplete="username"
-            />
-          </div>
+          {loading ? "로그인 중..." : "로그인"}
+        </button>
 
-          <div>
-            <div style={labelStyle}>비밀번호</div>
-            <input
-              name="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="비밀번호"
-              style={inputStyle}
-              type="password"
-              autoComplete="current-password"
-            />
+        {msg ? (
+          <div style={{ color: "crimson", fontSize: 13, marginTop: 6 }}>
+            {msg}
           </div>
-
-          <button type="submit" style={btnStyle}>
-            로그인
-          </button>
-        </form>
-      </div>
+        ) : null}
+      </form>
     </div>
   );
 }
-
-const labelStyle: React.CSSProperties = {
-  fontSize: 12,
-  opacity: 0.8,
-  marginBottom: 6,
-};
-
-const inputStyle: React.CSSProperties = {
-  width: "100%",
-  padding: "10px 12px",
-  border: "1px solid #e5e7eb",
-  borderRadius: 10,
-  outline: "none",
-};
-
-const btnStyle: React.CSSProperties = {
-  padding: "10px 12px",
-  borderRadius: 10,
-  border: "1px solid #111827",
-  background: "#111827",
-  color: "white",
-  cursor: "pointer",
-};
