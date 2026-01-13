@@ -36,9 +36,7 @@ async function requireAdminTeam(req: Request) {
     .or(`username.eq.${empId},emp_id.eq.${empId}`)
     .maybeSingle();
 
-  if (error) {
-    return { ok: false as const, status: 500, error: "DB_QUERY_FAILED", detail: error.message };
-  }
+  if (error) return { ok: false as const, status: 500, error: "DB_QUERY_FAILED", detail: error.message };
   if (!data) return { ok: false as const, status: 401, error: "ACCOUNT_NOT_FOUND" };
   if (data.is_active === false) return { ok: false as const, status: 403, error: "ACCOUNT_DISABLED" };
 
@@ -47,29 +45,13 @@ async function requireAdminTeam(req: Request) {
 }
 
 function pickEmpId(row: any) {
-  return (
-    row?.emp_id ??
-    row?.empId ??
-    row?.user_id ??
-    row?.userId ??
-    row?.account_id ??
-    row?.accountId ??
-    "-"
-  );
+  return row?.emp_id ?? row?.empId ?? row?.user_id ?? row?.userId ?? row?.account_id ?? row?.accountId ?? "-";
 }
 function pickScore(row: any) {
   return row?.score ?? row?.total_score ?? row?.result_score ?? 0;
 }
 function pickSubmittedAt(row: any) {
-  return (
-    row?.submitted_at ??
-    row?.submittedAt ??
-    row?.ended_at ??
-    row?.endedAt ??
-    row?.created_at ??
-    row?.started_at ??
-    null
-  );
+  return row?.submitted_at ?? row?.submittedAt ?? row?.ended_at ?? row?.endedAt ?? row?.created_at ?? row?.started_at ?? null;
 }
 function pickStartedAt(row: any) {
   return row?.started_at ?? row?.startedAt ?? row?.created_at ?? null;
@@ -91,20 +73,29 @@ export async function GET(req: Request) {
     const pageSize = Math.min(200, Math.max(1, n(u.searchParams.get("pageSize"), 50)));
     const offset = (page - 1) * pageSize;
 
-    // ✅ 신형 attempts(UUID) - 팀 필터 적용
+    const includeLegacy = (u.searchParams.get("includeLegacy") ?? "1") !== "0";
+
+    const items: any[] = [];
+    let newErr: any = null;
+    let legacyErr: any = null;
+
+    // -----------------------------
+    // 1) ✅ 신형 attempts(UUID) - 있으면 가져오되, 없어도 실패로 막지 않음
+    // -----------------------------
     const newRes = await supabaseAdmin
       .from("attempts")
       .select("id, user_id, team, started_at, submitted_at, score, total_points, questions, wrongs")
-      .eq("team", auth.team) // ✅ 핵심: 팀 분리
+      .eq("team", auth.team)
       .order("started_at", { ascending: false })
       .range(offset, offset + pageSize - 1);
 
-    const items: any[] = [];
-
-    if (!newRes.error) {
+    if (newRes.error) {
+      // attempts 테이블이 없거나 권한/컬럼 오류여도 legacy로 보여주기 위해 그냥 기록만
+      newErr = newRes.error;
+    } else {
       for (const r of newRes.data || []) {
         items.push({
-          id: String(r.id), // ✅ UUID
+          id: String(r.id),
           idType: "uuid",
           empId: pickEmpId(r),
           score: pickScore(r),
@@ -113,12 +104,60 @@ export async function GET(req: Request) {
           submittedAt: pickSubmittedAt(r),
           totalQuestions: Array.isArray((r as any).questions) ? (r as any).questions.length : 0,
           wrongCount: Array.isArray((r as any).wrongs) ? (r as any).wrongs.length : 0,
+          source: "attempts",
         });
       }
     }
 
-    // ✅ 구형 exam_attempts는 팀 분리 불가(기본 제외)
-    // 필요하면 나중에 A팀 관리자만 includeLegacy=true로 보이게 옵션 추가 가능
+    // -----------------------------
+    // 2) ✅ legacy exam_attempts(Bigint) - 팀 분리 가능하게 "accounts"로 emp_id 목록 뽑아서 IN 필터
+    // -----------------------------
+    if (includeLegacy) {
+      // 팀에 속한 emp_id 목록 조회
+      // (대량이면 pageSize 정도만 보여줄거라 보통 충분)
+      const accRes = await supabaseAdmin
+        .from("accounts")
+        .select("emp_id")
+        .eq("team", auth.team)
+        .limit(5000);
+
+      if (accRes.error) {
+        legacyErr = accRes.error;
+      } else {
+        const empIds = (accRes.data || [])
+          .map((r: any) => String(r.emp_id ?? "").trim())
+          .filter((x: string) => x);
+
+        // empIds가 없으면 legacy도 결과 없음
+        if (empIds.length > 0) {
+          const legacyRes = await supabaseAdmin
+            .from("exam_attempts")
+            .select("id, emp_id, started_at, submitted_at, score, total_questions")
+            .in("emp_id", empIds)
+            .order("started_at", { ascending: false })
+            .range(offset, offset + pageSize - 1);
+
+          if (legacyRes.error) {
+            legacyErr = legacyRes.error;
+          } else {
+            for (const r of legacyRes.data || []) {
+              items.push({
+                id: String(r.id), // bigint지만 문자열로 내려주자 (프론트 안전)
+                idType: "numeric",
+                empId: String(r.emp_id ?? "-"),
+                score: Number(r.score ?? 0),
+                totalPoints: 0, // legacy에는 total_points 없을 수 있음
+                startedAt: r.started_at ?? null,
+                submittedAt: r.submitted_at ?? null,
+                totalQuestions: Number(r.total_questions ?? 0),
+                wrongCount: 0, // legacy에서 오답수 계산하려면 별도 테이블 필요
+                source: "exam_attempts",
+              });
+            }
+          }
+        }
+      }
+    }
 
     // 최신순 정렬(제출시각 우선, 없으면 시작시각)
     items.sort((a, b) => {
@@ -129,13 +168,15 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       ok: true,
-      team: auth.team, // ✅ 확인용
+      team: auth.team,
       page,
       pageSize,
       items,
       debug: {
-        newErr: newRes.error ?? null,
-        legacyExcluded: true,
+        includeLegacy,
+        newErr: newErr ?? null,
+        legacyErr: legacyErr ?? null,
+        itemsCount: items.length,
       },
     });
   } catch (e: any) {
