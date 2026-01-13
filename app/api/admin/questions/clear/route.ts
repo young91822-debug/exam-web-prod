@@ -13,6 +13,7 @@ const sb: any = supabaseAdmin;
 const QUESTION_FK_COL_CANDIDATES = [
   "question_id",
   "questionId",
+  // 아래 uuid 계열은 과거 잔재 대응용(있으면 지우고, 없어도 자동 스킵)
   "question_uuid",
   "questionUuid",
   "qid",
@@ -114,7 +115,9 @@ export async function POST(req: Request) {
       );
     }
 
+    // ✅ exam_answers도 반드시 포함 (question_id FK 잔여 제거)
     const childTables = [
+      "exam_answers",
       "attempt_answers",
       "exam_attempt_answers",
       "attempt_questions",
@@ -168,7 +171,7 @@ export async function POST(req: Request) {
         .from("questions")
         .delete()
         .in("id", ids)
-        .eq("team", auth.team); // ✅ 이중 안전장치(혹시 같은 id 케이스는 없지만)
+        .eq("team", auth.team); // ✅ 이중 안전장치
 
       if (delErr) {
         return NextResponse.json(
@@ -185,9 +188,7 @@ export async function POST(req: Request) {
 
       deletedQuestions += ids.length;
 
-      // ✅ offset 기반 range는 삭제하면 당겨져서 "같은 offset=0"을 계속 조회해야 함
-      // 그래서 offset을 올리면 누락이 생길 수 있음.
-      // -> 매번 offset=0에서 다시 BATCH만 가져와 계속 지우는 방식이 안전.
+      // ✅ 삭제하면 당겨져서 offset 올리면 누락 발생 → 항상 0부터 다시
       offset = 0;
     }
 
