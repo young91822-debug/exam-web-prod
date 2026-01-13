@@ -142,42 +142,60 @@ export async function POST(req: Request) {
     const body = await readBody(req);
 
     const emp_id = s(body?.emp_id ?? body?.empId ?? body?.id);
-    const name = s(body?.name ?? body?.emp_name ?? body?.empName);
-    const active = toBool(body?.is_active ?? body?.active ?? body?.use, null); // null이면 상태컬럼 안 만짐
-
     if (!emp_id) {
       return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
     }
 
-    // 중복 체크(선택)
-    const { data: exists, error: exErr } = await sb
+    // ✅ 1단계: emp_id만으로 최소 insert
+    let { data, error } = await sb
       .from("accounts")
-      .select("id, emp_id")
-      .eq("emp_id", emp_id)
-      .maybeSingle();
+      .insert([{ emp_id }])
+      .select("*")
+      .single();
 
-    if (exErr && String(exErr.message || "").length) {
-      // 중복체크 실패해도 진행은 가능하지만, 에러 노출은 해주자
-      // (너는 지금 빨리 되게 하는게 목적)
-    }
-    if (exists?.id) {
-      return NextResponse.json({ ok: false, error: "EMP_ID_EXISTS" }, { status: 409 });
+    // ✅ 성공하면 바로 반환
+    if (!error) {
+      return NextResponse.json({ ok: true, row: data });
     }
 
-    const payloadBase: any = {
-  emp_id,
-  role: "user",          // ✅ DB에 NOT NULL일 가능성 99%
-  password_hash: "",     // ✅ NOT NULL 방어
-};
-    if (name) payloadBase.name = name;
+    const msg = String(error.message ?? "");
 
-    const { data, error } = await insertAccount(payloadBase, active);
-    if (error) {
-      return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: error.message },
-        { status: 500 }
-      );
+    // ✅ 2단계: role / password_hash 필요할 경우만 보강
+    if (/role|password_hash|null value/i.test(msg)) {
+      const retry = await sb
+        .from("accounts")
+        .insert([
+          {
+            emp_id,
+            role: "user",
+            password_hash: "",
+          },
+        ])
+        .select("*")
+        .single();
+
+      if (retry.error) {
+        return NextResponse.json(
+          { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: retry.error.message },
+          { status: 500 }
+        );
+      }
+
+      return NextResponse.json({ ok: true, row: retry.data });
     }
+
+    // ❌ 그 외 에러
+    return NextResponse.json(
+      { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: error.message },
+      { status: 500 }
+    );
+  } catch (e: any) {
+    return NextResponse.json(
+      { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
+      { status: 500 }
+    );
+  }
+}
 
     return NextResponse.json({ ok: true, row: data });
   } catch (e: any) {
