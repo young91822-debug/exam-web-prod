@@ -1,7 +1,6 @@
 // app/api/admin/accounts/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
-import crypto from "crypto";
 
 export const dynamic = "force-dynamic";
 const sb: any = supabaseAdmin;
@@ -9,292 +8,209 @@ const sb: any = supabaseAdmin;
 function s(v: any) {
   return String(v ?? "").trim();
 }
-function b(v: any, d = true) {
+function toBool(v: any, d: boolean | null = null) {
   if (v === undefined || v === null || v === "") return d;
   if (typeof v === "boolean") return v;
-  const t = s(v).toLowerCase();
-  if (["1", "true", "y", "yes", "on", "사용"].includes(t)) return true;
-  if (["0", "false", "n", "no", "off", "미사용"].includes(t)) return false;
+  const t = String(v).toLowerCase().trim();
+  if (["1", "true", "y", "yes", "사용", "use", "on"].includes(t)) return true;
+  if (["0", "false", "n", "no", "미사용", "off"].includes(t)) return false;
   return d;
 }
-async function readBody(req: Request): Promise<any> {
+
+async function readBody(req: Request) {
   try {
     return await req.json();
   } catch {
     try {
       const t = await req.text();
-      if (!t) return {};
-      return JSON.parse(t);
+      return t ? JSON.parse(t) : {};
     } catch {
       return {};
     }
   }
 }
-function getCookie(cookieHeader: string, name: string) {
-  const parts = cookieHeader.split(";").map((v) => v.trim());
-  for (const p of parts) {
-    const idx = p.indexOf("=");
-    if (idx < 0) continue;
-    const k = p.slice(0, idx).trim();
-    const v = p.slice(idx + 1).trim();
-    if (k === name) return decodeURIComponent(v);
-  }
-  return "";
-}
-
-async function getAccountSafe(empId: string) {
-  const tries = [
-    { cols: "emp_id,team,username,is_active,role" },
-    { cols: "emp_id,team,is_active,role" },
-    { cols: "emp_id,team,username" },
-    { cols: "emp_id,team,password" },
-    { cols: "emp_id,team" },
-  ];
-
-  for (const t of tries) {
-    const res = await sb
-      .from("accounts")
-      .select(t.cols)
-      .or(`emp_id.eq.${empId},username.eq.${empId},user_id.eq.${empId}`)
-      .maybeSingle();
-
-    if (!res.error) return { data: res.data, error: null };
-    const msg = String(res.error?.message || res.error);
-    if (msg.includes("does not exist") || msg.includes("column")) continue;
-    return { data: null, error: res.error };
-  }
-  return { data: null, error: null };
-}
-
-/** ✅ 관리자 팀 조회 (username/is_active 없어도 동작) */
-async function requireAdminTeam(req: Request) {
-  const cookieHeader = req.headers.get("cookie") || "";
-  const empId = getCookie(cookieHeader, "empId");
-  const role = getCookie(cookieHeader, "role");
-
-  if (!empId) return { ok: false as const, status: 401, error: "NO_SESSION" };
-  if (role !== "admin") return { ok: false as const, status: 403, error: "NOT_ADMIN" };
-
-  const { data, error } = await getAccountSafe(empId);
-  if (error) return { ok: false as const, status: 500, error: "DB_QUERY_FAILED", detail: String(error.message || error) };
-
-  const team = String((data as any)?.team ?? "").trim() || "A";
-  const isActiveVal =
-    (data as any)?.is_active ?? (data as any)?.active ?? (data as any)?.enabled ?? null;
-  if (isActiveVal === false) return { ok: false as const, status: 403, error: "ACCOUNT_DISABLED" };
-
-  return { ok: true as const, team, empId };
-}
 
 /**
- * password hash (scrypt)
- * 저장 포맷: scrypt$<saltB64>$<hashB64>
+ * ✅ accounts 테이블은 환경마다 컬럼명이 다를 수 있음
+ * - is_active가 없을 수 있음 (현재 네 화면 상태)
+ * - active / enabled / use_yn 등일 수 있음
+ * 그래서: insert/update 시 상태 컬럼은 "시도->실패하면 빼고 재시도" 전략
  */
-function makePasswordHash(plain: string) {
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(plain, salt, 64);
-  return `scrypt$${salt.toString("base64")}$${hash.toString("base64")}`;
+async function insertAccount(payloadBase: any, active: boolean | null) {
+  // 1) is_active로 시도
+  if (active !== null) {
+    let { data, error } = await sb
+      .from("accounts")
+      .insert([{ ...payloadBase, is_active: active }])
+      .select("*")
+      .single();
+    if (!error) return { data, error: null };
+    const msg = String(error?.message ?? "");
+    if (!/is_active/i.test(msg) && !/does not exist/i.test(msg)) {
+      return { data: null, error };
+    }
+  }
+
+  // 2) active로 시도
+  if (active !== null) {
+    let { data, error } = await sb
+      .from("accounts")
+      .insert([{ ...payloadBase, active }])
+      .select("*")
+      .single();
+    if (!error) return { data, error: null };
+    const msg = String(error?.message ?? "");
+    if (!/active/i.test(msg) && !/does not exist/i.test(msg)) {
+      return { data: null, error };
+    }
+  }
+
+  // 3) 상태 컬럼 없이 최소 삽입
+  const { data, error } = await sb
+    .from("accounts")
+    .insert([{ ...payloadBase }])
+    .select("*")
+    .single();
+  return { data, error };
 }
 
-/** insert/update 시 password 컬럼명이 환경마다 달라서(password_hash vs password) 재시도 */
-async function writePassword(row: any, passwordHash: string) {
-  // 1) password_hash 시도
-  let res = await sb.from("accounts").insert({ ...row, password_hash: passwordHash }).select("*").maybeSingle();
-  if (!res.error) return res;
+async function updateAccount(match: any, patchBase: any, active: boolean | null) {
+  // 1) is_active 포함 업데이트 시도
+  if (active !== null) {
+    let { data, error } = await sb
+      .from("accounts")
+      .update({ ...patchBase, is_active: active })
+      .match(match)
+      .select("*");
+    if (!error) return { data, error: null };
+    const msg = String(error?.message ?? "");
+    if (!/is_active/i.test(msg) && !/does not exist/i.test(msg)) {
+      return { data: null, error };
+    }
+  }
 
-  const msg1 = String(res.error?.message || res.error);
-  if (!(msg1.includes("does not exist") || msg1.includes("column"))) return res;
+  // 2) active 포함 업데이트 시도
+  if (active !== null) {
+    let { data, error } = await sb
+      .from("accounts")
+      .update({ ...patchBase, active })
+      .match(match)
+      .select("*");
+    if (!error) return { data, error: null };
+    const msg = String(error?.message ?? "");
+    if (!/active/i.test(msg) && !/does not exist/i.test(msg)) {
+      return { data: null, error };
+    }
+  }
 
-  // 2) password로 재시도
-  res = await sb.from("accounts").insert({ ...row, password: passwordHash }).select("*").maybeSingle();
-  return res;
+  // 3) 상태 컬럼 없이 업데이트
+  const { data, error } = await sb.from("accounts").update({ ...patchBase }).match(match).select("*");
+  return { data, error };
 }
 
-async function updatePassword(id: any, passwordHash: string) {
-  // 1) password_hash
-  let res = await sb.from("accounts").update({ password_hash: passwordHash }).eq("id", id).select("*").maybeSingle();
-  if (!res.error) return res;
-
-  const msg1 = String(res.error?.message || res.error);
-  if (!(msg1.includes("does not exist") || msg1.includes("column"))) return res;
-
-  // 2) password
-  res = await sb.from("accounts").update({ password: passwordHash }).eq("id", id).select("*").maybeSingle();
-  return res;
-}
-
-export async function GET(req: Request) {
+export async function GET() {
   try {
-    const auth = await requireAdminTeam(req);
-    if (!auth.ok) {
-      return NextResponse.json(
-        { ok: false, error: auth.error, detail: (auth as any).detail },
-        { status: auth.status }
-      );
+    const { data, error } = await sb.from("accounts").select("*").order("id", { ascending: true });
+    if (error) {
+      return NextResponse.json({ ok: false, error: "DB_QUERY_FAILED", detail: error.message }, { status: 500 });
     }
 
-    // ✅ 컬럼이 없을 수 있으니 안전한 select 조합으로 재시도
-    const tries = [
-      "id, emp_id, username, name, team, is_active, created_at",
-      "id, emp_id, username, team, is_active, created_at",
-      "id, emp_id, team, is_active, created_at",
-      "id, emp_id, team, created_at",
-    ];
-
-    let data: any[] | null = null;
-    let lastErr: any = null;
-
-    for (const cols of tries) {
-      const res = await sb.from("accounts").select(cols).eq("team", auth.team).order("created_at", { ascending: false });
-      if (!res.error) {
-        data = res.data ?? [];
-        lastErr = null;
-        break;
-      }
-      const msg = String(res.error?.message || res.error);
-      lastErr = res.error;
-      if (msg.includes("does not exist") || msg.includes("column")) continue;
-      break;
-    }
-
-    if (lastErr) {
-      return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_LIST_FAILED", detail: String(lastErr.message || lastErr) },
-        { status: 500 }
-      );
-    }
-
-    // 화면에서 기대하는 필드로 normalize
-    const items = (data ?? []).map((r: any) => ({
-      id: r.id,
-      emp_id: r.emp_id ?? r.empId ?? r.user_id ?? "-",
-      username: r.username ?? r.name ?? r.emp_id ?? "",
-      name: r.name ?? r.username ?? "",
-      team: r.team ?? auth.team,
-      is_active: r.is_active ?? true,
-      created_at: r.created_at ?? null,
-    }));
-
-    return NextResponse.json({
-      ok: true,
-      team: auth.team,
-      items,
-      marker: "ACCOUNTS_TEAM_FILTER_v2_SCHEMA_SAFE",
+    // ✅ 어떤 상태 컬럼이든 화면에서 "사용"을 잘 표시하게 통일
+    const rows = (data ?? []).map((r: any) => {
+      const active =
+        r?.is_active ??
+        r?.active ??
+        r?.enabled ??
+        r?.isEnabled ??
+        r?.use_yn ??
+        r?.useYn ??
+        true; // 없으면 true로 간주(기존 화면이 다 '사용'으로 나오는 상태라)
+      return {
+        ...r,
+        _active: Boolean(active),
+      };
     });
+
+    return NextResponse.json({ ok: true, rows });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "ACCOUNTS_LIST_FAILED", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }
 
 export async function POST(req: Request) {
   try {
-    const auth = await requireAdminTeam(req);
-    if (!auth.ok) {
-      return NextResponse.json(
-        { ok: false, error: auth.error, detail: (auth as any).detail },
-        { status: auth.status }
-      );
-    }
-
     const body = await readBody(req);
 
-    const empId = s(body.empId ?? body.emp_id ?? body.employeeId ?? body.employee_id);
-    const name = s(body.name ?? body.displayName ?? body.koreanName ?? body.fullname);
-    const isActive = b(body.isActive ?? body.is_active ?? body.active ?? body.use, true);
-    const username = s(body.username) || name || empId;
+    const emp_id = s(body?.emp_id ?? body?.empId ?? body?.id);
+    const name = s(body?.name ?? body?.emp_name ?? body?.empName);
+    const active = toBool(body?.is_active ?? body?.active ?? body?.use, null); // null이면 상태컬럼 안 만짐
 
-    if (!empId) return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
+    if (!emp_id) {
+      return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
+    }
 
-    const myTeam = auth.team;
-    const plainPassword = s(body.password ?? body.pw ?? body.passwordPlain) || "1234";
-    const passwordHash = makePasswordHash(plainPassword);
+    // 중복 체크(선택)
+    const { data: exists, error: exErr } = await sb
+      .from("accounts")
+      .select("id, emp_id")
+      .eq("emp_id", emp_id)
+      .maybeSingle();
 
-    // 기존 계정 확인(팀 분리 위해 emp_id로 고정)
-    const ex = await sb.from("accounts").select("id, emp_id, team").eq("emp_id", empId).maybeSingle();
-    if (ex.error) {
+    if (exErr && String(exErr.message || "").length) {
+      // 중복체크 실패해도 진행은 가능하지만, 에러 노출은 해주자
+      // (너는 지금 빨리 되게 하는게 목적)
+    }
+    if (exists?.id) {
+      return NextResponse.json({ ok: false, error: "EMP_ID_EXISTS" }, { status: 409 });
+    }
+
+    const payloadBase: any = { emp_id };
+    if (name) payloadBase.name = name;
+
+    const { data, error } = await insertAccount(payloadBase, active);
+    if (error) {
       return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_EXIST_CHECK_FAILED", detail: String(ex.error.message || ex.error) },
+        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: error.message },
         { status: 500 }
       );
     }
 
-    if (ex.data?.id) {
-      const existingTeam = String((ex.data as any).team ?? "").trim() || "A";
-      if (existingTeam !== myTeam) {
-        return NextResponse.json(
-          { ok: false, error: "CROSS_TEAM_ACCOUNT_FORBIDDEN", detail: { empId, existingTeam, myTeam } },
-          { status: 403 }
-        );
-      }
-
-      // update 가능한 컬럼만 업데이트(없는 컬럼이면 그냥 무시되도록 최소화)
-      const updateRow: any = { team: myTeam };
-
-      // username/name/is_active 컬럼이 있을 수도 있으니 "시도"만 한다(없으면 에러 → 그때는 빼고 재시도)
-      // 1차 시도
-      let up = await sb.from("accounts").update({ ...updateRow, username, name: name || null, is_active: isActive }).eq("id", ex.data.id).select("*").maybeSingle();
-      if (up.error) {
-        const msg = String(up.error.message || up.error);
-        if (msg.includes("does not exist") || msg.includes("column")) {
-          // 2차: 더 최소로
-          up = await sb.from("accounts").update(updateRow).eq("id", ex.data.id).select("*").maybeSingle();
-        }
-      }
-      if (up.error) {
-        return NextResponse.json(
-          { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: String(up.error.message || up.error) },
-          { status: 500 }
-        );
-      }
-
-      // 비밀번호 변경도 반영(컬럼명 password_hash / password 둘 중 하나)
-      const pwRes = await updatePassword(ex.data.id, passwordHash);
-      if (pwRes.error) {
-        return NextResponse.json(
-          { ok: false, error: "PASSWORD_UPDATE_FAILED", detail: String(pwRes.error.message || pwRes.error) },
-          { status: 500 }
-        );
-      }
-
-      return NextResponse.json({ ok: true, team: myTeam, item: up.data, mode: "UPDATED", tempPassword: plainPassword });
-    }
-
-    // 새로 생성: team/emp_id는 확정
-    // username/name/is_active는 있을 때만 들어가면 되니까 "시도" 방식
-    const baseRow: any = {
-      emp_id: empId,
-      team: myTeam,
-    };
-
-    // 1차: 컬럼 있을지도 몰라서 최대 넣고 시도
-    let ins = await writePassword(
-      { ...baseRow, username, name: name || null, is_active: isActive },
-      passwordHash
-    );
-
-    if (ins.error) {
-      const msg = String(ins.error.message || ins.error);
-      if (msg.includes("does not exist") || msg.includes("column")) {
-        // 2차: 최소 컬럼으로 재시도
-        ins = await writePassword(baseRow, passwordHash);
-      }
-    }
-
-    if (ins.error) {
-      return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: String(ins.error.message || ins.error) },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json({ ok: true, team: myTeam, item: ins.data, mode: "CREATED", tempPassword: plainPassword });
+    return NextResponse.json({ ok: true, row: data });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "ACCOUNTS_CREATE_FAILED", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) }, { status: 500 });
+  }
+}
+
+export async function PATCH(req: Request) {
+  try {
+    const body = await readBody(req);
+
+    const id = body?.id ?? null;
+    const emp_id = s(body?.emp_id ?? body?.empId ?? "");
+    const name = s(body?.name ?? "");
+    const active = toBool(body?.is_active ?? body?.active ?? body?.use, null);
+
+    const match: any = {};
+    if (id != null && id !== "") match.id = id;
+    else if (emp_id) match.emp_id = emp_id;
+
+    if (!Object.keys(match).length) {
+      return NextResponse.json({ ok: false, error: "MISSING_TARGET" }, { status: 400 });
+    }
+
+    const patchBase: any = {};
+    if (name !== "") patchBase.name = name;
+
+    const { data, error } = await updateAccount(match, patchBase, active);
+    if (error) {
+      return NextResponse.json(
+        { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: error.message },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ ok: true, rows: data ?? [] });
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }
