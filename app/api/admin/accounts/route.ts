@@ -92,22 +92,74 @@ export async function POST(req: Request) {
     const emp_id = s(body?.emp_id ?? body?.empId ?? body?.id);
 
     if (!emp_id) {
-      return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "MISSING_EMP_ID" },
+        { status: 400 }
+      );
     }
 
-    const { data, error } = await insertAccountSafe(emp_id);
+    // ✅ 핵심: user_id NOT NULL → emp_id를 그대로 사용
+    const basePayload = {
+      user_id: emp_id,   // 🔥 이 줄이 핵심
+      emp_id: emp_id,
+    };
 
-    if (error) {
+    // 1차: 최소 컬럼
+    let res = await sb
+      .from("accounts")
+      .insert([basePayload])
+      .select("*")
+      .single();
+
+    if (!res.error) {
+      return NextResponse.json({ ok: true, row: res.data });
+    }
+
+    const msg = String(res.error?.message ?? "");
+
+    // 2차: role / password_hash NOT NULL 방어
+    if (/role|password_hash|null value/i.test(msg)) {
+      const retry = await sb
+        .from("accounts")
+        .insert([
+          {
+            ...basePayload,
+            role: "user",
+            password_hash: "",
+          },
+        ])
+        .select("*")
+        .single();
+
+      if (!retry.error) {
+        return NextResponse.json({ ok: true, row: retry.data });
+      }
+
       return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: error.message },
+        {
+          ok: false,
+          error: "ACCOUNTS_INSERT_FAILED",
+          detail: retry.error.message,
+        },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ ok: true, row: data });
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "ACCOUNTS_INSERT_FAILED",
+        detail: res.error.message,
+      },
+      { status: 500 }
+    );
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
+      {
+        ok: false,
+        error: "SERVER_ERROR",
+        detail: String(e?.message ?? e),
+      },
       { status: 500 }
     );
   }
