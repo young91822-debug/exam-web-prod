@@ -1,11 +1,20 @@
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { createClient } from "@supabase/supabase-js";
 
 /**
  * 한글 CSV (EUC-KR / UTF-8) + 헤더:
  * 문항ID,문제유형,문제내용,보기1,보기2,보기3,보기4,정답,배점
- * 을 "그대로" 업로드 가능하게 처리
  */
+
+function getSupabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error("Supabase env missing");
+
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
 
 function s(v: any) {
   return String(v ?? "").trim();
@@ -54,7 +63,7 @@ function parseCSV(text: string) {
   return rows;
 }
 
-/** 인코딩 자동 판별 (UTF-8 → EUC-KR) */
+/** 인코딩 자동 판별 */
 function decodeSmart(buf: ArrayBuffer) {
   const u8 = new Uint8Array(buf);
   let t = new TextDecoder("utf-8", { fatal: false }).decode(u8);
@@ -94,34 +103,25 @@ export async function POST(req: Request) {
     const rows = parseCSV(text);
 
     if (rows.length < 2) {
-      return NextResponse.json(
-        { ok: false, error: "NO_ROWS" },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "NO_ROWS" }, { status: 400 });
     }
 
     const header = rows[0].map(norm);
     const body = rows.slice(1);
-
-    const result: any[] = [];
+    const payload: any[] = [];
 
     for (const cols of body) {
       const o: Record<string, string> = {};
       header.forEach((h, i) => (o[h] = cols[i] ?? ""));
 
       const content = s(o["문제내용"]);
-      const choices = [
-        s(o["보기1"]),
-        s(o["보기2"]),
-        s(o["보기3"]),
-        s(o["보기4"]),
-      ];
+      const choices = [s(o["보기1"]), s(o["보기2"]), s(o["보기3"]), s(o["보기4"])];
       const answer = parseAnswer(o["정답"]);
       const points = Number(o["배점"]) || 1;
 
       if (!content || answer < 0 || !choices.some(Boolean)) continue;
 
-      result.push({
+      payload.push({
         content,
         choices,
         answer_index: answer,
@@ -130,14 +130,12 @@ export async function POST(req: Request) {
       });
     }
 
-    if (result.length === 0) {
-      return NextResponse.json(
-        { ok: false, error: "NO_VALID_ROWS" },
-        { status: 400 }
-      );
+    if (payload.length === 0) {
+      return NextResponse.json({ ok: false, error: "NO_VALID_ROWS" }, { status: 400 });
     }
 
-    const { error } = await supabaseAdmin.from("questions").insert(result);
+    const supabase = getSupabaseAdmin();
+    const { error } = await supabase.from("questions").insert(payload);
 
     if (error) {
       return NextResponse.json(
@@ -146,10 +144,10 @@ export async function POST(req: Request) {
       );
     }
 
-    return NextResponse.json({ ok: true, inserted: result.length });
+    return NextResponse.json({ ok: true, inserted: payload.length });
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: "UPLOAD_FAILED", detail: String(e) },
+      { ok: false, error: "UPLOAD_FAILED", detail: String(e?.message ?? e) },
       { status: 500 }
     );
   }
