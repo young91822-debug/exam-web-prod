@@ -85,7 +85,6 @@ export async function GET() {
     );
   }
 }
-console.log("POST /api/admin/accounts BODY =", body);
 export async function POST(req: Request) {
   try {
     const body = await readBody(req);
