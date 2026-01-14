@@ -68,7 +68,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    const role = s((row as any).role) || (ADMIN_IDS.has(id) ? "admin" : "user");
+    const role = ADMIN_IDS.has(id)
+  ? "admin"
+  : (s((row as any).role) || "user");
 
     const isProd = process.env.NODE_ENV === "production";
 
