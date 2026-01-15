@@ -1,4 +1,6 @@
 ﻿// app/login/page.tsx
+export const dynamic = "force-dynamic";
+
 "use client";
 
 import React, { useState } from "react";
