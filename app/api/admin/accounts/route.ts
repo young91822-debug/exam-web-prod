@@ -1,5 +1,5 @@
 // app/api/admin/accounts/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
@@ -21,10 +21,14 @@ function toBool(v: any, d: boolean | null = null) {
   return d;
 }
 
+/**
+ * ✅ (유지) 팀 픽: body.team 우선, 없으면 empId가 admin_gs면 B, 아니면 A
+ * - "empId"는 생성 대상(직원) emp_id 기준으로 팀 추정하는 기존 로직 유지
+ * - 실제 스코프 분리는 owner_admin으로 함
+ */
 function pickTeam(empId: string, bodyTeam: any) {
   const t = s(bodyTeam);
   if (t) return t;
-  // admin_gs는 B로, 그 외는 A 기본 (원하면 나중에 변경)
   if (empId === "admin_gs") return "B";
   return "A";
 }
@@ -52,13 +56,31 @@ async function readBody(req: Request) {
   }
 }
 
+/** ✅ 로그인 관리자 스코프(쿠키) */
+function getAdminScope(req: NextRequest) {
+  const adminEmpId = s(req.cookies.get("empId")?.value);
+  const role = s(req.cookies.get("role")?.value);
+  if (!adminEmpId || role !== "admin") return null;
+  return { adminEmpId };
+}
+
 /* ---------------- handlers ---------------- */
 
-export async function GET() {
+// ✅ GET은 NextRequest를 받아야 쿠키를 읽고 "내꺼만" 필터 가능
+export async function GET(req: NextRequest) {
   try {
+    const scope = getAdminScope(req);
+    if (!scope) {
+      return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
+    }
+    const { adminEmpId } = scope;
+
+    // ✅ 핵심: owner_admin=현재 관리자 인 것만 조회
+    // + owner_admin이 null인데 자기 emp_id인 경우(초기 백필/예외)도 보이게 OR 처리
     const { data, error } = await sb
       .from("accounts")
       .select("*")
+      .or(`owner_admin.eq.${adminEmpId},and(owner_admin.is.null,emp_id.eq.${adminEmpId})`)
       .order("id", { ascending: true });
 
     if (error) {
@@ -84,18 +106,27 @@ export async function GET() {
   }
 }
 
-export async function POST(req: Request) {
+// ✅ POST도 NextRequest로 바꿔야 "현재 로그인 관리자"를 owner_admin으로 박을 수 있음
+export async function POST(req: NextRequest) {
   try {
+    const scope = getAdminScope(req);
+    if (!scope) {
+      return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
+    }
+    const { adminEmpId } = scope;
+
     const body = await readBody(req);
 
     const emp_id = s(body?.emp_id ?? body?.empId ?? body?.id ?? body?.user_id);
     const name = s(body?.name ?? "");
-    const is_active = toBool(body?.is_active ?? body?.active ?? body?.use, true) ?? true;
-    const team = pickTeam(emp_id, body?.team);
+    const is_active =
+      toBool(body?.is_active ?? body?.active ?? body?.use, true) ?? true;
 
     if (!emp_id) {
       return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
     }
+
+    const team = pickTeam(emp_id, body?.team);
 
     // 생성 시 사용할 임시 비번 (원하면 body.tempPassword로 덮어쓰기 가능)
     const tempPassword = s(body?.tempPassword ?? body?.password ?? "1234");
@@ -132,19 +163,35 @@ export async function POST(req: Request) {
       exists = exists2;
     }
 
-    // ✅ 이미 있으면: password_hash가 비어있을 때만 채워주고 반환
+    // ✅ 이미 있으면: (중요) "내 소유가 아니면" 생성/수정 막기
     if (exists) {
+      const owner = s((exists as any).owner_admin ?? "");
+      // owner_admin이 이미 있고, 현재 관리자랑 다르면 막기
+      if (owner && owner !== adminEmpId) {
+        return NextResponse.json(
+          { ok: false, error: "FORBIDDEN_OTHER_OWNER" },
+          { status: 403 }
+        );
+      }
+
+      // owner_admin이 비어있으면(구 데이터) 현재 관리자 소유로 먼저 귀속시켜버림
+      // → 이렇게 해야 앞으로 목록에서 섞여보이지 않음
+      if (!owner) {
+        await sb.from("accounts").update({ owner_admin: adminEmpId }).eq("id", (exists as any).id);
+      }
+
       const ph = s((exists as any).password_hash ?? "");
       if (!ph) {
-        await sb
-          .from("accounts")
-          .update({ password_hash })
-          .eq("id", (exists as any).id);
-        // 업데이트된 row 다시 읽기
-        const { data: reread } = await sb.from("accounts").select("*").eq("id", (exists as any).id).single();
-        return NextResponse.json({ ok: true, row: reread ?? exists, tempPassword });
+        await sb.from("accounts").update({ password_hash }).eq("id", (exists as any).id);
       }
-      return NextResponse.json({ ok: true, row: exists, tempPassword });
+
+      const { data: reread } = await sb
+        .from("accounts")
+        .select("*")
+        .eq("id", (exists as any).id)
+        .single();
+
+      return NextResponse.json({ ok: true, row: reread ?? exists, tempPassword });
     }
 
     // 2) 새로 INSERT (필수 컬럼들 함께)
@@ -155,10 +202,17 @@ export async function POST(req: Request) {
       role: "user",
       is_active,
       team,
+
+      // ✅ 핵심: 누가 만들었는지 박기
+      owner_admin: adminEmpId,
     };
     if (name) payload.name = name;
 
-    const { data, error } = await sb.from("accounts").insert([payload]).select("*").single();
+    const { data, error } = await sb
+      .from("accounts")
+      .insert([payload])
+      .select("*")
+      .single();
 
     if (error) {
       return NextResponse.json(
@@ -167,7 +221,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 프론트에서 바로 보여주도록 tempPassword 같이 내려줌
     return NextResponse.json({ ok: true, row: data, tempPassword });
   } catch (e: any) {
     return NextResponse.json(
@@ -177,8 +230,14 @@ export async function POST(req: Request) {
   }
 }
 
-export async function PATCH(req: Request) {
+export async function PATCH(req: NextRequest) {
   try {
+    const scope = getAdminScope(req);
+    if (!scope) {
+      return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
+    }
+    const { adminEmpId } = scope;
+
     const body = await readBody(req);
 
     const id = body?.id ?? null;
@@ -193,6 +252,31 @@ export async function PATCH(req: Request) {
       return NextResponse.json({ ok: false, error: "MISSING_TARGET" }, { status: 400 });
     }
 
+    // ✅ 소유자 검사: 내 owner_admin인 것만 수정 허용
+    // id로 찾을 수 있으면 우선 조회해서 owner 확인
+    const lookupKey = match.id ? { id: match.id } : { emp_id: match.emp_id };
+    const { data: before, error: be } = await sb
+      .from("accounts")
+      .select("id, emp_id, owner_admin")
+      .match(lookupKey)
+      .maybeSingle();
+
+    if (be || !before) {
+      return NextResponse.json(
+        { ok: false, error: "ACCOUNT_NOT_FOUND", detail: be?.message },
+        { status: 404 }
+      );
+    }
+
+    const owner = s(before.owner_admin ?? "");
+    if (owner && owner !== adminEmpId) {
+      return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
+    }
+    // owner_admin이 null인데 자기 emp_id도 아니면 막기
+    if (!owner && s(before.emp_id) !== adminEmpId) {
+      return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
+    }
+
     const patch: any = {};
     if (active !== null) patch.is_active = active;
 
@@ -203,7 +287,10 @@ export async function PATCH(req: Request) {
       patch.password_hash = makePasswordHash(newPw);
     }
 
-    let res = await sb.from("accounts").update(patch).match(match).select("*");
+    // ✅ 혹시 owner_admin이 null(구 데이터)인 계정이면 수정 시점에 귀속시켜버림
+    if (!owner) patch.owner_admin = adminEmpId;
+
+    const res = await sb.from("accounts").update(patch).match(match).select("*");
     if (!res.error) {
       return NextResponse.json({ ok: true, rows: res.data ?? [] });
     }
