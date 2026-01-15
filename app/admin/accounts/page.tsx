@@ -6,15 +6,36 @@ import React, { useEffect, useMemo, useState } from "react";
 type Account = any;
 
 type ListResp =
-  | { ok: true; rows: Account[] }
+  | { ok: true; items?: Account[]; rows?: Account[] }
   | { ok: false; error: string; detail?: any };
 
 type PostResp =
-  | { ok: true; row: Account; mode?: string; tempPassword?: string; marker?: string }
+  | { ok: true; item: Account; mode?: string; tempPassword?: string; marker?: string }
+  | { ok: false; error: string; detail?: any };
+
+type PatchResp =
+  | { ok: true; rows?: Account[]; items?: Account[] }
   | { ok: false; error: string; detail?: any };
 
 function s(v: any) {
   return String(v ?? "").trim();
+}
+
+async function safeJson(res: Response) {
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return { ok: false, error: "INVALID_JSON", detail: text };
+  }
+}
+
+function pickList(json: any): Account[] {
+  if (!json) return [];
+  if (Array.isArray(json.items)) return json.items;
+  if (Array.isArray(json.rows)) return json.rows;
+  if (Array.isArray(json.data)) return json.data;
+  return [];
 }
 
 export default function AdminAccountsPage() {
@@ -24,240 +45,262 @@ export default function AdminAccountsPage() {
 
   const [items, setItems] = useState<Account[]>([]);
   const [loading, setLoading] = useState(false);
-  const [msg, setMsg] = useState<string>("");
+  const [posting, setPosting] = useState(false);
   const [err, setErr] = useState<string>("");
 
-  async function load() {
-    setErr("");
+  const count = items.length;
+
+  async function fetchList() {
     setLoading(true);
+    setErr("");
     try {
       const res = await fetch("/api/admin/accounts", { cache: "no-store" });
-      const text = await res.text();
-      const json = (text ? JSON.parse(text) : null) as ListResp;
+      const json = (await safeJson(res)) as ListResp;
 
       if (!res.ok || !json?.ok) {
-        setItems([]);
         setErr((json as any)?.error || `HTTP_${res.status}`);
+        setItems([]); // 화면상 혼동 줄이려면 비우고
         return;
       }
 
-      // ✅ 서버 응답은 rows
-      setItems(Array.isArray((json as any).rows) ? (json as any).rows : []);
+      const list = pickList(json);
+      setItems(list);
     } catch (e: any) {
-      setItems([]);
       setErr(String(e?.message ?? e));
+      setItems([]);
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
-    load();
+    fetchList();
   }, []);
 
-  const listCount = useMemo(() => items?.length ?? 0, [items]);
-
   async function onCreate() {
-    setErr("");
-    setMsg("");
-    const payload = {
-      empId: s(empId),
-      name: s(name), // "이름(선택)"
-      is_active: !!isActive,
-    };
-
-    if (!payload.empId) {
-      setErr("응시자ID(emp_id)를 입력해줘.");
+    const emp_id = s(empId);
+    if (!emp_id) {
+      setErr("emp_id를 입력해줘");
       return;
     }
 
-    setLoading(true);
+    setPosting(true);
+    setErr("");
+
     try {
       const res = await fetch("/api/admin/accounts", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-        cache: "no-store",
+        body: JSON.stringify({
+          empId: emp_id,
+          name: s(name),
+          is_active: isActive,
+        }),
       });
 
-      const text = await res.text();
-      const json = (text ? JSON.parse(text) : null) as PostResp;
+      const json = (await safeJson(res)) as PostResp;
 
       if (!res.ok || !json?.ok) {
         setErr((json as any)?.error || `HTTP_${res.status}`);
         return;
       }
 
-      // ✅ 서버 응답은 row
-      const createdEmpId =
-        (json as any)?.row?.emp_id ??
-        (json as any)?.row?.empId ??
-        payload.empId;
+      // ✅ 생성 성공 → 목록 새로고침 (가장 확실)
+      await fetchList();
 
-      const tempPw = (json as any)?.tempPassword;
-
-      setMsg(`생성 완료: ${createdEmpId}${tempPw ? ` (기본비번: ${tempPw})` : ""}`);
-
-      // ✅ 생성 후 목록 다시 불러오기
-      await load();
-
+      // 입력 초기화
       setEmpId("");
       setName("");
       setIsActive(true);
+
+      // 필요하면 임시비번 안내
+      if ((json as any)?.tempPassword) {
+        // 너무 귀찮으면 alert로
+        alert(`생성/갱신 완료! 임시 비번: ${(json as any).tempPassword}`);
+      }
     } catch (e: any) {
       setErr(String(e?.message ?? e));
     } finally {
-      setLoading(false);
+      setPosting(false);
     }
   }
 
+  // (선택) 간단 검색
+  const filtered = useMemo(() => {
+    return items;
+  }, [items]);
+
   return (
     <div style={{ padding: 24 }}>
-      <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 12 }}>응시자 계정 관리</h2>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 16 }}>
+        응시자 계정 관리
+      </h1>
 
       {err ? (
         <div
           style={{
-            background: "#ffecec",
-            color: "#b40000",
-            padding: 12,
+            background: "#fee2e2",
+            color: "#991b1b",
+            padding: "10px 12px",
             borderRadius: 10,
             marginBottom: 12,
+            fontWeight: 600,
           }}
         >
           에러: {err}
         </div>
       ) : null}
 
-      {msg ? (
-        <div
-          style={{
-            background: "#e9f8ee",
-            color: "#116b2b",
-            padding: 12,
-            borderRadius: 10,
-            marginBottom: 12,
-          }}
-        >
-          {msg}
-        </div>
-      ) : null}
-
       <div
         style={{
-          border: "1px solid #e5e5e5",
+          background: "#fff",
+          border: "1px solid #e5e7eb",
           borderRadius: 12,
-          padding: 14,
-          marginBottom: 18,
+          padding: 16,
+          marginBottom: 16,
         }}
       >
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <div style={{ minWidth: 240 }}>
-            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>응시자ID(emp_id) *</div>
+          <div style={{ minWidth: 220 }}>
+            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>
+              응시자ID(emp_id) *
+            </div>
             <input
               value={empId}
               onChange={(e) => setEmpId(e.target.value)}
               placeholder="예: 201978"
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                border: "1px solid #e5e7eb",
+                borderRadius: 10,
+              }}
             />
           </div>
 
-          <div style={{ minWidth: 240 }}>
-            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>이름(선택)</div>
+          <div style={{ minWidth: 220 }}>
+            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>
+              이름(선택)
+            </div>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="예: 홍길동"
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                border: "1px solid #e5e7eb",
+                borderRadius: 10,
+              }}
             />
           </div>
 
-          <div style={{ minWidth: 140 }}>
-            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>사용 여부</div>
+          <div style={{ minWidth: 160 }}>
+            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>
+              사용 여부
+            </div>
             <select
-              value={isActive ? "Y" : "N"}
-              onChange={(e) => setIsActive(e.target.value === "Y")}
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+              value={isActive ? "1" : "0"}
+              onChange={(e) => setIsActive(e.target.value === "1")}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                border: "1px solid #e5e7eb",
+                borderRadius: 10,
+              }}
             >
-              <option value="Y">사용</option>
-              <option value="N">미사용</option>
+              <option value="1">사용</option>
+              <option value="0">미사용</option>
             </select>
           </div>
 
           <button
             onClick={onCreate}
-            disabled={loading}
+            disabled={posting}
             style={{
-              padding: "10px 16px",
+              padding: "10px 14px",
               borderRadius: 10,
-              border: "1px solid #222",
-              background: "#222",
+              border: "1px solid #111827",
+              background: posting ? "#9ca3af" : "#111827",
               color: "#fff",
               fontWeight: 700,
-              cursor: "pointer",
-              opacity: loading ? 0.7 : 1,
+              cursor: posting ? "not-allowed" : "pointer",
+              marginTop: 18,
             }}
           >
-            생성
+            {posting ? "처리중..." : "생성"}
           </button>
 
           <button
-            onClick={load}
+            onClick={fetchList}
             disabled={loading}
             style={{
-              padding: "10px 16px",
+              padding: "10px 14px",
               borderRadius: 10,
-              border: "1px solid #ddd",
+              border: "1px solid #e5e7eb",
               background: "#fff",
-              cursor: "pointer",
-              opacity: loading ? 0.7 : 1,
+              color: "#111827",
+              fontWeight: 700,
+              cursor: loading ? "not-allowed" : "pointer",
+              marginTop: 18,
             }}
           >
             새로고침
           </button>
         </div>
 
-        <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
-          * “생성” 눌렀는데 목록이 안 바뀌면 DevTools → Network에서 <b>/api/admin/accounts</b> GET/POST 응답을 확인
+        <div style={{ marginTop: 10, fontSize: 12, color: "#6b7280" }}>
+          * “생성” 눌렀는데 목록이 안 바뀌면 DevTools → Network에서 <b>/api/admin/accounts</b> GET 응답 확인
         </div>
       </div>
 
-      <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, overflow: "hidden" }}>
-        <div style={{ padding: 12, fontWeight: 700 }}>목록 ({listCount}건)</div>
+      <div
+        style={{
+          background: "#fff",
+          border: "1px solid #e5e7eb",
+          borderRadius: 12,
+          padding: 16,
+        }}
+      >
+        <div style={{ fontWeight: 800, marginBottom: 10 }}>
+          목록 ({count}건)
+        </div>
 
-        <div style={{ borderTop: "1px solid #eee" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", padding: 12, fontWeight: 700 }}>
-            <div>ID</div>
-            <div>emp_id</div>
-            <div>이름</div>
-            <div>사용</div>
-            <div>생성일</div>
-          </div>
-
-          <div style={{ borderTop: "1px solid #eee" }}>
-            {items.length === 0 ? (
-              <div style={{ padding: 12, opacity: 0.7 }}>아직 계정이 없습니다.</div>
-            ) : (
-              items.map((it: any) => (
-                <div
-                  key={String(it?.id ?? it?.emp_id ?? Math.random())}
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr",
-                    padding: 12,
-                    borderTop: "1px solid #f2f2f2",
-                    alignItems: "center",
-                  }}
-                >
-                  <div style={{ wordBreak: "break-all" }}>{String(it?.id ?? "-")}</div>
-                  <div>{String(it?.emp_id ?? it?.empId ?? "-")}</div>
-                  <div>{String(it?.name ?? it?.display_name ?? it?.fullname ?? it?.username ?? "-")}</div>
-                  <div>{(it?.is_active ?? it?._active) ? "사용" : "미사용"}</div>
-                  <div>{String(it?.created_at ?? it?.createdAt ?? "-")}</div>
-                </div>
-              ))
-            )}
-          </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #e5e7eb", textAlign: "left" }}>
+                <th style={{ padding: 10 }}>ID</th>
+                <th style={{ padding: 10 }}>emp_id</th>
+                <th style={{ padding: 10 }}>이름</th>
+                <th style={{ padding: 10 }}>사용</th>
+                <th style={{ padding: 10 }}>생성일</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={5} style={{ padding: 12, color: "#6b7280" }}>
+                    {loading ? "불러오는 중..." : "아직 계정이 없습니다."}
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((r: any) => (
+                  <tr key={String(r?.id ?? r?.emp_id)} style={{ borderBottom: "1px solid #f3f4f6" }}>
+                    <td style={{ padding: 10 }}>{String(r?.id ?? "")}</td>
+                    <td style={{ padding: 10 }}>{String(r?.emp_id ?? "")}</td>
+                    <td style={{ padding: 10 }}>{String(r?.name ?? "")}</td>
+                    <td style={{ padding: 10 }}>
+                      {r?.is_active ? "사용" : "미사용"}
+                    </td>
+                    <td style={{ padding: 10 }}>
+                      {String(r?.created_at ?? "")}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
