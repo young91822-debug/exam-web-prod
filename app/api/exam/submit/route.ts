@@ -129,44 +129,10 @@ export async function POST(req: Request) {
 
     const uniqQids = Array.from(new Set(questionIds)).filter(Boolean);
 
-    // 문제 목록이 없다면(비정상) 그래도 제출은 처리
-    if (uniqQids.length === 0) {
-      const nowIso = new Date().toISOString();
-      const { error: upErr } = await client
-        .from("exam_attempts")
-        .update({
-          submitted_at: nowIso,
-          status: "SUBMITTED",
-          score: 0,
-          correct_count: 0,
-          wrong_count: 0,
-          total_points: Number((attempt as any)?.total_points ?? 0),
-          total_questions: Number((attempt as any)?.total_questions ?? 0),
-          answers: answersMap,
-        })
-        .eq("id", attemptId);
-
-      if (upErr) {
-        return NextResponse.json({ ok: false, error: "ATTEMPT_UPDATE_FAILED", detail: upErr }, { status: 500 });
-      }
-
-      return NextResponse.json({
-        ok: true,
-        attemptId,
-        score: 0,
-        totalPoints: Number((attempt as any)?.total_points ?? 0),
-        correctCount: 0,
-        wrongQuestionIds: [],
-        savedAnswers: 0,
-        note: "question_ids empty; submitted with minimal update",
-      });
-    }
-
-    // 3) questions 조회
-    const { data: questions, error: qErr } = await client
-      .from("questions")
-      .select("*")
-      .in("id", uniqQids as any);
+    // 3) questions 조회 (없어도 제출은 되게)
+    const { data: questions, error: qErr } = uniqQids.length
+      ? await client.from("questions").select("*").in("id", uniqQids as any)
+      : { data: [], error: null as any };
 
     if (qErr) {
       return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: qErr }, { status: 500 });
@@ -175,7 +141,7 @@ export async function POST(req: Request) {
     const qById = new Map<string, any>();
     for (const q of questions ?? []) qById.set(String((q as any).id), q);
 
-    // 4) 채점 (✅ 못 푼 문제도 오답 처리)
+    // 4) 채점 (점수는 계산만 하고, DB 저장은 안 해도 됨)
     let totalPoints = 0;
     let score = 0;
     let correctCount = 0;
@@ -183,7 +149,6 @@ export async function POST(req: Request) {
     const wrongQuestionIds: string[] = [];
 
     // ✅ exam_answers에 넣을 rows (선택한 것만 저장)
-    //    ❗️is_correct 저장 금지 (스키마 캐시 문제로 500남)
     const rowsToInsert: any[] = [];
 
     for (const qid of uniqQids) {
@@ -197,7 +162,6 @@ export async function POST(req: Request) {
 
       const correctIndex = pickCorrectIndex(q);
 
-      // 미선택(자동제출 등) => 오답 처리
       if (selectedIndex === null || selectedIndex === undefined) {
         wrongCount += 1;
         wrongQuestionIds.push(String(qid));
@@ -231,10 +195,7 @@ export async function POST(req: Request) {
       .eq("attempt_id", attemptId);
 
     if (delErr) {
-      return NextResponse.json(
-        { ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
     }
 
     if (rowsToInsert.length > 0) {
@@ -243,32 +204,23 @@ export async function POST(req: Request) {
         .insert(rowsToInsert);
 
       if (insErr) {
-        return NextResponse.json(
-          { ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr },
-          { status: 500 }
-        );
+        return NextResponse.json({ ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr }, { status: 500 });
       }
     }
 
-    // 6) attempt 업데이트
+    // ✅ 6) attempt 업데이트: "존재 확실한 컬럼만" (제일 안전)
+    //    submitted_at / status 만 업데이트한다. (score/answers/total_*는 DB에 없을 수 있어서 제거)
     const nowIso = new Date().toISOString();
     const { error: upErr } = await client
       .from("exam_attempts")
-  .update({
-    submitted_at: nowIso,
-    status: "SUBMITTED",
-    score,
-    total_points: totalPoints,
-    total_questions: uniqQids.length,
-    answers: answersMap, // 내 선택 저장
-  })
-  .eq("id", attemptId);
-  
+      .update({
+        submitted_at: nowIso,
+        status: "SUBMITTED",
+      })
+      .eq("id", attemptId);
+
     if (upErr) {
-      return NextResponse.json(
-        { ok: false, error: "ATTEMPT_UPDATE_FAILED", detail: upErr },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "ATTEMPT_UPDATE_FAILED", detail: upErr }, { status: 500 });
     }
 
     return NextResponse.json({
@@ -281,6 +233,7 @@ export async function POST(req: Request) {
       savedAnswers: rowsToInsert.length,
       isAuto,
       redirectUrl: `/exam/result/${attemptId}`,
+      note: "attempt updated with minimal fields (submitted_at/status)",
     });
   } catch (e: any) {
     return NextResponse.json(
