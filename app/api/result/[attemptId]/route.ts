@@ -11,12 +11,21 @@ function n(v: any, d: number | null = null) {
   const x = Number(String(v ?? "").trim());
   return Number.isFinite(x) ? x : d;
 }
-function isNumericId(x: string) {
-  return /^\d+$/.test(x);
+function isNumericIdStr(x: any) {
+  return /^\d+$/.test(s(x));
 }
-function isUUID(v: any) {
+function isUUIDStr(v: any) {
   const t = s(v);
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
+}
+/** question id는 숫자(bigint) 또는 UUID 둘 다 허용 */
+function isValidQid(v: any) {
+  return isNumericIdStr(v) || isUUIDStr(v);
+}
+function normQid(v: any) {
+  const t = s(v);
+  if (isNumericIdStr(t)) return Number(t);
+  return t; // uuid면 string 유지
 }
 
 function pickChoices(q: any): string[] {
@@ -44,8 +53,8 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
-/** attempt에 저장돼 있을 수 있는 문제목록을 최대한 찾아봄 (UUID 기반) */
-function pickAttemptQuestionUuids(attempt: any): string[] {
+/** attempt에 저장돼 있을 수 있는 문제목록(숫자/UUID) 최대한 찾아봄 */
+function pickAttemptQuestionIds(attempt: any): string[] {
   const cands = [
     attempt?.question_ids,
     attempt?.questionIds,
@@ -59,7 +68,7 @@ function pickAttemptQuestionUuids(attempt: any): string[] {
     if (!v) continue;
 
     if (Array.isArray(v)) {
-      const out = v.map((x) => s(x)).filter((x) => isUUID(x));
+      const out = v.map((x: any) => s(x)).filter((x) => isValidQid(x));
       if (out.length) return out;
     }
 
@@ -71,59 +80,49 @@ function pickAttemptQuestionUuids(attempt: any): string[] {
       try {
         const parsed = JSON.parse(t);
         if (Array.isArray(parsed)) {
-          const out = parsed.map((x) => s(x)).filter((x) => isUUID(x));
+          const out = parsed.map((x: any) => s(x)).filter((x) => isValidQid(x));
           if (out.length) return out;
         }
       } catch {}
 
       // 콤마 문자열 가능
       if (t.includes(",")) {
-        const out = t.split(",").map((x) => s(x)).filter((x) => isUUID(x));
+        const out = t.split(",").map((x) => s(x)).filter((x) => isValidQid(x));
         if (out.length) return out;
       }
-    }
-
-    if (typeof v === "object") {
-      const out = Object.keys(v).map((k) => s(k)).filter((x) => isUUID(x));
-      if (out.length) return out;
     }
   }
 
   return [];
 }
 
-/** attempt.answers(맵 형태)에서 qids/선택값 뽑기 (키는 question_id(UUID) 문자열) */
+/** attempt.answers(맵 형태)에서 qid/선택값 뽑기 (키는 question_id 문자열) */
 function pickAttemptAnswersMap(attempt: any): Map<string, number> {
   const m = new Map<string, number>();
   const raw = attempt?.answers;
   if (!raw) return m;
 
+  const feed = (obj: any) => {
+    if (!obj || typeof obj !== "object") return;
+    for (const [k, v] of Object.entries(obj)) {
+      const key = s(k);
+      if (!isValidQid(key)) continue;
+      const val = n(v, null);
+      if (val !== null) m.set(key, val);
+    }
+  };
+
   if (typeof raw === "string") {
     try {
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") {
-        for (const [k, v] of Object.entries(parsed)) {
-          const key = s(k);
-          if (!isUUID(key)) continue;
-          const val = n(v, null);
-          if (val !== null) m.set(key, val);
-        }
-      }
+      feed(parsed);
     } catch {
       return m;
     }
     return m;
   }
 
-  if (typeof raw === "object") {
-    for (const [k, v] of Object.entries(raw)) {
-      const key = s(k);
-      if (!isUUID(key)) continue;
-      const val = n(v, null);
-      if (val !== null) m.set(key, val);
-    }
-  }
-
+  feed(raw);
   return m;
 }
 
@@ -135,7 +134,7 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
     if (!attemptIdStr) {
       return NextResponse.json({ ok: false, error: "MISSING_ATTEMPT_ID" }, { status: 400 });
     }
-    if (!isNumericId(attemptIdStr)) {
+    if (!isNumericIdStr(attemptIdStr)) {
       return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
@@ -160,7 +159,7 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
 
     /**
      * 2) 답변 소스 우선순위
-     *  - exam_answers(attempt_id)에서 question_id(UUID)/selected_index 읽기
+     *  - exam_answers(attempt_id)에서 question_id/selected_index 읽기
      *  - 없으면 attempt.answers(JSON) fallback
      */
     const ansMap = new Map<string, number>();
@@ -180,7 +179,7 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
     for (const a of answers ?? []) {
       const qid = s((a as any)?.question_id);
       const sel = (a as any)?.selected_index;
-      if (!isUUID(qid)) continue; // ✅ "0" 같은 값 자동 제거
+      if (!isValidQid(qid)) continue;
       if (sel === null || sel === undefined) continue;
       ansMap.set(qid, Number(sel));
     }
@@ -196,15 +195,15 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
 
     /**
      * 3) 문제 목록(qids) 만들기
-     *  - attempt에 저장된 문제목록(UUID)이 있으면 그걸 사용(전체 20문항 유지 가능)
+     *  - attempt에 저장된 문제목록을 우선 사용(전체 20문항 유지)
      *  - 없으면 "답이 있는 문제만"이라도 표시
      */
-    const attemptQids = pickAttemptQuestionUuids(attempt);
+    const attemptQids = pickAttemptQuestionIds(attempt);
     const qids = attemptQids.length > 0 ? attemptQids : Array.from(ansMap.keys());
 
-    const uniqQids = Array.from(new Set(qids.map((x) => s(x)).filter((x) => isUUID(x))));
+    const uniqQidsStr = Array.from(new Set(qids.map((x) => s(x)).filter((x) => isValidQid(x))));
 
-    if (!uniqQids.length) {
+    if (!uniqQidsStr.length) {
       return NextResponse.json({
         ok: true,
         attempt: {
@@ -225,11 +224,14 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
       });
     }
 
-    // 4) questions 조회 (questions.id = UUID)
+    // ✅ 질문 조회용 id는 숫자면 Number로, uuid면 string으로 변환
+    const uniqQidsQuery = uniqQidsStr.map(normQid);
+
+    // 4) questions 조회
     const { data: questions, error: eQ } = await supabaseAdmin
       .from("questions")
       .select("*")
-      .in("id", uniqQids as any);
+      .in("id", uniqQidsQuery as any);
 
     if (eQ) {
       return NextResponse.json(
@@ -238,20 +240,21 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
       );
     }
 
+    // questions.id도 숫자/uuid 섞일 수 있으니 문자열키로 관리
     const qById = new Map<string, any>();
-    for (const q of questions ?? []) qById.set(s(q?.id), q);
+    for (const q of questions ?? []) qById.set(s((q as any)?.id), q);
 
-    // 5) graded를 "qids 순서"대로 구성
+    // 5) graded 구성
     let score = 0;
     let correctCount = 0;
 
-    const graded = uniqQids
-      .map((qid) => {
-        const q = qById.get(qid);
+    const graded = uniqQidsStr
+      .map((qidStr) => {
+        const q = qById.get(s(qidStr));
         if (!q) return null;
 
         const correctIndex = pickCorrectIndex(q);
-        const chosen = ansMap.has(qid) ? ansMap.get(qid)! : null;
+        const chosen = ansMap.has(qidStr) ? ansMap.get(qidStr)! : null;
 
         const isCorrect =
           correctIndex !== null &&
