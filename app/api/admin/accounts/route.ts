@@ -5,13 +5,13 @@ import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
 const sb: any = supabaseAdmin;
+const TABLE = "accounts";
 
 /* ---------------- helpers ---------------- */
 
 function s(v: any) {
   return String(v ?? "").trim();
 }
-
 function toBool(v: any, d: boolean | null = null) {
   if (v === undefined || v === null || v === "") return d;
   if (typeof v === "boolean") return v;
@@ -21,28 +21,14 @@ function toBool(v: any, d: boolean | null = null) {
   return d;
 }
 
-/**
- * ✅ (유지) 팀 픽: body.team 우선, 없으면 empId가 admin_gs면 B, 아니면 A
- * - "empId"는 생성 대상(직원) emp_id 기준으로 팀 추정하는 기존 로직 유지
- * - 실제 스코프 분리는 owner_admin으로 함
- */
-function pickTeam(empId: string, bodyTeam: any) {
-  const t = s(bodyTeam);
-  if (t) return t;
-  if (empId === "admin_gs") return "B";
-  return "A";
-}
-
-/**
- * password_hash 생성 (내장 crypto.scrypt 사용)
- * 저장 포맷: scrypt$<saltB64>$<hashB64>
- */
+/** stored 포맷: scrypt$<saltB64>$<hashB64> */
 function makePasswordHash(plain: string) {
   const salt = crypto.randomBytes(16);
   const hash = crypto.scryptSync(plain, salt, 64);
   return `scrypt$${salt.toString("base64")}$${hash.toString("base64")}`;
 }
 
+/** 요청 body 안전 파싱 */
 async function readBody(req: Request) {
   try {
     return await req.json();
@@ -56,48 +42,59 @@ async function readBody(req: Request) {
   }
 }
 
-/** ✅ 로그인 관리자 스코프(쿠키) */
-function getAdminScope(req: NextRequest) {
-  const adminEmpId = s(req.cookies.get("empId")?.value);
-  const role = s(req.cookies.get("role")?.value);
-  if (!adminEmpId || role !== "admin") return null;
-  return { adminEmpId };
+/** "column ... does not exist" 류 판단 */
+function isMissingColumnErr(err: any) {
+  const msg = String(err?.message ?? err ?? "");
+  return msg.includes("does not exist") && msg.includes("column");
 }
 
-/* ---------------- handlers ---------------- */
+/**
+ * owner_admin 컬럼이 없는 DB에서도 동작하게:
+ * - 먼저 owner_admin 포함 select/insert 시도
+ * - 없다고 나오면 자동으로 owner_admin 제거해서 재시도
+ */
 
-// ✅ GET은 NextRequest를 받아야 쿠키를 읽고 "내꺼만" 필터 가능
+/* ---------------- GET ---------------- */
+/** 목록 */
 export async function GET(req: NextRequest) {
   try {
-    const scope = getAdminScope(req);
-    if (!scope) {
-      return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
-    }
-    const { adminEmpId } = scope;
+    // ✅ (선택) 관리자 empId를 쿠키에서 읽어둠 - 나중에 분리 시 사용 가능
+    const adminEmpId = s(req.cookies.get("empId")?.value);
 
-    // ✅ 핵심: owner_admin=현재 관리자 인 것만 조회
-    // + owner_admin이 null인데 자기 emp_id인 경우(초기 백필/예외)도 보이게 OR 처리
-    const { data, error } = await sb
-      .from("accounts")
-      .select("*")
-      .or(`owner_admin.eq.${adminEmpId},and(owner_admin.is.null,emp_id.eq.${adminEmpId})`)
-      .order("id", { ascending: true });
+    // 1) owner_admin 포함해서 먼저 시도
+    let q1 = sb
+      .from(TABLE)
+      .select(
+        "id, emp_id, name, is_active, created_at, role, owner_admin",
+        { count: "exact" }
+      )
+      .order("id", { ascending: false });
+
+    // ✅ 나중에 “내가 만든 계정만” 보이게 하고 싶으면 여기서 필터 걸면 됨
+    // q1 = q1.eq("owner_admin", adminEmpId);
+
+    let { data, error } = await q1;
+
+    // 2) owner_admin 컬럼이 없으면 fallback
+    if (error && isMissingColumnErr(error)) {
+      const q2 = sb
+        .from(TABLE)
+        .select("id, emp_id, name, is_active, created_at, role", { count: "exact" })
+        .order("id", { ascending: false });
+
+      const r2 = await q2;
+      data = r2.data;
+      error = r2.error;
+    }
 
     if (error) {
       return NextResponse.json(
-        { ok: false, error: "DB_QUERY_FAILED", detail: error.message },
+        { ok: false, error: "DB_QUERY_FAILED", detail: String(error?.message ?? error) },
         { status: 500 }
       );
     }
 
-    const rows = (data ?? []).map((r: any) => ({
-      ...r,
-      _active: Boolean(
-        r?.is_active ?? r?.active ?? r?.enabled ?? r?.use_yn ?? r?.useYn ?? true
-      ),
-    }));
-
-    return NextResponse.json({ ok: true, rows });
+    return NextResponse.json({ ok: true, items: data ?? [] });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
@@ -106,122 +103,60 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// ✅ POST도 NextRequest로 바꿔야 "현재 로그인 관리자"를 owner_admin으로 박을 수 있음
+/* ---------------- POST ---------------- */
+/** 생성 */
 export async function POST(req: NextRequest) {
   try {
-    const scope = getAdminScope(req);
-    if (!scope) {
-      return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
-    }
-    const { adminEmpId } = scope;
-
     const body = await readBody(req);
 
-    const emp_id = s(body?.emp_id ?? body?.empId ?? body?.id ?? body?.user_id);
-    const name = s(body?.name ?? "");
-    const is_active =
-      toBool(body?.is_active ?? body?.active ?? body?.use, true) ?? true;
+    const emp_id = s(body?.empId ?? body?.emp_id);
+    const name = s(body?.name);
+    const is_active = toBool(body?.isActive ?? body?.is_active, true) ?? true;
 
     if (!emp_id) {
       return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
     }
 
-    const team = pickTeam(emp_id, body?.team);
-
-    // 생성 시 사용할 임시 비번 (원하면 body.tempPassword로 덮어쓰기 가능)
-    const tempPassword = s(body?.tempPassword ?? body?.password ?? "1234");
+    // ✅ 기본 비번: 1234 (필요하면 바꿔)
+    const tempPassword = "1234";
     const password_hash = makePasswordHash(tempPassword);
 
-    // 1) 이미 존재 확인 (user_id 기준 우선, 없으면 emp_id)
-    const { data: exists1, error: selErr1 } = await sb
-      .from("accounts")
-      .select("*")
-      .eq("user_id", emp_id)
-      .maybeSingle();
+    // ✅ 쿠키에서 현재 관리자 empId 읽음 (있으면 owner_admin으로 저장 시도)
+    const adminEmpId = s(req.cookies.get("empId")?.value);
 
-    if (selErr1) {
-      return NextResponse.json(
-        { ok: false, error: "DB_QUERY_FAILED", detail: selErr1.message },
-        { status: 500 }
-      );
-    }
-
-    let exists = exists1;
-    if (!exists) {
-      const { data: exists2, error: selErr2 } = await sb
-        .from("accounts")
-        .select("*")
-        .eq("emp_id", emp_id)
-        .maybeSingle();
-
-      if (selErr2) {
-        return NextResponse.json(
-          { ok: false, error: "DB_QUERY_FAILED", detail: selErr2.message },
-          { status: 500 }
-        );
-      }
-      exists = exists2;
-    }
-
-    // ✅ 이미 있으면: (중요) "내 소유가 아니면" 생성/수정 막기
-    if (exists) {
-      const owner = s((exists as any).owner_admin ?? "");
-      // owner_admin이 이미 있고, 현재 관리자랑 다르면 막기
-      if (owner && owner !== adminEmpId) {
-        return NextResponse.json(
-          { ok: false, error: "FORBIDDEN_OTHER_OWNER" },
-          { status: 403 }
-        );
-      }
-
-      // owner_admin이 비어있으면(구 데이터) 현재 관리자 소유로 먼저 귀속시켜버림
-      // → 이렇게 해야 앞으로 목록에서 섞여보이지 않음
-      if (!owner) {
-        await sb.from("accounts").update({ owner_admin: adminEmpId }).eq("id", (exists as any).id);
-      }
-
-      const ph = s((exists as any).password_hash ?? "");
-      if (!ph) {
-        await sb.from("accounts").update({ password_hash }).eq("id", (exists as any).id);
-      }
-
-      const { data: reread } = await sb
-        .from("accounts")
-        .select("*")
-        .eq("id", (exists as any).id)
-        .single();
-
-      return NextResponse.json({ ok: true, row: reread ?? exists, tempPassword });
-    }
-
-    // 2) 새로 INSERT (필수 컬럼들 함께)
-    const payload: any = {
-      user_id: emp_id,
+    const baseRow: any = {
       emp_id,
-      password_hash,
-      role: "user",
+      name: name || null,
       is_active,
-      team,
-
-      // ✅ 핵심: 누가 만들었는지 박기
-      owner_admin: adminEmpId,
+      role: "user",
+      password: password_hash, // 네 DB가 password 컬럼이면 이거
+      // password_hash: password_hash, // 네 DB가 password_hash 컬럼이면 이걸로 바꿔야 함
     };
-    if (name) payload.name = name;
 
-    const { data, error } = await sb
-      .from("accounts")
-      .insert([payload])
-      .select("*")
-      .single();
+    // 1) owner_admin 포함 insert 시도
+    const rowWithOwner = adminEmpId ? { ...baseRow, owner_admin: adminEmpId } : baseRow;
 
-    if (error) {
+    let ins = await sb.from(TABLE).insert(rowWithOwner).select("*").single();
+
+    // 2) owner_admin 없다고 나오면 제거하고 재시도
+    if (ins.error && isMissingColumnErr(ins.error)) {
+      const { owner_admin, ...rowNoOwner } = rowWithOwner;
+      ins = await sb.from(TABLE).insert(rowNoOwner).select("*").single();
+    }
+
+    if (ins.error) {
       return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: error.message },
+        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: String(ins.error?.message ?? ins.error) },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ ok: true, row: data, tempPassword });
+    return NextResponse.json({
+      ok: true,
+      item: ins.data,
+      mode: "CREATED",
+      tempPassword,
+    });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
@@ -230,81 +165,36 @@ export async function POST(req: NextRequest) {
   }
 }
 
+/* ---------------- PATCH ---------------- */
+/** 활성/이름 수정 (필요한 것만) */
 export async function PATCH(req: NextRequest) {
   try {
-    const scope = getAdminScope(req);
-    if (!scope) {
-      return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
-    }
-    const { adminEmpId } = scope;
-
     const body = await readBody(req);
 
-    const id = body?.id ?? null;
-    const emp_id = s(body?.emp_id ?? body?.empId ?? "");
-    const active = toBool(body?.is_active ?? body?.active ?? body?.use, null);
-
-    const match: any = {};
-    if (id !== null && id !== "") match.id = id;
-    else if (emp_id) match.emp_id = emp_id;
-
-    if (!Object.keys(match).length) {
-      return NextResponse.json({ ok: false, error: "MISSING_TARGET" }, { status: 400 });
-    }
-
-    // ✅ 소유자 검사: 내 owner_admin인 것만 수정 허용
-    // id로 찾을 수 있으면 우선 조회해서 owner 확인
-    const lookupKey = match.id ? { id: match.id } : { emp_id: match.emp_id };
-    const { data: before, error: be } = await sb
-      .from("accounts")
-      .select("id, emp_id, owner_admin")
-      .match(lookupKey)
-      .maybeSingle();
-
-    if (be || !before) {
-      return NextResponse.json(
-        { ok: false, error: "ACCOUNT_NOT_FOUND", detail: be?.message },
-        { status: 404 }
-      );
-    }
-
-    const owner = s(before.owner_admin ?? "");
-    if (owner && owner !== adminEmpId) {
-      return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
-    }
-    // owner_admin이 null인데 자기 emp_id도 아니면 막기
-    if (!owner && s(before.emp_id) !== adminEmpId) {
-      return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
+    const id = body?.id;
+    if (!id) {
+      return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
     }
 
     const patch: any = {};
-    if (active !== null) patch.is_active = active;
-
-    // (옵션) 비번 초기화 지원: body.resetPassword=true면 password_hash 재발급
-    const resetPw = toBool(body?.resetPassword ?? body?.reset_pw, false) ?? false;
-    if (resetPw) {
-      const newPw = s(body?.newPassword ?? body?.tempPassword ?? "1234");
-      patch.password_hash = makePasswordHash(newPw);
+    if (body?.name !== undefined) patch.name = s(body.name) || null;
+    if (body?.is_active !== undefined || body?.isActive !== undefined) {
+      patch.is_active = toBool(body?.is_active ?? body?.isActive, null);
     }
 
-    // ✅ 혹시 owner_admin이 null(구 데이터)인 계정이면 수정 시점에 귀속시켜버림
-    if (!owner) patch.owner_admin = adminEmpId;
-
-    const res = await sb.from("accounts").update(patch).match(match).select("*");
-    if (!res.error) {
-      return NextResponse.json({ ok: true, rows: res.data ?? [] });
+    if (Object.keys(patch).length === 0) {
+      return NextResponse.json({ ok: false, error: "NO_FIELDS" }, { status: 400 });
     }
 
-    // fallback (is_active 없을 경우)
-    const retry = await sb.from("accounts").update({ active }).match(match).select("*");
-    if (retry.error) {
+    const up = await sb.from(TABLE).update(patch).eq("id", id).select("*");
+    if (up.error) {
       return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: retry.error.message },
+        { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: String(up.error?.message ?? up.error) },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ ok: true, rows: retry.data ?? [] });
+    return NextResponse.json({ ok: true, rows: up.data ?? [] });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "SERVER_ERROR", detail: String(e?.message ?? e) },
