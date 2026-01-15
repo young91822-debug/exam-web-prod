@@ -6,11 +6,11 @@ import React, { useEffect, useMemo, useState } from "react";
 type Account = any;
 
 type ListResp =
-  | { ok: true; items: Account[] }
+  | { ok: true; rows: Account[] }
   | { ok: false; error: string; detail?: any };
 
 type PostResp =
-  | { ok: true; item: Account; mode?: string; tempPassword?: string; marker?: string }
+  | { ok: true; row: Account; mode?: string; tempPassword?: string; marker?: string }
   | { ok: false; error: string; detail?: any };
 
 function s(v: any) {
@@ -41,7 +41,8 @@ export default function AdminAccountsPage() {
         return;
       }
 
-      setItems(Array.isArray((json as any).items) ? (json as any).items : []);
+      // ✅ 서버 응답은 rows
+      setItems(Array.isArray((json as any).rows) ? (json as any).rows : []);
     } catch (e: any) {
       setItems([]);
       setErr(String(e?.message ?? e));
@@ -87,20 +88,19 @@ export default function AdminAccountsPage() {
         return;
       }
 
+      // ✅ 서버 응답은 row
       const createdEmpId =
-        (json as any)?.item?.emp_id ??
-        (json as any)?.item?.empId ??
+        (json as any)?.row?.emp_id ??
+        (json as any)?.row?.empId ??
         payload.empId;
 
       const tempPw = (json as any)?.tempPassword;
 
-      // ✅ 여기서 undefined 안 뜨게 보장
       setMsg(`생성 완료: ${createdEmpId}${tempPw ? ` (기본비번: ${tempPw})` : ""}`);
 
       // ✅ 생성 후 목록 다시 불러오기
       await load();
 
-      // 입력값 일부 초기화(원하면 빼도 됨)
       setEmpId("");
       setName("");
       setIsActive(true);
@@ -116,13 +116,29 @@ export default function AdminAccountsPage() {
       <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 12 }}>응시자 계정 관리</h2>
 
       {err ? (
-        <div style={{ background: "#ffecec", color: "#b40000", padding: 12, borderRadius: 10, marginBottom: 12 }}>
+        <div
+          style={{
+            background: "#ffecec",
+            color: "#b40000",
+            padding: 12,
+            borderRadius: 10,
+            marginBottom: 12,
+          }}
+        >
           에러: {err}
         </div>
       ) : null}
 
       {msg ? (
-        <div style={{ background: "#e9f8ee", color: "#116b2b", padding: 12, borderRadius: 10, marginBottom: 12 }}>
+        <div
+          style={{
+            background: "#e9f8ee",
+            color: "#116b2b",
+            padding: 12,
+            borderRadius: 10,
+            marginBottom: 12,
+          }}
+        >
           {msg}
         </div>
       ) : null}
@@ -236,7 +252,7 @@ export default function AdminAccountsPage() {
                   <div style={{ wordBreak: "break-all" }}>{String(it?.id ?? "-")}</div>
                   <div>{String(it?.emp_id ?? it?.empId ?? "-")}</div>
                   <div>{String(it?.name ?? it?.display_name ?? it?.fullname ?? it?.username ?? "-")}</div>
-                  <div>{it?.is_active ? "사용" : "미사용"}</div>
+                  <div>{(it?.is_active ?? it?._active) ? "사용" : "미사용"}</div>
                   <div>{String(it?.created_at ?? it?.createdAt ?? "-")}</div>
                 </div>
               ))
