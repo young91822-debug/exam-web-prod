@@ -1,10 +1,10 @@
 ﻿// app/login/page.tsx
-export const dynamic = "force-dynamic";
-
 "use client";
 
 import React, { useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+
+export const dynamic = "force-dynamic";
 
 type LoginOk = { ok: true; empId: string; role: string; name?: string; redirect?: string };
 type LoginFail = { ok: false; error: string; detail?: any };
