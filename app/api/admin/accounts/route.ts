@@ -42,47 +42,43 @@ async function readBody(req: Request) {
   }
 }
 
-/** "column ... does not exist" 류 판단 */
-function isMissingColumnErr(err: any) {
-  const msg = String(err?.message ?? err ?? "");
-  return msg.includes("does not exist") && msg.includes("column");
+/** owner_admin 컬럼 관련 "없음" 에러 전부 캐치 (does not exist / schema cache 포함) */
+function isMissingOwnerAdminColumn(err: any) {
+  const msg = String(err?.message ?? err ?? "").toLowerCase();
+  // 예: "column accounts.owner_admin does not exist"
+  // 예: "Could not find the 'owner_admin' column of 'accounts' in the schema cache"
+  return (
+    msg.includes("owner_admin") &&
+    (msg.includes("does not exist") ||
+      msg.includes("schema cache") ||
+      msg.includes("could not find the") ||
+      msg.includes("column") ||
+      msg.includes("not find"))
+  );
 }
-
-/**
- * owner_admin 컬럼이 없는 DB에서도 동작하게:
- * - 먼저 owner_admin 포함 select/insert 시도
- * - 없다고 나오면 자동으로 owner_admin 제거해서 재시도
- */
 
 /* ---------------- GET ---------------- */
 /** 목록 */
 export async function GET(req: NextRequest) {
   try {
-    // ✅ (선택) 관리자 empId를 쿠키에서 읽어둠 - 나중에 분리 시 사용 가능
-    const adminEmpId = s(req.cookies.get("empId")?.value);
+    // (선택) 관리자 empId - 나중에 필터링용
+    // const adminEmpId = s(req.cookies.get("empId")?.value);
 
-    // 1) owner_admin 포함해서 먼저 시도
+    // 1) owner_admin 포함 시도
     let q1 = sb
       .from(TABLE)
-      .select(
-        "id, emp_id, name, is_active, created_at, role, owner_admin",
-        { count: "exact" }
-      )
+      .select("id, emp_id, name, is_active, created_at, role, owner_admin")
       .order("id", { ascending: false });
-
-    // ✅ 나중에 “내가 만든 계정만” 보이게 하고 싶으면 여기서 필터 걸면 됨
-    // q1 = q1.eq("owner_admin", adminEmpId);
 
     let { data, error } = await q1;
 
-    // 2) owner_admin 컬럼이 없으면 fallback
-    if (error && isMissingColumnErr(error)) {
-      const q2 = sb
+    // 2) owner_admin 컬럼 없으면 fallback
+    if (error && isMissingOwnerAdminColumn(error)) {
+      const r2 = await sb
         .from(TABLE)
-        .select("id, emp_id, name, is_active, created_at, role", { count: "exact" })
+        .select("id, emp_id, name, is_active, created_at, role")
         .order("id", { ascending: false });
 
-      const r2 = await q2;
       data = r2.data;
       error = r2.error;
     }
@@ -117,11 +113,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
     }
 
-    // ✅ 기본 비번: 1234 (필요하면 바꿔)
+    // ✅ 기본 비번
     const tempPassword = "1234";
     const password_hash = makePasswordHash(tempPassword);
 
-    // ✅ 쿠키에서 현재 관리자 empId 읽음 (있으면 owner_admin으로 저장 시도)
+    // ✅ 쿠키에서 현재 관리자 empId (있으면 owner_admin으로 저장 시도)
     const adminEmpId = s(req.cookies.get("empId")?.value);
 
     const baseRow: any = {
@@ -133,20 +129,23 @@ export async function POST(req: NextRequest) {
       // password_hash: password_hash, // 네 DB가 password_hash 컬럼이면 이걸로 바꿔야 함
     };
 
-    // 1) owner_admin 포함 insert 시도
+    // 1) owner_admin 포함해서 insert 시도
     const rowWithOwner = adminEmpId ? { ...baseRow, owner_admin: adminEmpId } : baseRow;
-
     let ins = await sb.from(TABLE).insert(rowWithOwner).select("*").single();
 
-    // 2) owner_admin 없다고 나오면 제거하고 재시도
-    if (ins.error && isMissingColumnErr(ins.error)) {
+    // 2) owner_admin 컬럼 없으면 제거하고 재시도
+    if (ins.error && isMissingOwnerAdminColumn(ins.error)) {
       const { owner_admin, ...rowNoOwner } = rowWithOwner;
       ins = await sb.from(TABLE).insert(rowNoOwner).select("*").single();
     }
 
     if (ins.error) {
       return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: String(ins.error?.message ?? ins.error) },
+        {
+          ok: false,
+          error: "ACCOUNTS_INSERT_FAILED",
+          detail: String(ins.error?.message ?? ins.error),
+        },
         { status: 500 }
       );
     }
@@ -166,12 +165,11 @@ export async function POST(req: NextRequest) {
 }
 
 /* ---------------- PATCH ---------------- */
-/** 활성/이름 수정 (필요한 것만) */
 export async function PATCH(req: NextRequest) {
   try {
     const body = await readBody(req);
-
     const id = body?.id;
+
     if (!id) {
       return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
     }
