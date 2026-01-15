@@ -1,5 +1,5 @@
 // app/api/auth/login/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
@@ -11,10 +11,10 @@ function s(v: any) {
 }
 
 /** stored 포맷: scrypt$<saltB64>$<hashB64> */
-function verifyScryptHash(plain: string, stored: string) {
+function verifyPasswordHash(plain: string, stored: string) {
   try {
     const [algo, saltB64, hashB64] = String(stored || "").split("$");
-    if (algo !== "scrypt") return false;
+    if (algo !== "scrypt" || !saltB64 || !hashB64) return false;
 
     const salt = Buffer.from(saltB64, "base64");
     const expected = Buffer.from(hashB64, "base64");
@@ -29,153 +29,127 @@ function verifyScryptHash(plain: string, stored: string) {
   }
 }
 
-function makeScryptHash(plain: string) {
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(plain, salt, 64);
-  return `scrypt$${salt.toString("base64")}$${hash.toString("base64")}`;
-}
-
-async function readBody(req: Request) {
+/**
+ * body를 "뭐로 보내든" 최대한 읽어준다:
+ * - JSON
+ * - text(JSON 문자열)
+ * - x-www-form-urlencoded
+ * - multipart/form-data
+ */
+async function readBodyAny(req: NextRequest): Promise<any> {
+  // 1) JSON 우선
   try {
     return await req.json();
-  } catch {
+  } catch {}
+
+  // 2) form-data
+  try {
+    const fd = await req.formData();
+    const obj: any = {};
+    fd.forEach((v, k) => (obj[k] = v));
+    if (Object.keys(obj).length) return obj;
+  } catch {}
+
+  // 3) text / urlencoded
+  try {
+    const t = await req.text();
+    if (!t) return {};
+    // JSON string
     try {
-      const t = await req.text();
-      return t ? JSON.parse(t) : {};
-    } catch {
-      return {};
-    }
+      return JSON.parse(t);
+    } catch {}
+    // x-www-form-urlencoded
+    const params = new URLSearchParams(t);
+    const obj: any = {};
+    params.forEach((v, k) => (obj[k] = v));
+    return obj;
+  } catch {
+    return {};
   }
 }
 
-function setCookie(res: any, name: string, value: string, maxAgeSec = 60 * 60 * 24 * 7) {
-  // Vercel/https 환경 고려: SameSite=Lax, Secure
-  const v = encodeURIComponent(value);
-  res.headers.append(
-    "Set-Cookie",
-    `${name}=${v}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; SameSite=Lax; Secure`
-  );
-}
+const ADMIN_IDS = new Set(["admin", "admin_gs"]); // 필요하면 추가
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
-    const body = await readBody(req);
+    const body = await readBodyAny(req);
 
-    // 프론트가 id/pw 또는 empId/password 등으로 보낼 수 있어서 다 수용
-    const id = s(body?.id ?? body?.empId ?? body?.emp_id ?? body?.user_id ?? body?.userId);
-    const pw = s(body?.pw ?? body?.password ?? body?.pass);
+    // ✅ 여러 키 형태 전부 허용
+    const id = s(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id ?? body?.username ?? body?.loginId);
+    const pw = s(body?.pw ?? body?.password ?? body?.pass ?? body?.pwd);
 
     if (!id || !pw) {
-      return NextResponse.json({ ok: false, error: "MISSING_FIELDS" }, { status: 400 });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "MISSING_FIELDS",
+          detail: {
+            gotKeys: Object.keys(body || {}),
+            idPreview: id ? id.slice(0, 2) + "***" : "",
+            pwLength: pw ? pw.length : 0,
+          },
+        },
+        { status: 400 }
+      );
     }
 
-    // 1) 계정 조회: emp_id 우선, 없으면 user_id로도 시도
-    let row: any = null;
+    const sb: any = supabaseAdmin;
 
-    const q1 = await supabaseAdmin
+    // ✅ 계정 조회
+    const { data, error } = await sb
       .from(TABLE)
       .select("*")
-      .eq("emp_id", id)
+      .eq("user_id", id)
       .maybeSingle();
 
-    if (q1.error) {
+    if (error) {
       return NextResponse.json(
-        { ok: false, error: "ACCOUNTS_QUERY_FAILED", detail: q1.error },
+        { ok: false, error: "DB_READ_FAILED", detail: String(error?.message ?? error) },
         { status: 500 }
       );
     }
-    row = q1.data;
 
-    if (!row) {
-      const q2 = await supabaseAdmin
-        .from(TABLE)
-        .select("*")
-        .eq("user_id", id)
-        .maybeSingle();
-
-      if (q2.error) {
-        return NextResponse.json(
-          { ok: false, error: "ACCOUNTS_QUERY_FAILED", detail: q2.error },
-          { status: 500 }
-        );
-      }
-      row = q2.data;
+    if (!data) {
+      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    if (!row) {
-      // ✅ 여기서 INVALID_CREDENTIALS 대신 명확히
-      return NextResponse.json({ ok: false, error: "USER_NOT_FOUND" }, { status: 401 });
-    }
-
-    // 2) 활성여부(컬럼명이 여러 버전일 수 있어서 유연하게)
+    // ✅ 활성 체크(컬럼명이 다를 수도 있어서 방어)
     const isActive =
-      row?.is_active ?? row?.active ?? row?.enabled ?? true;
-
-    if (isActive === false) {
-      return NextResponse.json({ ok: false, error: "USER_INACTIVE" }, { status: 401 });
+      data?.is_active === undefined || data?.is_active === null ? true : Boolean(data.is_active);
+    if (!isActive) {
+      return NextResponse.json({ ok: false, error: "INACTIVE_ACCOUNT" }, { status: 403 });
     }
 
-    // 3) 저장된 비번 찾기 (여러 컬럼 후보)
-    const stored =
-      s(row?.password_hash) ||
-      s(row?.password) ||
-      s(row?.pw_hash) ||
-      s(row?.pw) ||
-      "";
+    // ✅ 비번 검증: password_hash 우선, 없으면 password(평문) fallback (초기세팅용)
+    const storedHash = s(data?.password_hash);
+    const storedPlain = s(data?.password);
 
-    if (!stored) {
-      return NextResponse.json({ ok: false, error: "PASSWORD_NOT_SET" }, { status: 401 });
-    }
-
-    // 4) 검증 로직
-    // - scrypt$...면 해시검증
-    // - 아니면 "평문/레거시"로 보고 직접 비교
-    let ok = false;
-    let needsUpgrade = false;
-
-    if (stored.startsWith("scrypt$")) {
-      ok = verifyScryptHash(pw, stored);
-    } else {
-      // ✅ 레거시/평문 호환
-      ok = crypto.timingSafeEqual(Buffer.from(pw), Buffer.from(stored));
-      if (ok) needsUpgrade = true;
-    }
+    const ok =
+      (storedHash && verifyPasswordHash(pw, storedHash)) ||
+      (!!storedPlain && pw === storedPlain);
 
     if (!ok) {
       return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    // 5) 레거시면 자동 업그레이드(가능한 컬럼에 해시로 저장)
-    if (needsUpgrade) {
-      const newHash = makeScryptHash(pw);
+    // ✅ role 결정
+    const role = ADMIN_IDS.has(id) ? "admin" : "user";
+    const team = s(data?.team ?? "");
 
-      // 업데이트 시도: password_hash가 있으면 거기, 아니면 password에 저장
-      // (컬럼이 없으면 실패할 수 있으니 실패해도 로그인은 통과시키고 넘어감)
-      const patch: any = {};
-      if (row?.password_hash !== undefined) patch.password_hash = newHash;
-      else if (row?.password !== undefined) patch.password = newHash;
-      else patch.password = newHash;
+    const res = NextResponse.json({ ok: true, role, empId: id, team });
 
-      if (Object.keys(patch).length) {
-        await supabaseAdmin.from(TABLE).update(patch).eq("id", row.id);
-      }
-    }
+    // ✅ 쿠키 세팅(실서버 https 기준)
+    const cookieOpts = {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax" as const,
+      path: "/",
+      maxAge: 60 * 60 * 12, // 12h
+    };
 
-    // 6) role 결정 (없으면 admin_gs/admin은 admin으로 강제)
-    const empId = s(row?.emp_id ?? row?.user_id ?? id);
-    let role = s(row?.role) || "user";
-    if (empId === "admin" || empId === "admin_gs") role = "admin";
-
-    const res = NextResponse.json({
-      ok: true,
-      empId,
-      role,
-      name: s(row?.name),
-      redirect: role === "admin" ? "/admin" : "/exam",
-    });
-
-    setCookie(res, "empId", empId);
-    setCookie(res, "role", role);
+    res.cookies.set("empId", id, cookieOpts);
+    res.cookies.set("role", role, cookieOpts);
+    if (team) res.cookies.set("team", team, cookieOpts);
 
     return res;
   } catch (e: any) {
