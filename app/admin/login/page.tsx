@@ -1,18 +1,18 @@
-// app/login/page.tsx
+// app/admin/login/page.tsx
 "use client";
 
 import React, { useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-type LoginResp =
-  | { ok: true; empId: string; role: string; name?: string; redirect?: string }
-  | { ok: false; error: string; detail?: any };
+type LoginOk = { ok: true; empId: string; role: string; name?: string; redirect?: string };
+type LoginFail = { ok: false; error: string; detail?: any };
+type LoginResp = LoginOk | LoginFail;
 
 function s(v: any) {
   return String(v ?? "").trim();
 }
 
-export default function LoginPage() {
+export default function AdminLoginPage() {
   const router = useRouter();
   const sp = useSearchParams();
   const next = s(sp.get("next")) || "";
@@ -28,7 +28,6 @@ export default function LoginPage() {
 
     const id2 = s(id);
     const pw2 = s(pw);
-
     if (!id2 || !pw2) {
       setMsg("아이디/비밀번호를 입력하세요.");
       return;
@@ -44,25 +43,31 @@ export default function LoginPage() {
       });
 
       const text = await res.text();
-      const json: LoginResp = text ? JSON.parse(text) : (null as any);
+      const json: LoginResp = text ? JSON.parse(text) : ({ ok: false, error: "EMPTY_RESPONSE" } as any);
 
-      if (!res.ok || !json?.ok) {
+      // ✅ 실패 처리 (여기서만 error 접근)
+      if (!res.ok || !json.ok) {
+        const errCode = (json as LoginFail)?.error || `HTTP_${res.status}`;
+
         setMsg(
-          json?.error === "USER_NOT_FOUND"
+          errCode === "USER_NOT_FOUND"
             ? "계정이 없습니다."
-            : json?.error === "PASSWORD_NOT_SET"
+            : errCode === "PASSWORD_NOT_SET"
             ? "비밀번호가 설정되지 않았습니다."
-            : json?.error === "USER_INACTIVE"
+            : errCode === "USER_INACTIVE"
             ? "비활성 계정입니다."
+            : errCode === "MISSING_FIELDS"
+            ? "아이디/비밀번호를 입력하세요."
             : "로그인 실패: 아이디/비밀번호를 확인하세요."
         );
         return;
       }
 
       // ✅ 성공 시 이동
+      const ok = json as LoginOk;
       const redirect =
-        s((json as any)?.redirect) ||
-        (next ? next : json.role === "admin" ? "/admin" : "/exam");
+        s(ok.redirect) ||
+        (next ? next : ok.role === "admin" ? "/admin" : "/exam");
 
       router.replace(redirect);
       router.refresh();
