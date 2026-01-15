@@ -1,108 +1,113 @@
-﻿"use client";
+﻿// app/login/page.tsx
+"use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import React, { useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+
+type LoginOk = { ok: true; empId: string; role: string; name?: string; redirect?: string };
+type LoginFail = { ok: false; error: string; detail?: any };
+type LoginResp = LoginOk | LoginFail;
+
+function s(v: any) {
+  return String(v ?? "").trim();
+}
 
 export default function LoginPage() {
   const router = useRouter();
+  const sp = useSearchParams();
+  const next = s(sp.get("next")) || "";
 
-  const [loginId, setLoginId] = useState("");
-  const [password, setPassword] = useState("");
-  const [msg, setMsg] = useState<string | null>(null);
+  const [id, setId] = useState("");
+  const [pw, setPw] = useState("");
   const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState("");
 
-  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+  async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (loading) return; // ✅ 중복 클릭 방지
+    setMsg("");
 
-    setMsg(null);
+    const id2 = s(id);
+    const pw2 = s(pw);
+
+    if (!id2 || !pw2) {
+      setMsg("아이디/비밀번호를 입력하세요.");
+      return;
+    }
+
     setLoading(true);
-
     try {
-      const r = await fetch("/api/auth/login", {
+      const res = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ loginId, password }),
-        credentials: "include",
         cache: "no-store",
+        body: JSON.stringify({ id: id2, pw: pw2 }),
       });
 
-      const j = await r.json().catch(() => null);
+      const text = await res.text();
+      const json: LoginResp = text ? JSON.parse(text) : ({ ok: false, error: "EMPTY_RESPONSE" } as any);
 
-      if (!r.ok || !j?.ok) {
-        setMsg("로그인 실패: 아이디/비밀번호를 확인하세요.");
+      if (!res.ok || !json.ok) {
+        const errCode = (json as LoginFail)?.error || `HTTP_${res.status}`;
+        setMsg(
+          errCode === "USER_NOT_FOUND"
+            ? "계정이 없습니다."
+            : errCode === "PASSWORD_NOT_SET"
+            ? "비밀번호가 설정되지 않았습니다."
+            : errCode === "USER_INACTIVE"
+            ? "비활성 계정입니다."
+            : errCode === "MISSING_FIELDS"
+            ? "아이디/비밀번호를 입력하세요."
+            : "로그인 실패: 아이디/비밀번호를 확인하세요."
+        );
         return;
       }
 
-      // ✅ 성공: 쿠키 반영 확실하게 하려고 강제 이동 권장
-      const target = j.role === "admin" || j.empId === "admin" ? "/admin" : "/exam";
+      const ok = json as LoginOk;
+      const redirect =
+        s(ok.redirect) ||
+        (next ? next : ok.role === "admin" ? "/admin" : "/exam");
 
-      // 1) 제일 확실한 방법 (추천)
-      window.location.href = target;
-
-      // 2) router를 쓰고 싶으면 이걸로 (강제 이동 대신)
-      // router.replace(target);
-      // router.refresh();
-    } catch (err) {
-      setMsg("로그인 오류: 서버 상태를 확인하세요.");
+      router.replace(redirect);
+      router.refresh();
+    } catch (err: any) {
+      setMsg(String(err?.message ?? err));
     } finally {
-      // ✅ 성공/실패/에러 모두 로딩 해제
       setLoading(false);
     }
   }
 
   return (
-    <div style={{ maxWidth: 420, margin: "80px auto", padding: 20 }}>
-      <h1 style={{ fontSize: 22, fontWeight: 800, marginBottom: 16 }}>로그인</h1>
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <form onSubmit={onSubmit} className="w-full max-w-sm space-y-4">
+        <h1 className="text-2xl font-bold text-center">로그인</h1>
 
-      <form onSubmit={onSubmit} style={{ display: "grid", gap: 10 }}>
-        <input
-          value={loginId}
-          onChange={(e) => setLoginId(e.target.value)}
-          placeholder="아이디"
-          autoComplete="username"
-          style={{
-            width: "100%",
-            padding: 12,
-            border: "1px solid #ddd",
-            borderRadius: 10,
-            outline: "none",
-          }}
-        />
-
-        <input
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="비밀번호"
-          type="password"
-          autoComplete="current-password"
-          style={{
-            width: "100%",
-            padding: 12,
-            border: "1px solid #ddd",
-            borderRadius: 10,
-            outline: "none",
-          }}
-        />
+        <div className="space-y-2">
+          <input
+            value={id}
+            onChange={(e) => setId(e.target.value)}
+            placeholder="아이디"
+            className="w-full border rounded px-3 py-2"
+            autoComplete="username"
+          />
+          <input
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+            placeholder="비밀번호"
+            type="password"
+            className="w-full border rounded px-3 py-2"
+            autoComplete="current-password"
+          />
+        </div>
 
         <button
           type="submit"
           disabled={loading}
-          style={{
-            padding: 12,
-            borderRadius: 10,
-            border: 0,
-            cursor: loading ? "not-allowed" : "pointer",
-            fontWeight: 800,
-            opacity: loading ? 0.6 : 1,
-          }}
+          className="w-full rounded px-3 py-2 border bg-gray-100 hover:bg-gray-200 disabled:opacity-50"
         >
           {loading ? "로그인 중..." : "로그인"}
         </button>
 
-        {msg ? (
-          <div style={{ color: "crimson", fontSize: 13, marginTop: 6 }}>{msg}</div>
-        ) : null}
+        {msg ? <div className="text-sm text-red-600">{msg}</div> : null}
       </form>
     </div>
   );
