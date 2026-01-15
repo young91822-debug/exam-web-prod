@@ -18,14 +18,13 @@ function isUUIDStr(v: any) {
   const t = s(v);
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
 }
-/** question id는 숫자(bigint) 또는 UUID 둘 다 허용 */
 function isValidQid(v: any) {
   return isNumericIdStr(v) || isUUIDStr(v);
 }
 function normQid(v: any) {
   const t = s(v);
   if (isNumericIdStr(t)) return Number(t);
-  return t; // uuid면 string 유지
+  return t;
 }
 
 function pickChoices(q: any): string[] {
@@ -53,7 +52,6 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
-/** attempt에 저장돼 있을 수 있는 문제목록(숫자/UUID) 최대한 찾아봄 */
 function pickAttemptQuestionIds(attempt: any): string[] {
   const cands = [
     attempt?.question_ids,
@@ -76,7 +74,6 @@ function pickAttemptQuestionIds(attempt: any): string[] {
       const t = v.trim();
       if (!t) continue;
 
-      // JSON 배열 가능
       try {
         const parsed = JSON.parse(t);
         if (Array.isArray(parsed)) {
@@ -85,7 +82,6 @@ function pickAttemptQuestionIds(attempt: any): string[] {
         }
       } catch {}
 
-      // 콤마 문자열 가능
       if (t.includes(",")) {
         const out = t.split(",").map((x) => s(x)).filter((x) => isValidQid(x));
         if (out.length) return out;
@@ -96,7 +92,6 @@ function pickAttemptQuestionIds(attempt: any): string[] {
   return [];
 }
 
-/** attempt.answers(맵 형태)에서 qid/선택값 뽑기 (키는 question_id 문자열) */
 function pickAttemptAnswersMap(attempt: any): Map<string, number> {
   const m = new Map<string, number>();
   const raw = attempt?.answers;
@@ -131,12 +126,8 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
     const { attemptId: raw } = await context.params;
     const attemptIdStr = s(raw);
 
-    if (!attemptIdStr) {
-      return NextResponse.json({ ok: false, error: "MISSING_ATTEMPT_ID" }, { status: 400 });
-    }
-    if (!isNumericIdStr(attemptIdStr)) {
-      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
-    }
+    if (!attemptIdStr) return NextResponse.json({ ok: false, error: "MISSING_ATTEMPT_ID" }, { status: 400 });
+    if (!isNumericIdStr(attemptIdStr)) return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
 
     const attemptId = Number(attemptIdStr);
 
@@ -153,15 +144,9 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
         { status: 500 }
       );
     }
-    if (!attempt) {
-      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
-    }
+    if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
 
-    /**
-     * 2) 답변 소스 우선순위
-     *  - exam_answers(attempt_id)에서 question_id/selected_index 읽기
-     *  - 없으면 attempt.answers(JSON) fallback
-     */
+    // 2) answers
     const ansMap = new Map<string, number>();
 
     const { data: answers, error: eAns } = await supabaseAdmin
@@ -193,14 +178,9 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
       }
     }
 
-    /**
-     * 3) 문제 목록(qids) 만들기
-     *  - attempt에 저장된 문제목록을 우선 사용(전체 20문항 유지)
-     *  - 없으면 "답이 있는 문제만"이라도 표시
-     */
+    // 3) qids
     const attemptQids = pickAttemptQuestionIds(attempt);
     const qids = attemptQids.length > 0 ? attemptQids : Array.from(ansMap.keys());
-
     const uniqQidsStr = Array.from(new Set(qids.map((x) => s(x)).filter((x) => isValidQid(x))));
 
     if (!uniqQidsStr.length) {
@@ -212,22 +192,22 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
           started_at: attempt.started_at,
           submitted_at: attempt.submitted_at,
           total_questions: attempt.total_questions,
-          total_points: attempt.total_points,
-          score: attempt.score ?? 0,
-          correct_count: attempt.correct_count ?? 0,
           status: attempt.status,
           answers_source: answersSource,
+          score: 0,
+          total_points: 0,
+          correct_count: 0,
         },
         graded: [],
         totalQuestions: 0,
         wrongCount: 0,
+        totalPoints: 0,
       });
     }
 
-    // ✅ 질문 조회용 id는 숫자면 Number로, uuid면 string으로 변환
     const uniqQidsQuery = uniqQidsStr.map(normQid);
 
-    // 4) questions 조회
+    // 4) questions
     const { data: questions, error: eQ } = await supabaseAdmin
       .from("questions")
       .select("*")
@@ -240,18 +220,21 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
       );
     }
 
-    // questions.id도 숫자/uuid 섞일 수 있으니 문자열키로 관리
     const qById = new Map<string, any>();
     for (const q of questions ?? []) qById.set(s((q as any)?.id), q);
 
-    // 5) graded 구성
+    // 5) graded + 총점 계산
     let score = 0;
     let correctCount = 0;
+    let totalPoints = 0;
 
     const graded = uniqQidsStr
       .map((qidStr) => {
         const q = qById.get(s(qidStr));
         if (!q) return null;
+
+        const pts = n(q?.points, 0) ?? 0;
+        totalPoints += pts;
 
         const correctIndex = pickCorrectIndex(q);
         const chosen = ansMap.has(qidStr) ? ansMap.get(qidStr)! : null;
@@ -263,7 +246,6 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
           Number.isFinite(Number(chosen)) &&
           Number(correctIndex) === Number(chosen);
 
-        const pts = n(q?.points, 0) ?? 0;
         if (isCorrect) {
           score += pts;
           correctCount += 1;
@@ -288,16 +270,19 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
         emp_id: attempt.emp_id,
         started_at: attempt.started_at,
         submitted_at: attempt.submitted_at,
-        total_questions: attempt.total_questions,
-        total_points: attempt.total_points,
-        score,
-        correct_count: correctCount,
         status: attempt.status,
         answers_source: answersSource,
+        // ✅ 화면용으로 항상 내려줌
+        score,
+        total_points: totalPoints,
+        correct_count: correctCount,
+        total_questions: graded.length,
       },
       graded,
       totalQuestions: graded.length,
       wrongCount: graded.filter((g: any) => g?.isCorrect === false).length,
+      // ✅ 프론트가 이거 써도 됨
+      totalPoints,
     });
   } catch (err: any) {
     return NextResponse.json(
