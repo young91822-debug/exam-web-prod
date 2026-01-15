@@ -12,9 +12,35 @@ function n(v: any, d: number) {
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
 }
-function looksMissingColumn(err: any, col: string) {
+
+function isMissingColumn(err: any) {
   const msg = String(err?.message ?? err ?? "");
-  return msg.includes(col) && (msg.includes("does not exist") || msg.includes("schema cache"));
+  // PostgREST / Supabase에서 컬럼 없을 때 나오는 패턴들
+  return (
+    msg.includes("does not exist") ||
+    msg.includes("Could not find") ||
+    msg.includes("schema cache")
+  );
+}
+
+async function trySelect(
+  teamFilter: string | null,
+  from: number,
+  to: number,
+  selectExpr: string
+) {
+  let q = sb
+    .from("exam_attempts")
+    .select(selectExpr, { count: "exact" })
+    .order("submitted_at", { ascending: false })
+    .range(from, to);
+
+  if (teamFilter !== null) {
+    // team 포함 + empty/null도 포함 (너가 원래 원했던 동작)
+    q = q.or(`team.eq.${teamFilter},team.is.null,team.eq.`);
+  }
+
+  return await q;
 }
 
 export async function GET(req: NextRequest) {
@@ -33,116 +59,84 @@ export async function GET(req: NextRequest) {
     const from = (page - 1) * pageSize;
     const to = from + pageSize - 1;
 
-    // ✅ 팀 추정(필요하면 여기 규칙만 바꾸면 됨)
+    // ✅ 기본 팀 (admin_gs는 B, 그 외 A)
     const team = teamCookie || (empId === "admin_gs" ? "B" : "A");
 
-     const BASE_SELECT =
-  "id, emp_id, score, total_points, correct_count, wrong_count, started_at, submitted_at, total_questions, team";
+    // ✅ “있을 수도 있는 컬럼들”을 후보로 둔다
+    // - total_points 가 없어서 지금 터진 상태라, 여기서는 후보로만 두고
+    // - 실제 select에서 실패하면 자동으로 빼고 재시도한다
+    const selectCandidates = [
+      "id",
+      "emp_id",
+      "score",
+      "started_at",
+      "submitted_at",
+      "total_questions",
+      "team",
+      "status",
+      "total_points",
+      "correct_count",
+      "wrong_count",
+    ];
 
+    // 1차: 최대한 많이 포함해서 시도
+    let cols = [...selectCandidates];
+    let lastErr: any = null;
 
-    // 1) owner_admin 있으면 최우선
-    {
-      const q = sb
-        .from("exam_attempts")
-        .select(BASE_SELECT + ", owner_admin", { count: "exact" })
-        .eq("owner_admin", empId)
-        .order("submitted_at", { ascending: false })
-        .range(from, to);
+    for (let tries = 0; tries < 12; tries++) {
+      const selectExpr = cols.join(",");
+      const r = await trySelect(team, from, to, selectExpr);
 
-      const { data, error, count } = await q;
-      if (!error) {
+      if (!r.error) {
         return NextResponse.json({
           ok: true,
-          mode: "FILTER_OWNER_ADMIN",
+          mode: "SAFE_SELECT_TEAM_PLUS_EMPTY",
           page,
           pageSize,
-          total: count ?? (data?.length ?? 0),
-          items: data ?? [],
-        });
-      }
-      if (!looksMissingColumn(error, "owner_admin")) {
-        return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(error?.message ?? error) }, { status: 500 });
-      }
-    }
-
-    // 2) team 컬럼 있으면 team으로 필터
-    // ✅ 단, 0건이면 "team IS NULL/''"도 포함해서 다시 조회 (지금 너 케이스 방지)
-    {
-      const q1 = sb
-        .from("exam_attempts")
-        .select(BASE_SELECT + ", team", { count: "exact" })
-        .eq("team", team)
-        .order("submitted_at", { ascending: false })
-        .range(from, to);
-
-      const r1 = await q1;
-      if (!r1.error) {
-        const total1 = r1.count ?? (r1.data?.length ?? 0);
-
-        if (total1 > 0) {
-          return NextResponse.json({
-            ok: true,
-            mode: "FILTER_TEAM_COLUMN",
-            page,
-            pageSize,
-            total: total1,
-            items: r1.data ?? [],
-          });
-        }
-
-        // ✅ 0건이면: team이 비어있는 데이터도 같이 보여주기
-        const q2 = sb
-          .from("exam_attempts")
-          .select(BASE_SELECT + ", team", { count: "exact" })
-          .or(`team.eq.${team},team.is.null,team.eq.`) // team==B OR NULL OR ''(빈문자열)
-          .order("submitted_at", { ascending: false })
-          .range(from, to);
-
-        const r2 = await q2;
-
-        // team 컬럼 자체는 있으니까, 여기서 에러나면 DB 문제
-        if (r2.error) {
-          return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(r2.error?.message ?? r2.error) }, { status: 500 });
-        }
-
-        return NextResponse.json({
-          ok: true,
-          mode: "FILTER_TEAM_PLUS_EMPTY",
-          page,
-          pageSize,
-          total: r2.count ?? (r2.data?.length ?? 0),
-          items: r2.data ?? [],
-          hint: "team 값이 NULL/빈문자열로 저장된 응시가 있어 team 필터만으로는 0건이었습니다.",
+          total: r.count ?? (r.data?.length ?? 0),
+          selectExpr,
+          items: r.data ?? [],
         });
       }
 
-      if (!looksMissingColumn(r1.error, "team")) {
-        return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(r1.error?.message ?? r1.error) }, { status: 500 });
+      lastErr = r.error;
+
+      // 컬럼 없음이면, 에러 메시지에서 컬럼명을 대충 뽑아서 빼준다
+      if (isMissingColumn(r.error)) {
+        const msg = String(r.error?.message ?? "");
+        // 예: 'column exam_attempts.total_points does not exist'
+        const m = msg.match(/exam_attempts\.([a-zA-Z0-9_]+)/);
+        const badCol = m?.[1];
+
+        if (badCol && cols.includes(badCol)) {
+          cols = cols.filter((c) => c !== badCol);
+          continue;
+        }
+
+        // 못뽑았으면 “잘 터질만한 애들”을 우선 제거
+        const fallbackRemoveOrder = ["total_points", "correct_count", "wrong_count", "status", "team"];
+        const remove = fallbackRemoveOrder.find((c) => cols.includes(c));
+        if (remove) {
+          cols = cols.filter((c) => c !== remove);
+          continue;
+        }
       }
+
+      // 컬럼 없음이 아닌 DB 에러면 바로 반환
+      return NextResponse.json(
+        { ok: false, error: "DB_READ_FAILED", detail: String(r.error?.message ?? r.error) },
+        { status: 500 }
+      );
     }
 
-    // 3) 마지막 fallback: 필터 없이 전체
-    {
-      const q = sb
-        .from("exam_attempts")
-        .select(BASE_SELECT, { count: "exact" })
-        .order("submitted_at", { ascending: false })
-        .range(from, to);
-
-      const { data, error, count } = await q;
-      if (error) {
-        return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(error?.message ?? error) }, { status: 500 });
-      }
-      return NextResponse.json({
-        ok: true,
-        mode: "NO_FILTER_FALLBACK",
-        page,
-        pageSize,
-        total: count ?? (data?.length ?? 0),
-        items: data ?? [],
-      });
-    }
+    return NextResponse.json(
+      { ok: false, error: "DB_READ_FAILED", detail: String(lastErr?.message ?? lastErr) },
+      { status: 500 }
+    );
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: "RESULTS_FAILED", detail: String(e?.message ?? e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "RESULTS_FAILED", detail: String(e?.message ?? e) },
+      { status: 500 }
+    );
   }
 }
