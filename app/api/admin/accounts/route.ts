@@ -113,11 +113,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
     }
 
-    // ✅ 기본 비번
     const tempPassword = "1234";
     const password_hash = makePasswordHash(tempPassword);
-
-    // ✅ 쿠키에서 현재 관리자 empId (있으면 owner_admin으로 저장 시도)
     const adminEmpId = s(req.cookies.get("empId")?.value);
 
     const baseRow: any = {
@@ -125,27 +122,60 @@ export async function POST(req: NextRequest) {
       name: name || null,
       is_active,
       role: "user",
-      password: password_hash, // 네 DB가 password 컬럼이면 이거
-      // password_hash: password_hash, // 네 DB가 password_hash 컬럼이면 이걸로 바꿔야 함
+      password: password_hash, // 필요 시 password_hash로 변경
     };
 
-    // 1) owner_admin 포함해서 insert 시도
+    // owner_admin 컬럼이 있으면 넣고, 없으면 자동으로 제거
     const rowWithOwner = adminEmpId ? { ...baseRow, owner_admin: adminEmpId } : baseRow;
+
+    // ✅ 1) 먼저 insert 시도
     let ins = await sb.from(TABLE).insert(rowWithOwner).select("*").single();
 
-    // 2) owner_admin 컬럼 없으면 제거하고 재시도
+    // ✅ 2) owner_admin 컬럼 없으면 제거 후 재시도
     if (ins.error && isMissingOwnerAdminColumn(ins.error)) {
       const { owner_admin, ...rowNoOwner } = rowWithOwner;
       ins = await sb.from(TABLE).insert(rowNoOwner).select("*").single();
     }
 
+    // ✅ 3) emp_id 중복이면 "update로 전환"
+    const msg = String(ins.error?.message ?? ins.error ?? "");
+    const isDupEmp =
+      msg.includes("accounts_emp_id_key") ||
+      msg.toLowerCase().includes("duplicate key value") ||
+      msg.toLowerCase().includes("unique constraint");
+
+    if (ins.error && isDupEmp) {
+      // 기존 row 업데이트 (비번도 1234로 리셋)
+      const patch: any = {
+        name: name || null,
+        is_active,
+        password: password_hash, // 필요 시 password_hash로 변경
+      };
+
+      // owner_admin은 컬럼 있을 때만 시도
+      let up = await sb.from(TABLE).update({ ...patch, owner_admin: adminEmpId || null }).eq("emp_id", emp_id).select("*").single();
+      if (up.error && isMissingOwnerAdminColumn(up.error)) {
+        up = await sb.from(TABLE).update(patch).eq("emp_id", emp_id).select("*").single();
+      }
+
+      if (up.error) {
+        return NextResponse.json(
+          { ok: false, error: "ACCOUNTS_UPSERT_FAILED", detail: String(up.error?.message ?? up.error) },
+          { status: 500 }
+        );
+      }
+
+      return NextResponse.json({
+        ok: true,
+        item: up.data,
+        mode: "UPDATED_EXISTING",
+        tempPassword,
+      });
+    }
+
     if (ins.error) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: "ACCOUNTS_INSERT_FAILED",
-          detail: String(ins.error?.message ?? ins.error),
-        },
+        { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: String(ins.error?.message ?? ins.error) },
         { status: 500 }
       );
     }
