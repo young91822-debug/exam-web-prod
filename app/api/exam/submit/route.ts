@@ -29,17 +29,6 @@ function isNumericId(x: any) {
   return /^\d+$/.test(s(x));
 }
 
-function getCookie(req: Request, name: string) {
-  const raw = req.headers.get("cookie") || "";
-  const parts = raw.split(";").map((x) => x.trim());
-  for (const p of parts) {
-    if (!p) continue;
-    const [k, ...rest] = p.split("=");
-    if (k === name) return decodeURIComponent(rest.join("=") || "");
-  }
-  return "";
-}
-
 async function readBody(req: Request): Promise<any> {
   try {
     return await req.json();
@@ -75,18 +64,23 @@ function pickCorrectIndex(q: any): number | null {
 export async function POST(req: Request) {
   const { client, error } = getSupabaseAdmin();
   if (error) {
-    return NextResponse.json({ ok: false, error: "SUPABASE_ADMIN_INIT_FAILED", detail: error }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "SUPABASE_ADMIN_INIT_FAILED", detail: error },
+      { status: 500 }
+    );
   }
 
   try {
     const body = await readBody(req);
-
     const isAuto = !!body?.isAuto;
 
     // ✅ attemptId (숫자)
     const attemptIdRaw = body?.attemptId ?? body?.attempt_id ?? body?.id ?? null;
     if (!isNumericId(attemptIdRaw)) {
-      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID", detail: { attemptIdRaw } }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { attemptIdRaw } },
+        { status: 400 }
+      );
     }
     const attemptId = Number(attemptIdRaw);
 
@@ -136,7 +130,6 @@ export async function POST(req: Request) {
     const uniqQids = Array.from(new Set(questionIds)).filter(Boolean);
 
     // 문제 목록이 없다면(비정상) 그래도 제출은 처리
-    // -> score 0, wrongCount = 0 처리
     if (uniqQids.length === 0) {
       const nowIso = new Date().toISOString();
       const { error: upErr } = await client
@@ -189,7 +182,8 @@ export async function POST(req: Request) {
     let wrongCount = 0;
     const wrongQuestionIds: string[] = [];
 
-    // exam_answers에 넣을 rows (선택한 것만 저장)
+    // ✅ exam_answers에 넣을 rows (선택한 것만 저장)
+    //    ❗️is_correct 저장 금지 (스키마 캐시 문제로 500남)
     const rowsToInsert: any[] = [];
 
     for (const qid of uniqQids) {
@@ -223,17 +217,14 @@ export async function POST(req: Request) {
         wrongQuestionIds.push(String(qid));
       }
 
-      // ✅ 선택한 것만 답안 테이블에 저장
       rowsToInsert.push({
         attempt_id: attemptId,
         question_id: qid,
         selected_index: Number(selectedIndex),
-        is_correct: isCorrect,
       });
     }
 
     // 5) 기존 답안 삭제 후 재저장
-    // ✅ 테이블명 수정: exam_attempt_answers ❌ -> exam_answers ✅
     const { error: delErr } = await client
       .from("exam_answers")
       .delete()
@@ -271,7 +262,7 @@ export async function POST(req: Request) {
         wrong_count: wrongCount,
         total_points: totalPoints,
         total_questions: uniqQids.length,
-        answers: answersMap, // ✅ 결과/관리자 상세에서 "내 선택" 보여주려고 저장
+        answers: answersMap, // ✅ 결과에서 "내 선택" fallback용
       })
       .eq("id", attemptId);
 
