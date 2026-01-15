@@ -254,18 +254,16 @@ export async function POST(req: Request) {
     const nowIso = new Date().toISOString();
     const { error: upErr } = await client
       .from("exam_attempts")
-      .update({
-        submitted_at: nowIso,
-        status: "SUBMITTED",
-        score,
-        correct_count: correctCount,
-        wrong_count: wrongCount,
-        total_points: totalPoints,
-        total_questions: uniqQids.length,
-        answers: answersMap, // ✅ 결과에서 "내 선택" fallback용
-      })
-      .eq("id", attemptId);
-
+  .update({
+    submitted_at: nowIso,
+    status: "SUBMITTED",
+    score,
+    total_points: totalPoints,
+    total_questions: uniqQids.length,
+    answers: answersMap, // 내 선택 저장
+  })
+  .eq("id", attemptId);
+  
     if (upErr) {
       return NextResponse.json(
         { ok: false, error: "ATTEMPT_UPDATE_FAILED", detail: upErr },
