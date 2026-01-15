@@ -1,17 +1,30 @@
-// app/login/LoginClient.tsx
 "use client";
 
 import React, { useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-type LoginOk = { ok: true; empId: string; role: string; name?: string; redirect?: string };
-type LoginFail = { ok: false; error: string };
+/* ---------- 타입 ---------- */
+type LoginOk = {
+  ok: true;
+  empId: string;
+  role: string;
+  name?: string;
+  redirect?: string;
+};
+
+type LoginFail = {
+  ok: false;
+  error: string;
+};
+
 type LoginResp = LoginOk | LoginFail;
 
+/* ---------- utils ---------- */
 function s(v: any) {
   return String(v ?? "").trim();
 }
 
+/* ---------- component ---------- */
 export default function LoginClient() {
   const router = useRouter();
   const sp = useSearchParams();
@@ -26,7 +39,11 @@ export default function LoginClient() {
     e.preventDefault();
     setMsg("");
 
-    if (!id || !pw) {
+    const id2 = s(id);
+    const pw2 = s(pw);
+
+    // ✅ 프론트 1차 방어
+    if (!id2 || !pw2) {
       setMsg("아이디/비밀번호를 입력하세요.");
       return;
     }
@@ -37,24 +54,42 @@ export default function LoginClient() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
-        body: JSON.stringify({ id, pw }),
+        body: JSON.stringify({ id: id2, pw: pw2 }),
       });
 
-      const json: LoginResp = await res.json();
+      const text = await res.text();
+      const json: LoginResp = text
+        ? JSON.parse(text)
+        : ({ ok: false, error: "EMPTY_RESPONSE" } as LoginFail);
 
+      // ✅ 실패 분기 (여기서만 error 접근)
       if (!res.ok || !json.ok) {
-        setMsg("로그인 실패: 아이디/비밀번호를 확인하세요.");
+        const errCode = (json as LoginFail)?.error || `HTTP_${res.status}`;
+
+        setMsg(
+          errCode === "MISSING_FIELDS"
+            ? "아이디/비밀번호를 입력하세요."
+            : errCode === "USER_NOT_FOUND"
+            ? "계정이 없습니다."
+            : errCode === "PASSWORD_NOT_SET"
+            ? "비밀번호가 설정되지 않았습니다."
+            : errCode === "USER_INACTIVE"
+            ? "비활성 계정입니다."
+            : "로그인 실패: 아이디/비밀번호를 확인하세요."
+        );
         return;
       }
 
+      // ✅ 성공
+      const ok = json as LoginOk;
       const redirect =
-        s((json as LoginOk).redirect) ||
-        (next ? next : json.role === "admin" ? "/admin" : "/exam");
+        s(ok.redirect) ||
+        (next ? next : ok.role === "admin" ? "/admin" : "/exam");
 
       router.replace(redirect);
       router.refresh();
-    } catch (e: any) {
-      setMsg(String(e?.message ?? e));
+    } catch (err: any) {
+      setMsg(String(err?.message ?? err));
     } finally {
       setLoading(false);
     }
@@ -65,23 +100,28 @@ export default function LoginClient() {
       <form onSubmit={onSubmit} className="w-full max-w-sm space-y-4">
         <h1 className="text-2xl font-bold text-center">로그인</h1>
 
-        <input
-          value={id}
-          onChange={(e) => setId(e.target.value)}
-          placeholder="아이디"
-          className="w-full border rounded px-3 py-2"
-        />
-        <input
-          value={pw}
-          onChange={(e) => setPw(e.target.value)}
-          type="password"
-          placeholder="비밀번호"
-          className="w-full border rounded px-3 py-2"
-        />
+        <div className="space-y-2">
+          <input
+            value={id}
+            onChange={(e) => setId(e.target.value)}
+            placeholder="아이디"
+            className="w-full border rounded px-3 py-2"
+            autoComplete="username"
+          />
+          <input
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+            type="password"
+            placeholder="비밀번호"
+            className="w-full border rounded px-3 py-2"
+            autoComplete="current-password"
+          />
+        </div>
 
         <button
+          type="submit"
           disabled={loading}
-          className="w-full rounded px-3 py-2 border bg-gray-100"
+          className="w-full rounded px-3 py-2 border bg-gray-100 hover:bg-gray-200 disabled:opacity-50"
         >
           {loading ? "로그인 중..." : "로그인"}
         </button>
