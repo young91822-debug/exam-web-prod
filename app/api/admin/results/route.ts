@@ -19,7 +19,6 @@ function looksMissingColumn(err: any, col: string) {
 
 export async function GET(req: NextRequest) {
   try {
-    // ✅ 권한
     const empId = s(req.cookies.get("empId")?.value);
     const role = s(req.cookies.get("role")?.value);
     const teamCookie = s(req.cookies.get("team")?.value);
@@ -28,21 +27,18 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
     }
 
-    // ✅ paging
     const url = new URL(req.url);
     const page = Math.max(1, n(url.searchParams.get("page"), 1));
     const pageSize = Math.min(200, Math.max(1, n(url.searchParams.get("pageSize"), 50)));
     const from = (page - 1) * pageSize;
     const to = from + pageSize - 1;
 
-    // 팀 추정(원하면 여기 규칙 바꿔도 됨)
+    // ✅ 팀 추정(필요하면 여기 규칙만 바꾸면 됨)
     const team = teamCookie || (empId === "admin_gs" ? "B" : "A");
 
-    // ✅ 기본 select 컬럼 (네 UI에 필요한 것들)
-    const BASE_SELECT =
-      "id, emp_id, score, started_at, submitted_at, total_questions";
+    const BASE_SELECT = "id, emp_id, score, started_at, submitted_at, total_questions";
 
-    // 1) owner_admin 컬럼이 있으면 owner_admin 기준으로 분리
+    // 1) owner_admin 있으면 최우선
     {
       const q = sb
         .from("exam_attempts")
@@ -62,39 +58,68 @@ export async function GET(req: NextRequest) {
           items: data ?? [],
         });
       }
-      // owner_admin 컬럼이 없으면 다음 전략으로
       if (!looksMissingColumn(error, "owner_admin")) {
-        // 컬럼은 있는데 다른 오류면 그대로 리턴 (DB 문제)
         return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(error?.message ?? error) }, { status: 500 });
       }
     }
 
-    // 2) team 컬럼이 exam_attempts에 있으면 team 기준으로 분리
+    // 2) team 컬럼 있으면 team으로 필터
+    // ✅ 단, 0건이면 "team IS NULL/''"도 포함해서 다시 조회 (지금 너 케이스 방지)
     {
-      const q = sb
+      const q1 = sb
         .from("exam_attempts")
         .select(BASE_SELECT + ", team", { count: "exact" })
         .eq("team", team)
         .order("submitted_at", { ascending: false })
         .range(from, to);
 
-      const { data, error, count } = await q;
-      if (!error) {
+      const r1 = await q1;
+      if (!r1.error) {
+        const total1 = r1.count ?? (r1.data?.length ?? 0);
+
+        if (total1 > 0) {
+          return NextResponse.json({
+            ok: true,
+            mode: "FILTER_TEAM_COLUMN",
+            page,
+            pageSize,
+            total: total1,
+            items: r1.data ?? [],
+          });
+        }
+
+        // ✅ 0건이면: team이 비어있는 데이터도 같이 보여주기
+        const q2 = sb
+          .from("exam_attempts")
+          .select(BASE_SELECT + ", team", { count: "exact" })
+          .or(`team.eq.${team},team.is.null,team.eq.`) // team==B OR NULL OR ''(빈문자열)
+          .order("submitted_at", { ascending: false })
+          .range(from, to);
+
+        const r2 = await q2;
+
+        // team 컬럼 자체는 있으니까, 여기서 에러나면 DB 문제
+        if (r2.error) {
+          return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(r2.error?.message ?? r2.error) }, { status: 500 });
+        }
+
         return NextResponse.json({
           ok: true,
-          mode: "FILTER_TEAM_COLUMN",
+          mode: "FILTER_TEAM_PLUS_EMPTY",
           page,
           pageSize,
-          total: count ?? (data?.length ?? 0),
-          items: data ?? [],
+          total: r2.count ?? (r2.data?.length ?? 0),
+          items: r2.data ?? [],
+          hint: "team 값이 NULL/빈문자열로 저장된 응시가 있어 team 필터만으로는 0건이었습니다.",
         });
       }
-      if (!looksMissingColumn(error, "team")) {
-        return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(error?.message ?? error) }, { status: 500 });
+
+      if (!looksMissingColumn(r1.error, "team")) {
+        return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(r1.error?.message ?? r1.error) }, { status: 500 });
       }
     }
 
-    // 3) 둘 다 없으면: 관리자 전체 조회라도 보여주기(안 뜨는 문제 종결)
+    // 3) 마지막 fallback: 필터 없이 전체
     {
       const q = sb
         .from("exam_attempts")
