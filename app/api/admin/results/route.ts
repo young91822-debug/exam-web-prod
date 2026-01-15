@@ -36,7 +36,9 @@ export async function GET(req: NextRequest) {
     // ✅ 팀 추정(필요하면 여기 규칙만 바꾸면 됨)
     const team = teamCookie || (empId === "admin_gs" ? "B" : "A");
 
-    const BASE_SELECT = "id, emp_id, score, started_at, submitted_at, total_questions";
+     const BASE_SELECT =
+  "id, emp_id, score, total_points, correct_count, wrong_count, started_at, submitted_at, total_questions, team";
+
 
     // 1) owner_admin 있으면 최우선
     {
