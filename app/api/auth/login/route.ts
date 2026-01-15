@@ -24,42 +24,115 @@ function verifyPasswordHash(plain: string, stored: string) {
     const expected = Buffer.from(hashB64, "base64");
     const derived = crypto.scryptSync(plain, salt, expected.length);
 
-    return (
-      derived.length === expected.length &&
-      crypto.timingSafeEqual(derived, expected)
-    );
+    return derived.length === expected.length && crypto.timingSafeEqual(derived, expected);
   } catch {
     return false;
   }
 }
 
-async function readBody(req: Request) {
-  try {
-    return await req.json();
-  } catch {
+/**
+ * ✅ 어떤 형태로 오든 body 파싱:
+ * - application/json
+ * - application/x-www-form-urlencoded
+ * - multipart/form-data (FormData)
+ * - plain text(JSON 문자열)
+ */
+async function readBodyAny(req: Request): Promise<any> {
+  const ct = (req.headers.get("content-type") || "").toLowerCase();
+
+  // 1) multipart/form-data
+  if (ct.includes("multipart/form-data")) {
     try {
-      const t = await req.text();
-      return t ? JSON.parse(t) : {};
+      const fd = await req.formData();
+      const obj: any = {};
+      for (const [k, v] of fd.entries()) obj[k] = typeof v === "string" ? v : String(v);
+      return obj;
     } catch {
+      // fallback below
+    }
+  }
+
+  // 2) x-www-form-urlencoded
+  if (ct.includes("application/x-www-form-urlencoded")) {
+    try {
+      const text = await req.text();
+      const params = new URLSearchParams(text);
+      const obj: any = {};
+      for (const [k, v] of params.entries()) obj[k] = v;
+      return obj;
+    } catch {
+      // fallback below
+    }
+  }
+
+  // 3) json
+  if (ct.includes("application/json")) {
+    try {
+      return await req.json();
+    } catch {
+      // fallback below
+    }
+  }
+
+  // 4) 마지막: 텍스트로 읽어서 JSON 시도
+  try {
+    const t = await req.text();
+    if (!t) return {};
+    try {
+      return JSON.parse(t);
+    } catch {
+      // 혹시 key=value 형태면 이것도 처리
+      const params = new URLSearchParams(t);
+      if ([...params.keys()].length > 0) {
+        const obj: any = {};
+        for (const [k, v] of params.entries()) obj[k] = v;
+        return obj;
+      }
       return {};
     }
+  } catch {
+    return {};
   }
 }
 
-// 관리자 계정(필요한 것만)
+// 관리자 계정
 const ADMIN_IDS = new Set(["admin", "admin_gs"]);
 
 export async function POST(req: Request) {
   try {
-    const body = await readBody(req);
-    const id = s(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id);
-    const pw = s(body?.pw ?? body?.password);
+    const body = await readBodyAny(req);
+
+    // ✅ 프론트가 뭐라고 보내든 최대한 다 받아주기
+    const id = s(
+      body?.id ??
+        body?.empId ??
+        body?.emp_id ??
+        body?.user_id ??
+        body?.username ??
+        body?.loginId ??
+        body?.login_id
+    );
+    const pw = s(
+      body?.pw ??
+        body?.password ??
+        body?.pass ??
+        body?.passwd ??
+        body?.loginPw ??
+        body?.login_pw
+    );
 
     if (!id || !pw) {
-      return NextResponse.json({ ok: false, error: "MISSING_FIELDS" }, { status: 400 });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "MISSING_FIELDS",
+          detail: { gotKeys: Object.keys(body ?? {}) },
+        },
+        { status: 400 }
+      );
     }
 
-    // ✅ password / password_hash 둘 다 select
+    // ✅ password / password_hash 둘 다 조회
     const { data: row, error } = await sb
       .from(TABLE)
       .select("emp_id, name, role, is_active, password, password_hash")
@@ -72,36 +145,26 @@ export async function POST(req: Request) {
         { status: 500 }
       );
     }
-
     if (!row) {
       return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
-
     if (row.is_active === false) {
       return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
     }
 
-    // ✅ 핵심: stored 비번을 password_hash 우선, 없으면 password
     const stored = s((row as any).password_hash) || s((row as any).password);
     if (!stored) {
-      return NextResponse.json(
-        { ok: false, error: "PASSWORD_NOT_SET" },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "PASSWORD_NOT_SET" }, { status: 500 });
     }
 
-    const ok = verifyPasswordHash(pw, stored);
-    if (!ok) {
+    if (!verifyPasswordHash(pw, stored)) {
       return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    // role 결정
     const role = ADMIN_IDS.has(id) || s((row as any).role) === "admin" ? "admin" : "user";
 
-    // ✅ 쿠키 세팅 (NextResponse)
     const res = NextResponse.json({ ok: true, empId: id, role });
 
-    // httpOnly로 안전하게
     res.cookies.set("empId", id, {
       httpOnly: true,
       sameSite: "lax",
