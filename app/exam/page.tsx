@@ -1,4 +1,4 @@
-// app/exam/page.tsx  ✅ SERVER COMPONENT
+// app/exam/page.tsx  ✅ SERVER COMPONENT (Next.js async cookies 대응)
 
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
@@ -6,22 +6,20 @@ import ExamClient from "./ExamClient";
 
 export const dynamic = "force-dynamic";
 
-export default function ExamPage() {
-  const c = cookies();
+export default async function ExamPage() {
+  const c = await cookies(); // ✅ Next.js 버전에 따라 Promise일 수 있음
 
   const empId = c.get("empId")?.value || "";
   const role = c.get("role")?.value || "";
 
-  // ✅ 로그인 안 됐으면
   if (!empId) {
     redirect("/login?next=/exam");
   }
 
-  // 🔥 관리자면 HTML 자체를 못 보게 바로 차단
+  // ✅ 관리자는 시험 페이지 HTML 자체 차단
   if (role === "admin") {
     redirect("/admin");
   }
 
-  // ✅ 여기까지 온 경우만 응시자
   return <ExamClient />;
 }

@@ -1,4 +1,3 @@
-// app/exam/ExamClient.tsx
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
@@ -12,7 +11,7 @@ type Q = {
 };
 
 type StartResp =
-  | { ok: true; attemptId: string; questions: Q[] }
+  | { ok: true; attemptId: string; questions: Q[]; debug?: any }
   | { ok: false; error: string; detail?: any };
 
 type SubmitResp =
@@ -49,7 +48,7 @@ function fmtRemain(sec: number) {
   return `${m}:${String(r).padStart(2, "0")}`;
 }
 
-const EXAM_LIMIT_SEC = 15 * 60;
+const EXAM_LIMIT_SEC = 15 * 60; // 15분
 
 export default function ExamClient() {
   const router = useRouter();
@@ -63,6 +62,7 @@ export default function ExamClient() {
   const [remainSec, setRemainSec] = useState<number>(EXAM_LIMIT_SEC);
   const submittingRef = useRef(false);
 
+  // 시작
   useEffect(() => {
     let alive = true;
 
@@ -105,6 +105,7 @@ export default function ExamClient() {
     };
   }, []);
 
+  // 15분 타이머
   useEffect(() => {
     if (!attemptId) return;
 
