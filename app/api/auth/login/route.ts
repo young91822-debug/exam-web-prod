@@ -10,8 +10,8 @@ function s(v: any) {
   return String(v ?? "").trim();
 }
 
-/** stored 포맷: scrypt$<saltB64>$<hashB64> */
-function verifyPasswordHash(plain: string, stored: string) {
+/** scrypt 저장 포맷: scrypt$<saltB64>$<hashB64> */
+function verifyScrypt(plain: string, stored: string) {
   try {
     const [algo, saltB64, hashB64] = String(stored || "").split("$");
     if (algo !== "scrypt" || !saltB64 || !hashB64) return false;
@@ -58,22 +58,35 @@ const ADMIN_IDS = new Set(["admin", "admin_gs"]);
 
 function getProjectRef() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
-  // https://xxxx.supabase.co -> xxxx
   const m = url.match(/^https:\/\/([^.]+)\.supabase\.co/i);
   return m?.[1] || "(no_url)";
 }
 
-/** Supabase 에러 메시지로 "컬럼 없음" 판별 (schema cache 포함) */
 function isMissingColumn(err: any, col: string) {
   const msg = String(err?.message || err || "");
-  // 예: column accounts.username does not exist
-  // 예: Could not find the 'username' column of 'accounts' in the schema cache
   return (
     msg.includes(`column ${TABLE}.${col} does not exist`) ||
-    msg.includes(`column "${col}"`) ||
     msg.includes(`Could not find the '${col}' column`) ||
-    msg.toLowerCase().includes(`${col}`) && msg.toLowerCase().includes("does not exist")
+    (msg.toLowerCase().includes(col) && msg.toLowerCase().includes("does not exist"))
   );
+}
+
+/**
+ * ✅ 핵심: password_hash가 비어있어도,
+ * password 컬럼에 scrypt$... 해시가 들어간 경우 자동으로 해시로 검증
+ */
+function pickStoredForVerify(password_hash: any, password: any) {
+  const ph = s(password_hash);
+  const pw = s(password);
+
+  // 해시는 둘 중 어디에 있어도 OK
+  const isScryptHash = (x: string) => x.startsWith("scrypt$");
+
+  if (isScryptHash(ph)) return { mode: "scrypt" as const, hash: ph, plain: "" };
+  if (isScryptHash(pw)) return { mode: "scrypt" as const, hash: pw, plain: "" };
+
+  // 해시가 없으면 평문 비교(기존 호환)
+  return { mode: "plain" as const, hash: "", plain: pw };
 }
 
 export async function POST(req: NextRequest) {
@@ -93,16 +106,13 @@ export async function POST(req: NextRequest) {
     const pw = s(body?.pw ?? body?.password ?? body?.pass ?? body?.pwd);
 
     if (!id || !pw) {
-      return NextResponse.json(
-        { ok: false, error: "MISSING_FIELDS", projectRef },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "MISSING_FIELDS", projectRef }, { status: 400 });
     }
 
     const sb: any = supabaseAdmin;
 
-    // ✅ 1) emp_id로 조회
-    let matchedBy: "emp_id" | "username" | null = "emp_id";
+    // 1) emp_id로 조회
+    let matchedBy: "emp_id" | "username" = "emp_id";
     const r1 = await sb.from(TABLE).select("*").eq("emp_id", id).maybeSingle();
 
     if (r1.error) {
@@ -112,43 +122,34 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    let data = r1.data;
+    let row: any = r1.data;
 
-    // ✅ 2) 없으면 username fallback (단, username 컬럼이 "진짜 있을 때만" 시도)
-    //    - username 컬럼이 없으면: 절대 DB 에러 내지 않고 그냥 스킵
-    if (!data) {
-      // 컬럼이 있을 수도 있으니 한번 시도하되,
-      // "username 컬럼 없음" 에러면 스킵하고 invalid로 처리
+    // 2) 없으면 username fallback (컬럼 없으면 스킵)
+    if (!row) {
       matchedBy = "username";
       const r2 = await sb.from(TABLE).select("*").eq("username", id).maybeSingle();
 
       if (r2.error) {
-        if (isMissingColumn(r2.error, "username")) {
-          // ✅ username 컬럼이 없으면 fallback 자체를 무효화
-          matchedBy = "emp_id";
-          data = null;
-        } else {
+        if (!isMissingColumn(r2.error, "username")) {
           return NextResponse.json(
             { ok: false, error: "DB_READ_FAILED", projectRef, detail: r2.error.message },
             { status: 500 }
           );
         }
       } else {
-        data = r2.data;
+        row = r2.data;
       }
     }
 
-    if (!data) {
+    if (!row) {
       return NextResponse.json(
-        { ok: false, error: "INVALID_CREDENTIALS", projectRef, detail: { found: false } },
+        { ok: false, error: "INVALID_CREDENTIALS", projectRef, detail: { matchedBy, found: false } },
         { status: 401 }
       );
     }
 
     const isActive =
-      data.is_active === null || data.is_active === undefined
-        ? true
-        : Boolean(data.is_active);
+      row.is_active === null || row.is_active === undefined ? true : Boolean(row.is_active);
 
     if (!isActive) {
       return NextResponse.json(
@@ -157,13 +158,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const storedHash = s(data.password_hash);
-    const storedPlain = s(data.password);
+    const picked = pickStoredForVerify(row.password_hash, row.password);
 
-    const matchHash = storedHash ? verifyPasswordHash(pw, storedHash) : false;
-    const matchPlain = storedPlain ? pw === storedPlain : false;
+    let matchHash = false;
+    let matchPlain = false;
 
-    if (!matchHash && !matchPlain) {
+    if (picked.mode === "scrypt") {
+      matchHash = verifyScrypt(pw, picked.hash);
+    } else {
+      matchPlain = picked.plain ? pw === picked.plain : false;
+    }
+
+    if (!(matchHash || matchPlain)) {
       return NextResponse.json(
         {
           ok: false,
@@ -172,10 +178,11 @@ export async function POST(req: NextRequest) {
           detail: {
             matchedBy,
             found: true,
-            hasHash: !!storedHash,
-            hasPlain: !!storedPlain,
+            hasHash: !!s(row.password_hash),
+            hasPlain: !!s(row.password),
             pwLen: pw.length,
-            plainLen: storedPlain.length,
+            plainLen: s(row.password).length,
+            pickedMode: picked.mode,
             matchHash,
             matchPlain,
           },
@@ -184,16 +191,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const role = ADMIN_IDS.has(id) ? "admin" : "user";
-    const team = s(data.team);
+    // ✅ 권장: role은 DB 우선, 없으면 관리자ID 기준 fallback
+    const dbRole = s(row.role);
+    const role = dbRole || (ADMIN_IDS.has(id) ? "admin" : "user");
+    const team = s(row.team);
 
-    const res = NextResponse.json({
-      ok: true,
-      role,
-      empId: data.emp_id,
-      team,
-      projectRef,
-    });
+    const res = NextResponse.json({ ok: true, role, empId: row.emp_id, team, projectRef });
 
     const cookieOpts = {
       httpOnly: true,
@@ -203,7 +206,7 @@ export async function POST(req: NextRequest) {
       maxAge: 60 * 60 * 12,
     };
 
-    res.cookies.set("empId", data.emp_id, cookieOpts);
+    res.cookies.set("empId", row.emp_id, cookieOpts);
     res.cookies.set("role", role, cookieOpts);
     if (team) res.cookies.set("team", team, cookieOpts);
 
