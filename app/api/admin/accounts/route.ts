@@ -3,7 +3,10 @@ import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
+export const runtime = "nodejs"; // ✅ crypto 사용 안정화 (Vercel Edge 방지)
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 const sb: any = supabaseAdmin;
 const TABLE = "accounts";
 
@@ -12,6 +15,7 @@ const TABLE = "accounts";
 function s(v: any) {
   return String(v ?? "").trim();
 }
+
 function toBool(v: any, d: boolean | null = null) {
   if (v === undefined || v === null || v === "") return d;
   if (typeof v === "boolean") return v;
@@ -21,11 +25,11 @@ function toBool(v: any, d: boolean | null = null) {
   return d;
 }
 
-/** stored 포맷: scrypt$<saltB64>$<hashB64> */
+/** stored 포맷: scrypt$<saltB64>$<hashB64>  (✅ 로그인 API와 동일 포맷) */
 function makePasswordHash(plain: string) {
   const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(plain, salt, 64);
-  return `scrypt$${salt.toString("base64")}$${hash.toString("base64")}`;
+  const derived = crypto.scryptSync(plain, salt, 32); // ✅ 32 bytes면 충분 + 로그인 검증과 잘 맞음
+  return `scrypt$${salt.toString("base64")}$${derived.toString("base64")}`;
 }
 
 /** 요청 body 안전 파싱 */
@@ -45,25 +49,28 @@ async function readBody(req: Request) {
 /** owner_admin 컬럼 관련 "없음" 에러 전부 캐치 (does not exist / schema cache 포함) */
 function isMissingOwnerAdminColumn(err: any) {
   const msg = String(err?.message ?? err ?? "").toLowerCase();
-  // 예: "column accounts.owner_admin does not exist"
-  // 예: "Could not find the 'owner_admin' column of 'accounts' in the schema cache"
   return (
     msg.includes("owner_admin") &&
     (msg.includes("does not exist") ||
       msg.includes("schema cache") ||
-      msg.includes("could not find the") ||
-      msg.includes("column") ||
-      msg.includes("not find"))
+      msg.includes("could not find") ||
+      msg.includes("not find") ||
+      msg.includes("column"))
   );
+}
+
+/** 중복(유니크 위반) 판단 */
+function isUniqueViolation(err: any) {
+  // Postgres unique_violation = 23505
+  const code = String(err?.code ?? "");
+  const msg = String(err?.message ?? err ?? "").toLowerCase();
+  return code === "23505" || msg.includes("duplicate key value") || msg.includes("unique constraint");
 }
 
 /* ---------------- GET ---------------- */
 /** 목록 */
-export async function GET(req: NextRequest) {
+export async function GET(_req: NextRequest) {
   try {
-    // (선택) 관리자 empId - 나중에 필터링용
-    // const adminEmpId = s(req.cookies.get("empId")?.value);
-
     // 1) owner_admin 포함 시도
     let q1 = sb
       .from(TABLE)
@@ -100,7 +107,7 @@ export async function GET(req: NextRequest) {
 }
 
 /* ---------------- POST ---------------- */
-/** 생성 */
+/** 생성(중복 emp_id면 비번 포함 업데이트로 전환) */
 export async function POST(req: NextRequest) {
   try {
     const body = await readBody(req);
@@ -109,26 +116,33 @@ export async function POST(req: NextRequest) {
     const name = s(body?.name);
     const is_active = toBool(body?.isActive ?? body?.is_active, true) ?? true;
 
+    // (옵션) role 받을지 말지: 기본 user, 필요하면 admin 생성도 가능
+    const role = s(body?.role) || "user";
+    const allowedRole = ["user", "admin"].includes(role) ? role : "user";
+
     if (!emp_id) {
       return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
     }
 
+    // ✅ 임시 비번 (원하면 여기만 바꾸면 됨)
     const tempPassword = "1234";
     const password_hash = makePasswordHash(tempPassword);
+
+    // ✅ 누가 만들었는지(있으면) 기록
     const adminEmpId = s(req.cookies.get("empId")?.value);
 
     const baseRow: any = {
       emp_id,
       name: name || null,
       is_active,
-      role: "user",
-      password: password_hash, // 필요 시 password_hash로 변경
+      role: allowedRole,
+      password: password_hash,
     };
 
     // owner_admin 컬럼이 있으면 넣고, 없으면 자동으로 제거
     const rowWithOwner = adminEmpId ? { ...baseRow, owner_admin: adminEmpId } : baseRow;
 
-    // ✅ 1) 먼저 insert 시도
+    // ✅ 1) insert 시도
     let ins = await sb.from(TABLE).insert(rowWithOwner).select("*").single();
 
     // ✅ 2) owner_admin 컬럼 없으면 제거 후 재시도
@@ -137,23 +151,23 @@ export async function POST(req: NextRequest) {
       ins = await sb.from(TABLE).insert(rowNoOwner).select("*").single();
     }
 
-    // ✅ 3) emp_id 중복이면 "update로 전환"
-    const msg = String(ins.error?.message ?? ins.error ?? "");
-    const isDupEmp =
-      msg.includes("accounts_emp_id_key") ||
-      msg.toLowerCase().includes("duplicate key value") ||
-      msg.toLowerCase().includes("unique constraint");
-
-    if (ins.error && isDupEmp) {
-      // 기존 row 업데이트 (비번도 1234로 리셋)
+    // ✅ 3) emp_id 중복이면 update(비번 1234로 리셋 포함)
+    if (ins.error && isUniqueViolation(ins.error)) {
       const patch: any = {
         name: name || null,
         is_active,
-        password: password_hash, // 필요 시 password_hash로 변경
+        role: allowedRole,
+        password: password_hash, // ✅ 여기에서 리셋
       };
 
       // owner_admin은 컬럼 있을 때만 시도
-      let up = await sb.from(TABLE).update({ ...patch, owner_admin: adminEmpId || null }).eq("emp_id", emp_id).select("*").single();
+      let up = await sb
+        .from(TABLE)
+        .update({ ...patch, owner_admin: adminEmpId || null })
+        .eq("emp_id", emp_id)
+        .select("*")
+        .single();
+
       if (up.error && isMissingOwnerAdminColumn(up.error)) {
         up = await sb.from(TABLE).update(patch).eq("emp_id", emp_id).select("*").single();
       }
@@ -195,6 +209,7 @@ export async function POST(req: NextRequest) {
 }
 
 /* ---------------- PATCH ---------------- */
+/** 수정(이름/활성만) */
 export async function PATCH(req: NextRequest) {
   try {
     const body = await readBody(req);
@@ -205,9 +220,13 @@ export async function PATCH(req: NextRequest) {
     }
 
     const patch: any = {};
+
     if (body?.name !== undefined) patch.name = s(body.name) || null;
+
     if (body?.is_active !== undefined || body?.isActive !== undefined) {
-      patch.is_active = toBool(body?.is_active ?? body?.isActive, null);
+      const b = toBool(body?.is_active ?? body?.isActive, null);
+      // ✅ null이면 업데이트 안 함(실수로 null 들어가는 사고 방지)
+      if (b !== null) patch.is_active = b;
     }
 
     if (Object.keys(patch).length === 0) {
