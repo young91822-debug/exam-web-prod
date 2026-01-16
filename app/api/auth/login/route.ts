@@ -1,3 +1,4 @@
+// app/api/auth/login/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
@@ -29,7 +30,9 @@ function verifyPasswordHash(plain: string, stored: string) {
 }
 
 async function readBodyAny(req: NextRequest): Promise<any> {
-  try { return await req.json(); } catch {}
+  try {
+    return await req.json();
+  } catch {}
   try {
     const fd = await req.formData();
     const obj: any = {};
@@ -39,7 +42,9 @@ async function readBodyAny(req: NextRequest): Promise<any> {
   try {
     const t = await req.text();
     if (!t) return {};
-    try { return JSON.parse(t); } catch {}
+    try {
+      return JSON.parse(t);
+    } catch {}
     const params = new URLSearchParams(t);
     const obj: any = {};
     params.forEach((v, k) => (obj[k] = v));
@@ -58,24 +63,47 @@ function getProjectRef() {
   return m?.[1] || "(no_url)";
 }
 
+/** Supabase 에러 메시지로 "컬럼 없음" 판별 (schema cache 포함) */
+function isMissingColumn(err: any, col: string) {
+  const msg = String(err?.message || err || "");
+  // 예: column accounts.username does not exist
+  // 예: Could not find the 'username' column of 'accounts' in the schema cache
+  return (
+    msg.includes(`column ${TABLE}.${col} does not exist`) ||
+    msg.includes(`column "${col}"`) ||
+    msg.includes(`Could not find the '${col}' column`) ||
+    msg.toLowerCase().includes(`${col}`) && msg.toLowerCase().includes("does not exist")
+  );
+}
+
 export async function POST(req: NextRequest) {
   const projectRef = getProjectRef();
 
   try {
     const body = await readBodyAny(req);
 
-    const id = s(body?.id ?? body?.emp_id ?? body?.empId ?? body?.username ?? body?.loginId);
+    const id = s(
+      body?.id ??
+        body?.emp_id ??
+        body?.empId ??
+        body?.username ??
+        body?.loginId ??
+        body?.user_id
+    );
     const pw = s(body?.pw ?? body?.password ?? body?.pass ?? body?.pwd);
 
     if (!id || !pw) {
-      return NextResponse.json({ ok: false, error: "MISSING_FIELDS", projectRef }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "MISSING_FIELDS", projectRef },
+        { status: 400 }
+      );
     }
 
     const sb: any = supabaseAdmin;
 
-    // 1) emp_id로 조회
+    // ✅ 1) emp_id로 조회
     let matchedBy: "emp_id" | "username" | null = "emp_id";
-    let r1 = await sb.from(TABLE).select("*").eq("emp_id", id).maybeSingle();
+    const r1 = await sb.from(TABLE).select("*").eq("emp_id", id).maybeSingle();
 
     if (r1.error) {
       return NextResponse.json(
@@ -86,18 +114,28 @@ export async function POST(req: NextRequest) {
 
     let data = r1.data;
 
-    // 2) 없으면 username으로 조회 (OR 금지!)
+    // ✅ 2) 없으면 username fallback (단, username 컬럼이 "진짜 있을 때만" 시도)
+    //    - username 컬럼이 없으면: 절대 DB 에러 내지 않고 그냥 스킵
     if (!data) {
+      // 컬럼이 있을 수도 있으니 한번 시도하되,
+      // "username 컬럼 없음" 에러면 스킵하고 invalid로 처리
       matchedBy = "username";
       const r2 = await sb.from(TABLE).select("*").eq("username", id).maybeSingle();
 
       if (r2.error) {
-        return NextResponse.json(
-          { ok: false, error: "DB_READ_FAILED", projectRef, detail: r2.error.message },
-          { status: 500 }
-        );
+        if (isMissingColumn(r2.error, "username")) {
+          // ✅ username 컬럼이 없으면 fallback 자체를 무효화
+          matchedBy = "emp_id";
+          data = null;
+        } else {
+          return NextResponse.json(
+            { ok: false, error: "DB_READ_FAILED", projectRef, detail: r2.error.message },
+            { status: 500 }
+          );
+        }
+      } else {
+        data = r2.data;
       }
-      data = r2.data;
     }
 
     if (!data) {
@@ -107,7 +145,11 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const isActive = data.is_active === null || data.is_active === undefined ? true : Boolean(data.is_active);
+    const isActive =
+      data.is_active === null || data.is_active === undefined
+        ? true
+        : Boolean(data.is_active);
+
     if (!isActive) {
       return NextResponse.json(
         { ok: false, error: "INACTIVE_ACCOUNT", projectRef, detail: { matchedBy } },
@@ -121,9 +163,7 @@ export async function POST(req: NextRequest) {
     const matchHash = storedHash ? verifyPasswordHash(pw, storedHash) : false;
     const matchPlain = storedPlain ? pw === storedPlain : false;
 
-    const ok = matchHash || matchPlain;
-
-    if (!ok) {
+    if (!matchHash && !matchPlain) {
       return NextResponse.json(
         {
           ok: false,
@@ -147,7 +187,13 @@ export async function POST(req: NextRequest) {
     const role = ADMIN_IDS.has(id) ? "admin" : "user";
     const team = s(data.team);
 
-    const res = NextResponse.json({ ok: true, role, empId: data.emp_id, team, projectRef });
+    const res = NextResponse.json({
+      ok: true,
+      role,
+      empId: data.emp_id,
+      team,
+      projectRef,
+    });
 
     const cookieOpts = {
       httpOnly: true,
