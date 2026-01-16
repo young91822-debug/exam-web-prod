@@ -94,10 +94,10 @@ export default function LoginClient() {
       }
 
       if (!data.ok) {
-        setMsg(friendlyError(data.error));
-        return;
-      }
-
+  const err = s((data as any)?.error) || "LOGIN_FAILED";
+  setMsg(friendlyError(err));
+  return;
+}
       const dest = s((data as LoginOk).redirect) || next || (data.role === "admin" ? "/admin" : "/exam");
       router.replace(dest);
       router.refresh();
