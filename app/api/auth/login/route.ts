@@ -35,7 +35,13 @@ function parseScrypt(stored: string) {
   const [algo, saltB64, hashB64] = parts;
   if (algo !== "scrypt") return null;
   if (!saltB64 || !hashB64) return null;
-  return { algo, saltB64, hashB64 };
+  return { saltB64, hashB64 };
+}
+
+function makePasswordHash(plain: string) {
+  const salt = crypto.randomBytes(16);
+  const derived = crypto.scryptSync(plain, salt, 32);
+  return `scrypt$${salt.toString("base64")}$${derived.toString("base64")}`;
 }
 
 function verifyScrypt(plain: string, stored: string) {
@@ -48,22 +54,10 @@ function verifyScrypt(plain: string, stored: string) {
     if (!salt.length || !expected.length) return { ok: false, reason: "BAD_B64" as const };
 
     const derived = crypto.scryptSync(plain, salt, expected.length);
-
     const equal =
       derived.length === expected.length && crypto.timingSafeEqual(derived, expected);
 
-    return {
-      ok: equal,
-      reason: equal ? ("OK" as const) : ("MISMATCH" as const),
-      debug: {
-        expectedLen: expected.length,
-        derivedLen: derived.length,
-        dollarCnt: (s(stored).match(/\$/g) || []).length,
-        headExpected: expected.toString("base64").slice(0, 12),
-        headDerived: derived.toString("base64").slice(0, 12),
-        saltHead: salt.toString("base64").slice(0, 12),
-      },
-    };
+    return { ok: equal, reason: equal ? ("OK" as const) : ("MISMATCH" as const) };
   } catch (e: any) {
     return { ok: false, reason: "CRASH" as const, detail: String(e?.message || e) };
   }
@@ -73,14 +67,12 @@ function verifyScrypt(plain: string, stored: string) {
 function setAuthCookies(res: NextResponse, empId: string, role: string, team: string | null) {
   const secure = process.env.NODE_ENV === "production";
 
-  // ✅ middleware / 서버 컴포넌트에서 안정적으로 쓰려면 httpOnly=true가 정상
-  // (client에서 JS로 읽을 필요 없음)
   res.cookies.set("empId", empId, {
     httpOnly: true,
     sameSite: "lax",
     secure,
     path: "/",
-    maxAge: 60 * 60 * 24 * 7, // 7d
+    maxAge: 60 * 60 * 24 * 7,
   });
 
   res.cookies.set("role", role, {
@@ -104,11 +96,23 @@ function setAuthCookies(res: NextResponse, empId: string, role: string, team: st
   }
 }
 
+/** ✅ password_hash / password 둘 다에서 "실제 저장값"을 찾아옴 */
+function pickStoredPassword(row: any) {
+  const a = s(row?.password_hash);
+  const b = s(row?.password);
+  // 우선순위: password_hash → password
+  return a || b;
+}
+
+/** ✅ 저장값이 scrypt인지 판별 */
+function isScryptStored(stored: string) {
+  return s(stored).startsWith("scrypt$") && !!parseScrypt(stored);
+}
+
 export async function POST(req: Request) {
   try {
     const body = await readBody(req);
 
-    // 프론트에서 {id, pw} / {username, password} 등 어떤 조합이 와도 처리
     const id = s(body?.id ?? body?.username ?? body?.empId ?? body?.emp_id);
     const pw = s(body?.pw ?? body?.password);
     const next = s(body?.next);
@@ -152,53 +156,49 @@ export async function POST(req: Request) {
       );
     }
 
-    // 비밀번호 검증
-    const storedHash = s(row.password_hash);
-    const storedPlain = row.password ? String(row.password) : "";
- // (있으면) 구버전 평문
+    // ✅ 비밀번호 검증 (중요: password_hash / password 둘 다 지원)
+    const stored = pickStoredPassword(row);
 
-    if (storedHash && storedHash.startsWith("scrypt$")) {
-  const v = verifyScrypt(pw, storedHash);
-  if (!v.ok) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "INVALID_CREDENTIALS",
-        marker: "LOGIN_BAD_PASSWORD",
-        matchedBy,
-        verify: v,
-      },
-      { status: 401 }
-    );
-  }
-}
-// 👇 이 분기는 진짜 legacy 계정만
-else if (storedPlain.length > 0) {
-  if (pw !== storedPlain) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "INVALID_CREDENTIALS",
-        marker: "LOGIN_BAD_PASSWORD_PLAIN",
-        matchedBy,
-      },
-      { status: 401 }
-    );
-  }
-}
-else {
-  return NextResponse.json(
-    {
-      ok: false,
-      error: "INVALID_CREDENTIALS",
-      marker: "LOGIN_NO_PASSWORD",
-      matchedBy,
-    },
-    { status: 401 }
-  );
-}
+    if (!stored) {
+      return NextResponse.json(
+        { ok: false, error: "INVALID_CREDENTIALS", marker: "LOGIN_NO_PASSWORD", matchedBy },
+        { status: 401 }
+      );
+    }
 
-    // ✅ 여기서부터: 관리자 판별 (id/username 둘 다 체크)
+    if (isScryptStored(stored)) {
+      const v = verifyScrypt(pw, stored);
+      if (!v.ok) {
+        return NextResponse.json(
+          { ok: false, error: "INVALID_CREDENTIALS", marker: "LOGIN_BAD_PASSWORD_SCRYPT", matchedBy, verify: v },
+          { status: 401 }
+        );
+      }
+    } else {
+      // ✅ legacy 평문 계정: 맞으면 통과 + 즉시 scrypt로 업그레이드
+      if (pw !== stored) {
+        return NextResponse.json(
+          { ok: false, error: "INVALID_CREDENTIALS", marker: "LOGIN_BAD_PASSWORD_PLAIN", matchedBy },
+          { status: 401 }
+        );
+      }
+
+      const upgraded = makePasswordHash(pw);
+
+      // password_hash 컬럼이 있으면 거기에, 없으면 password에 저장
+      // (둘 다 있는 스키마도 고려해서 둘 다 갱신해도 됨)
+      const patch: any = {};
+      if (row.password_hash !== undefined && row.password_hash !== null) patch.password_hash = upgraded;
+      else patch.password = upgraded;
+
+      // 둘 다 존재하면 둘 다 넣어주자(안전)
+      if (row.password_hash !== undefined) patch.password_hash = upgraded;
+      if (row.password !== undefined) patch.password = upgraded;
+
+      await sb.from(TABLE).update(patch).eq("id", row.id);
+    }
+
+    // ✅ 관리자 판별
     const empId = s(row.emp_id || id);
     const username = s(row.username);
     const team = s(row.team) || null;
@@ -212,7 +212,6 @@ else {
     const dbRole = s(row.role);
     const role = isAdminId ? "admin" : (dbRole || "user");
 
-    // ✅ next 우선, 없으면 role 기준
     const redirect = next || (role === "admin" ? "/admin" : "/exam");
 
     const res = NextResponse.json({
@@ -220,7 +219,7 @@ else {
       empId,
       role,
       team,
-      isAdmin: role === "admin", // ✅ 여기 따옴표/문법 오류 수정
+      isAdmin: role === "admin",
       matchedBy,
       marker: "LOGIN_OK",
       redirect,
