@@ -32,19 +32,56 @@ function getCookie(req: Request, name: string) {
   return "";
 }
 
+function isMissingColumn(err: any, col: string) {
+  const msg = String(err?.message || err || "");
+  // 예: column accounts.username does not exist
+  // 예: Could not find the 'username' column of 'accounts' in the schema cache
+  return (
+    msg.includes(`column accounts.${col} does not exist`) ||
+    msg.includes(`Could not find the '${col}' column`) ||
+    (msg.toLowerCase().includes(col) && msg.toLowerCase().includes("does not exist"))
+  );
+}
+
 // ✅ accounts에서 team 읽기 (없으면 A)
+// ✅ username 컬럼이 없는 DB에서도 절대 안 터지게 안전 처리
 async function pickTeamFromAccounts(empId: string) {
-  const { data, error } = await sb
+  // 1) emp_id로 먼저
+  const r1 = await sb
     .from("accounts")
-    .select("team, is_active")
-    .or(`emp_id.eq.${empId},username.eq.${empId}`)
+    .select("team, is_active, emp_id")
+    .eq("emp_id", empId)
     .maybeSingle();
 
-  if (error) throw error;
+  if (r1.error) throw r1.error;
+  if (r1.data) {
+    const isActive = r1.data.is_active === false ? false : true;
+    const team = s(r1.data.team || "A") || "A";
+    return { team, isActive, matchedBy: "emp_id" as const };
+  }
 
-  const isActive = data?.is_active === false ? false : true;
-  const team = s(data?.team || "A") || "A";
-  return { team, isActive };
+  // 2) 없으면 username으로 fallback (단, username 컬럼 없으면 스킵)
+  const r2 = await sb
+    .from("accounts")
+    .select("team, is_active, emp_id")
+    .eq("username", empId)
+    .maybeSingle();
+
+  if (r2.error) {
+    // ✅ username 컬럼이 없으면 그냥 계정 없음 처리로 넘김
+    if (isMissingColumn(r2.error, "username")) {
+      return { team: "A", isActive: true, matchedBy: "none" as const, notFound: true as const };
+    }
+    throw r2.error;
+  }
+
+  if (!r2.data) {
+    return { team: "A", isActive: true, matchedBy: "none" as const, notFound: true as const };
+  }
+
+  const isActive = r2.data.is_active === false ? false : true;
+  const team = s(r2.data.team || "A") || "A";
+  return { team, isActive, matchedBy: "username" as const };
 }
 
 export async function POST(req: Request) {
@@ -54,11 +91,20 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "NO_SESSION" }, { status: 401 });
     }
 
-    const teamInfo = await pickTeamFromAccounts(empId);
+    const teamInfo: any = await pickTeamFromAccounts(empId);
+
+    if (teamInfo?.notFound) {
+      return NextResponse.json(
+        { ok: false, error: "ACCOUNT_NOT_FOUND", detail: { empId } },
+        { status: 401 }
+      );
+    }
+
     if (!teamInfo.isActive) {
       return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
     }
-    const team = teamInfo.team;
+
+    const team = s(teamInfo.team || "A") || "A";
 
     // ✅ 내 팀 문제만 가져오기
     const q1 = await sb
@@ -116,9 +162,6 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
 
   const nowIso = new Date().toISOString();
 
-  // ✅ exam_attempts 스키마에 맞게 INSERT (현재 DB에 있는 컬럼만 쓰는 걸 추천)
-  // ⚠️ 너 DB에 total_points/correct_count/wrong_count 컬럼이 없어서 전에 터졌었음
-  // -> 일단 안전하게 "확실한 컬럼"만 넣어 (필요하면 나중에 컬럼 추가해서 확장)
   const insertRow: any = {
     emp_id: empId,
     status: "STARTED",
@@ -128,7 +171,8 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
     score: 0,
     question_ids: pickedIds,
     answers: {}, // map 형태(JSON)
-    team,        // ✅ 이제 DB에 team 컬럼 추가했으니 반드시 저장
+    team,        // ✅ team 저장
+    // total_points 는 DB 컬럼 없으면 넣지 말자 (안전)
   };
 
   const r1 = await sb.from("exam_attempts").insert(insertRow).select("id").single();
@@ -155,9 +199,9 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
 
   return NextResponse.json({
     ok: true,
-    attemptId: String(attempt.id), // ✅ 숫자 id
+    attemptId: String(attempt.id),
     questions: outQuestions,
-    debug: { empId, team, picked: outQuestions.length },
+    debug: { empId, team, picked: outQuestions.length, totalPoints },
   });
 }
 
