@@ -40,8 +40,9 @@ function isMissingColumn(err: any, col: string) {
   const msg = String(err?.message || err || "");
   const low = msg.toLowerCase();
   return (
-    low.includes("does not exist") && low.includes(col.toLowerCase())
-  ) || msg.includes(`Could not find the '${col}' column`);
+    (low.includes("does not exist") && low.includes(col.toLowerCase())) ||
+    msg.includes(`Could not find the '${col}' column`)
+  );
 }
 
 /**
@@ -59,7 +60,12 @@ async function pickAccountInfo(loginId: string) {
     .maybeSingle();
 
   // ✅ select에 없는 컬럼 때문에 터지면 -> 최소 컬럼로 재시도
-  if (r.error && (isMissingColumn(r.error, "role") || isMissingColumn(r.error, "is_active") || isMissingColumn(r.error, "team"))) {
+  if (
+    r.error &&
+    (isMissingColumn(r.error, "role") ||
+      isMissingColumn(r.error, "is_active") ||
+      isMissingColumn(r.error, "team"))
+  ) {
     r = await sb
       .from("accounts")
       .select("emp_id, team") // 최소
@@ -94,7 +100,11 @@ async function pickAccountInfo(loginId: string) {
       return { found: false as const };
     }
     // role/is_active/team 없어서 터진 경우 최소로 재시도
-    if (isMissingColumn(r2.error, "role") || isMissingColumn(r2.error, "is_active") || isMissingColumn(r2.error, "team")) {
+    if (
+      isMissingColumn(r2.error, "role") ||
+      isMissingColumn(r2.error, "is_active") ||
+      isMissingColumn(r2.error, "team")
+    ) {
       r2 = await sb
         .from("accounts")
         .select("emp_id, team")
@@ -123,6 +133,13 @@ async function pickAccountInfo(loginId: string) {
   };
 }
 
+/** ✅ 팀 → 소유 관리자 고정 매핑 */
+function mapOwnerAdminByTeam(team: string) {
+  const t = upperTeam(team);
+  // B팀은 admin_gs, 그 외는 admin
+  return t === "B" ? "admin_gs" : "admin";
+}
+
 export async function POST(req: Request) {
   try {
     const empId = s(getCookie(req, "empId"));
@@ -135,18 +152,20 @@ export async function POST(req: Request) {
     const info: any = await pickAccountInfo(empId);
 
     if (!info?.found) {
-      return NextResponse.json({ ok: false, error: "ACCOUNT_NOT_FOUND", detail: { empId } }, { status: 401 });
+      return NextResponse.json(
+        { ok: false, error: "ACCOUNT_NOT_FOUND", detail: { empId } },
+        { status: 401 }
+      );
     }
 
-    // ✅ 비활성(컬럼 없으면 기본 true로 이미 처리됨)
+    // ✅ 비활성
     if (info.is_active === false) {
       return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
     }
 
-    // ✅ 관리자 차단: DB role 컬럼이 있으면 DB 우선, 없으면 cookieRole로라도 막음
+    // ✅ 관리자 차단
     const dbRole = s(info.role).toLowerCase();
-    const effectiveRole = (dbRole && dbRole !== "user") ? dbRole : cookieRole || "user";
-
+    const effectiveRole = dbRole && dbRole !== "user" ? dbRole : cookieRole || "user";
     if (effectiveRole === "admin") {
       return NextResponse.json(
         { ok: false, error: "ADMIN_CANNOT_TAKE_EXAM", detail: { empId, matchedBy: info.matchedBy } },
@@ -164,13 +183,12 @@ export async function POST(req: Request) {
       .eq("is_active", true)
       .limit(5000);
 
-    // is_active 컬럼이 없을 수 있으니 fallback
+    // is_active 컬럼 없을 수 있으니 fallback
     let qrows: any[] | null = null;
 
     if (!q1.error) {
       qrows = q1.data || [];
     } else {
-      // is_active가 없어서 터졌으면 fallback
       if (isMissingColumn(q1.error, "is_active")) {
         const q2 = await sb
           .from("questions")
@@ -179,11 +197,17 @@ export async function POST(req: Request) {
           .limit(5000);
 
         if (q2.error) {
-          return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q2.error }, { status: 500 });
+          return NextResponse.json(
+            { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q2.error },
+            { status: 500 }
+          );
         }
         qrows = q2.data || [];
       } else {
-        return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q1.error }, { status: 500 });
+        return NextResponse.json(
+          { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q1.error },
+          { status: 500 }
+        );
       }
     }
 
@@ -194,7 +218,10 @@ export async function POST(req: Request) {
       );
     }
 
-    return await createAttemptAndRespond(info.emp_id || empId, team, qrows);
+    // ✅ 팀 기준으로 owner_admin 고정 저장
+    const ownerAdmin = mapOwnerAdminByTeam(team);
+
+    return await createAttemptAndRespond(info.emp_id || empId, team, qrows, ownerAdmin);
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "START_FATAL", detail: String(e?.message ?? e) },
@@ -203,7 +230,7 @@ export async function POST(req: Request) {
   }
 }
 
-async function createAttemptAndRespond(empId: string, team: string, qrows: any[]) {
+async function createAttemptAndRespond(empId: string, team: string, qrows: any[], ownerAdmin: string) {
   const picked = shuffle(qrows).slice(0, Math.min(20, qrows.length));
   const pickedIds = picked.map((q: any) => String(q.id));
   const totalPoints = picked.reduce((sum: number, q: any) => sum + n(q?.points, 5), 0);
@@ -220,9 +247,18 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
     question_ids: pickedIds,
     answers: {},
     team,
+
+    // ✅ 추가: 소유 관리자(팀 기준 고정)
+    owner_admin: ownerAdmin,
   };
 
-  const r1 = await sb.from("exam_attempts").insert(insertRow).select("id").single();
+  // owner_admin 컬럼이 아직 없으면(배포/마이그레이션 전) 터질 수 있으니 fallback
+  let r1 = await sb.from("exam_attempts").insert(insertRow).select("id").single();
+
+  if (r1.error && isMissingColumn(r1.error, "owner_admin")) {
+    const { owner_admin, ...withoutOwner } = insertRow;
+    r1 = await sb.from("exam_attempts").insert(withoutOwner).select("id").single();
+  }
 
   if (r1.error || !r1.data?.id) {
     return NextResponse.json(
@@ -246,7 +282,7 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
     ok: true,
     attemptId: String(r1.data.id),
     questions: outQuestions,
-    debug: { empId, team, picked: outQuestions.length, totalPoints },
+    debug: { empId, team, picked: outQuestions.length, totalPoints, owner_admin: ownerAdmin },
   });
 }
 
