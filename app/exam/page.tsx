@@ -11,7 +11,7 @@ type Q = {
 };
 
 type StartResp =
-  | { ok: true; attemptId: string; questions: Q[] }
+  | { ok: true; attemptId: string; questions: Q[]; debug?: any }
   | { ok: false; error: string; detail?: any };
 
 type SubmitResp =
@@ -50,6 +50,12 @@ function fmtRemain(sec: number) {
 
 const EXAM_LIMIT_SEC = 15 * 60; // 15분
 
+function getCookie(name: string) {
+  if (typeof document === "undefined") return "";
+  const m = document.cookie.match(new RegExp("(^| )" + name + "=([^;]+)"));
+  return m ? decodeURIComponent(m[2]) : "";
+}
+
 export default function ExamPage() {
   const router = useRouter();
 
@@ -62,8 +68,14 @@ export default function ExamPage() {
   const [remainSec, setRemainSec] = useState<number>(EXAM_LIMIT_SEC);
   const submittingRef = useRef(false);
 
-  // 시작 (페이지 들어올 때마다 start 호출됨 → 결과페이지 404로 돌아오면 리셋되는 원인이었음)
+  // ✅ 핵심: 관리자면 /exam에서 start 호출 자체를 안 하고 /admin으로 보낸다
   useEffect(() => {
+    const role = (getCookie("role") || "").trim().toLowerCase();
+    if (role === "admin") {
+      router.replace("/admin");
+      return;
+    }
+
     let alive = true;
 
     async function run() {
@@ -80,8 +92,15 @@ export default function ExamPage() {
 
         const json: StartResp = await res.json().catch(() => ({} as any));
 
+        // ✅ start API가 "관리자 시험 금지"를 주면 여기서도 바로 /admin 보냄
+        const errCode = (json as any)?.error || "";
+        if (res.status === 403 && (errCode === "ADMIN_CANNOT_TAKE_EXAM" || errCode === "ACCOUNT_DISABLED")) {
+          router.replace("/admin");
+          return;
+        }
+
         if (!res.ok || !json || (json as any).ok !== true) {
-          const msg = (json as any)?.error || `START_FAILED (status ${res.status})`;
+          const msg = errCode || `START_FAILED (status ${res.status})`;
           const detail = (json as any)?.detail;
           throw new Error(detail ? `${msg}\n${safeText(detail)}` : msg);
         }
@@ -103,7 +122,7 @@ export default function ExamPage() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [router]);
 
   // 15분 타이머
   useEffect(() => {
@@ -136,7 +155,6 @@ export default function ExamPage() {
       return;
     }
 
-    // 수동 제출만 답안 체크
     if (!isAuto) {
       if (!answers || Object.keys(answers).length === 0) {
         setErrText("답안을 하나도 선택하지 않았습니다.");
@@ -164,9 +182,6 @@ export default function ExamPage() {
       }
 
       const id = String((json as any).attemptId ?? attemptId);
-
-      // ✅ 결과 페이지 404 때문에 /exam으로 되돌아오며 리셋됐던 거라
-      // ✅ 여기서는 /exam/result를 “고정”으로 보냄
       router.push(`/exam/result/${id}`);
     } catch (e: any) {
       submittingRef.current = false;
