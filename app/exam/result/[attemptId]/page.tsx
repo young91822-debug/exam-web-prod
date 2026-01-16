@@ -52,7 +52,6 @@ function pickChoices(g: any): any[] {
 
 /** ✅ 다양한 API 형태를 "화면용" 하나로 통일 + selectedIndex를 attempt.answers로 보강 */
 function normalizePayload(payload: any) {
-  // attempt 후보
   const rawAttempt =
     payload?.attempt ??
     payload?.data?.attempt ??
@@ -80,7 +79,6 @@ function normalizePayload(payload: any) {
           "-",
         startedAt: rawAttempt?.started_at ?? rawAttempt?.startedAt ?? rawAttempt?.created_at ?? null,
         submittedAt: rawAttempt?.submitted_at ?? rawAttempt?.submittedAt ?? rawAttempt?.ended_at ?? null,
-        // ✅ 여기 중요: /api/result 는 attempt.answers를 내려줌
         answers:
           rawAttempt?.answers && typeof rawAttempt.answers === "object"
             ? (rawAttempt.answers as Record<string, any>)
@@ -88,7 +86,6 @@ function normalizePayload(payload: any) {
       }
     : null;
 
-  // graded 후보
   const rawGraded =
     payload?.graded ??
     payload?.wrongQuestions ??
@@ -101,7 +98,6 @@ function normalizePayload(payload: any) {
     ? rawGraded.map((g: any) => {
         const questionId = g?.questionId ?? g?.question_id ?? g?.id ?? null;
 
-        // 1) graded 내부에서 먼저 찾기
         const selectedFromG =
           toIndex(g?.selectedIndex) ??
           toIndex(g?.selected_index) ??
@@ -118,7 +114,6 @@ function normalizePayload(payload: any) {
           toIndex(g?.answerIndex) ??
           toIndex(g?.answer_index);
 
-        // 2) graded에 없으면 attempt.answers[questionId]에서 보강
         const selectedFromAttempt =
           selectedFromG === null && attempt?.answers && questionId
             ? toIndex((attempt.answers as any)[String(questionId)])
@@ -188,9 +183,7 @@ export default function ExamResultPage() {
       setLoading(true);
       setErr(null);
 
-      // ✅ 핵심: "내 선택" 보장하려면 attempt.answers가 있는 /api/result 를 써야 함
       const url = `/api/result/${attemptId}`;
-
       const r = await fetchAny(url);
 
       const looksOk = r.json && r.json.ok === true;
@@ -214,28 +207,88 @@ export default function ExamResultPage() {
     };
   }, [attemptId]);
 
-  if (loading) return <div style={{ padding: 16 }}>결과 불러오는 중…</div>;
+  const pageBg: React.CSSProperties = {
+    minHeight: "100vh",
+    padding: 16,
+    background:
+      "radial-gradient(1200px 600px at 20% 10%, rgba(99,102,241,0.14), transparent 60%)," +
+      "radial-gradient(900px 500px at 80% 30%, rgba(16,185,129,0.12), transparent 60%)," +
+      "linear-gradient(180deg, #0b1020 0%, #070a12 100%)",
+    color: "white",
+    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+  };
+
+  const container: React.CSSProperties = { maxWidth: 980, margin: "0 auto" };
+
+  const card: React.CSSProperties = {
+    borderRadius: 18,
+    background: "rgba(255,255,255,0.06)",
+    border: "1px solid rgba(255,255,255,0.10)",
+    boxShadow: "0 18px 60px rgba(0,0,0,0.35)",
+    padding: 16,
+    backdropFilter: "blur(10px)",
+  };
+
+  const btn: React.CSSProperties = {
+    padding: "10px 12px",
+    borderRadius: 14,
+    border: "1px solid rgba(255,255,255,0.12)",
+    background: "rgba(255,255,255,0.06)",
+    color: "white",
+    fontWeight: 900,
+    cursor: "pointer",
+  };
+
+  const pill = (bg: string, fg: string): React.CSSProperties => ({
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "6px 10px",
+    borderRadius: 999,
+    border: "1px solid rgba(255,255,255,0.10)",
+    background: bg,
+    color: fg,
+    fontSize: 12,
+    fontWeight: 900,
+    whiteSpace: "nowrap",
+  });
+
+  if (loading) {
+    return (
+      <div style={pageBg}>
+        <div style={container}>
+          <div style={card}>
+            <div style={{ fontSize: 18, fontWeight: 900 }}>결과 불러오는 중…</div>
+            <div style={{ marginTop: 8, color: "rgba(255,255,255,0.70)", fontSize: 13 }}>
+              잠시만 기다려 주세요.
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (err) {
     return (
-      <div style={{ padding: 16 }}>
-        <div style={{ fontSize: 18, fontWeight: 800 }}>결과 페이지 에러</div>
-        <div style={{ marginTop: 8, color: "#b00", fontWeight: 700 }}>{err}</div>
-        <pre style={{ whiteSpace: "pre-wrap", marginTop: 12 }}>{JSON.stringify(debug, null, 2)}</pre>
+      <div style={pageBg}>
+        <div style={container}>
+          <div style={card}>
+            <div style={{ fontSize: 18, fontWeight: 900 }}>결과 페이지 에러</div>
+            <div style={{ marginTop: 8, color: "#ffb4b4", fontWeight: 900 }}>{err}</div>
 
-        <div style={{ marginTop: 14, display: "flex", gap: 8 }}>
-          <button
-            onClick={() => router.push("/exam")}
-            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white" }}
-          >
-            다시 시험 보기
-          </button>
-          <button
-            onClick={() => location.reload()}
-            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white" }}
-          >
-            새로고침
-          </button>
+            <pre style={{ whiteSpace: "pre-wrap", marginTop: 12, color: "rgba(255,255,255,0.75)" }}>
+              {JSON.stringify(debug, null, 2)}
+            </pre>
+
+            <div style={{ marginTop: 14, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button onClick={() => router.push("/exam")} style={btn}>
+                다시 시험 보기
+              </button>
+              <button onClick={() => location.reload()} style={btn}>
+                새로고침
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -248,112 +301,188 @@ export default function ExamResultPage() {
   const startedAt = attempt?.startedAt ?? null;
   const submittedAt = attempt?.submittedAt ?? null;
 
-  return (
-    <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-        <div>
-          <div style={{ fontSize: 18, fontWeight: 900 }}>시험 결과</div>
-          <div style={{ marginTop: 6, fontSize: 13, opacity: 0.75 }}>attemptId: {attemptId}</div>
-        </div>
-        <button
-          onClick={() => router.push("/exam")}
-          style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", fontWeight: 800 }}
-        >
-          다시 시험 보기
-        </button>
-      </div>
+  // 상태 배지
+  const total = Array.isArray(graded) ? graded.length : 0;
+  const wrong = Array.isArray(graded) ? graded.filter((g: any) => g?.isCorrect === false || g?.status === "wrong").length : 0;
+  const unsubmitted = Array.isArray(graded) ? graded.filter((g: any) => (g?.status === "unsubmitted" || toIndex(g?.selectedIndex) == null)).length : 0;
 
-      <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 14, padding: 14 }}>
-        <div style={{ fontWeight: 900, marginBottom: 8 }}>요약</div>
-        <div style={{ display: "grid", gridTemplateColumns: "140px 1fr", rowGap: 6, columnGap: 10 }}>
-          <div style={{ opacity: 0.7 }}>점수</div>
-          <div style={{ fontWeight: 900 }}>
-            {score} / {totalPoints}
+  return (
+    <div style={pageBg}>
+      <style>{`
+        .smooth { transition: all 160ms ease; }
+        .lift:hover { transform: translateY(-1px); border-color: rgba(255,255,255,0.18); background: rgba(255,255,255,0.08); }
+        .choice:hover { background: rgba(255,255,255,0.07); }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      `}</style>
+
+      <div style={container}>
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontSize: 20, fontWeight: 950, letterSpacing: -0.2 }}>시험 결과</div>
+            <div className="mono" style={{ marginTop: 6, fontSize: 12, color: "rgba(255,255,255,0.60)" }}>
+              attemptId: {attemptId}
+            </div>
           </div>
 
-          <div style={{ opacity: 0.7 }}>응시 시작</div>
-          <div>{fmt(startedAt)}</div>
+          <button onClick={() => router.push("/exam")} className="smooth lift" style={btn}>
+            다시 시험 보기 →
+          </button>
+        </div>
 
-          <div style={{ opacity: 0.7 }}>제출 시각</div>
-          <div>{fmt(submittedAt)}</div>
+        {/* Summary */}
+        <div style={{ marginTop: 12, ...card }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+            <div>
+              <div style={{ fontWeight: 950 }}>요약</div>
+              <div style={{ marginTop: 6, color: "rgba(255,255,255,0.70)", fontSize: 13 }}>
+                점수와 제출 정보를 확인하세요.
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <span style={pill("rgba(34,197,94,0.12)", "rgba(255,255,255,0.92)")}>✅ 총 {total}문항</span>
+              <span style={pill("rgba(239,68,68,0.12)", "rgba(255,255,255,0.92)")}>❌ 오답 {wrong}</span>
+              <span style={pill("rgba(148,163,184,0.12)", "rgba(255,255,255,0.82)")}>⏸ 미제출 {unsubmitted}</span>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "140px 1fr", rowGap: 8, columnGap: 10, fontSize: 13 }}>
+            <div style={{ color: "rgba(255,255,255,0.65)" }}>점수</div>
+            <div style={{ fontWeight: 950 }}>
+              {score} <span style={{ color: "rgba(255,255,255,0.60)" }}>/ {totalPoints}</span>
+            </div>
+
+            <div style={{ color: "rgba(255,255,255,0.65)" }}>응시 시작</div>
+            <div>{fmt(startedAt)}</div>
+
+            <div style={{ color: "rgba(255,255,255,0.65)" }}>제출 시각</div>
+            <div>{fmt(submittedAt)}</div>
+          </div>
+        </div>
+
+        {/* Debug (접기 느낌) */}
+        <div style={{ marginTop: 10, fontSize: 12, color: "rgba(255,255,255,0.45)" }}>
+          debug: <span className="mono">{JSON.stringify(debug)}</span>
+        </div>
+
+        {/* Questions */}
+        {Array.isArray(graded) && graded.length > 0 ? (
+          <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+            {graded.map((g: any, idx: number) => {
+              const selectedIndex = toIndex(g?.selectedIndex);
+              const correctIndex = toIndex(g?.correctIndex);
+
+              const isWrong = g?.isCorrect === false || g?.status === "wrong";
+              const isUnsubmitted = g?.status === "unsubmitted" || selectedIndex == null;
+
+              const borderColor = isWrong ? "rgba(239,68,68,0.75)" : isUnsubmitted ? "rgba(148,163,184,0.45)" : "rgba(255,255,255,0.10)";
+              const bg = isWrong ? "rgba(239,68,68,0.06)" : isUnsubmitted ? "rgba(148,163,184,0.06)" : "rgba(255,255,255,0.05)";
+
+              const choices = Array.isArray(g?.choices) ? g.choices : [];
+
+              return (
+                <div key={String(g?.questionId ?? idx)} style={{ ...card, borderColor, background: bg, padding: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+                    <div style={{ fontWeight: 950, fontSize: 15 }}>
+                      Q{idx + 1}. {g?.content ?? ""}
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      {isWrong ? (
+                        <span style={pill("rgba(239,68,68,0.16)", "rgba(255,255,255,0.92)")}>오답</span>
+                      ) : isUnsubmitted ? (
+                        <span style={pill("rgba(148,163,184,0.16)", "rgba(255,255,255,0.82)")}>미제출</span>
+                      ) : (
+                        <span style={pill("rgba(34,197,94,0.16)", "rgba(255,255,255,0.92)")}>정답</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+                    {choices.map((c: any, i: number) => {
+                      const isCorrectChoice = correctIndex === i;
+                      const isMyChoice = selectedIndex !== null && selectedIndex === i;
+
+                      const chip = isCorrectChoice ? "정답" : isMyChoice ? "내 선택" : "";
+                      const chipBg = isCorrectChoice
+                        ? "rgba(34,197,94,0.18)"
+                        : isMyChoice
+                        ? "rgba(99,102,241,0.18)"
+                        : "transparent";
+
+                      return (
+                        <div
+                          key={i}
+                          className="smooth choice"
+                          style={{
+                            border: "1px solid rgba(255,255,255,0.10)",
+                            borderRadius: 14,
+                            padding: "10px 12px",
+                            display: "flex",
+                            justifyContent: "space-between",
+                            gap: 12,
+                            alignItems: "flex-start",
+                          }}
+                        >
+                          <div style={{ whiteSpace: "pre-wrap", color: "rgba(255,255,255,0.92)" }}>
+                            <span style={{ color: "rgba(255,255,255,0.55)", fontWeight: 800 }}>{i + 1}.</span>{" "}
+                            {String(c ?? "")}
+                          </div>
+
+                          <div
+                            style={{
+                              minWidth: 54,
+                              textAlign: "right",
+                              fontSize: 12,
+                              fontWeight: 950,
+                              color: chip ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.20)",
+                            }}
+                          >
+                            <span
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                padding: chip ? "6px 10px" : "6px 10px",
+                                borderRadius: 999,
+                                border: "1px solid rgba(255,255,255,0.10)",
+                                background: chip ? chipBg : "rgba(255,255,255,0.06)",
+                              }}
+                            >
+                              {chip || "•"}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap", fontSize: 13 }}>
+                    <span style={pill("rgba(99,102,241,0.12)", "rgba(255,255,255,0.92)")}>
+                      내 선택: {selectedIndex != null ? selectedIndex + 1 : "-"}
+                    </span>
+                    <span style={pill("rgba(34,197,94,0.12)", "rgba(255,255,255,0.92)")}>
+                      정답: {correctIndex != null ? correctIndex + 1 : "-"}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div style={{ marginTop: 14, ...card }}>
+            표시할 상세 결과가 없습니다. (API가 graded를 안 내려주거나, 경로가 다를 수 있음)
+            <pre style={{ whiteSpace: "pre-wrap", marginTop: 12, color: "rgba(255,255,255,0.75)" }}>
+              {JSON.stringify(payload, null, 2)}
+            </pre>
+          </div>
+        )}
+
+        <div style={{ marginTop: 18, fontSize: 12, color: "rgba(255,255,255,0.45)" }}>
+          © {new Date().getFullYear()} Exam Web • Internal Use Only
         </div>
       </div>
-
-      <div style={{ marginTop: 12, fontSize: 12, opacity: 0.6 }}>debug: {JSON.stringify(debug)}</div>
-
-      {Array.isArray(graded) && graded.length > 0 ? (
-        <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
-          {graded.map((g: any, idx: number) => {
-            const selectedIndex = toIndex(g?.selectedIndex);
-            const correctIndex = toIndex(g?.correctIndex);
-
-            const isWrong = g?.isCorrect === false || g?.status === "wrong";
-            const isUnsubmitted = g?.status === "unsubmitted" || selectedIndex == null;
-
-            const borderColor = isWrong ? "#ff3b30" : isUnsubmitted ? "#bbb" : "#eee";
-            const bg = isWrong ? "rgba(255,59,48,0.04)" : isUnsubmitted ? "rgba(0,0,0,0.03)" : "white";
-
-            const choices = Array.isArray(g?.choices) ? g.choices : [];
-
-            return (
-              <div
-                key={String(g?.questionId ?? idx)}
-                style={{ border: `2px solid ${borderColor}`, background: bg, borderRadius: 14, padding: 14 }}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ fontWeight: 900 }}>
-                    Q{idx + 1}. {g?.content ?? ""}
-                  </div>
-                  <div style={{ fontSize: 12, opacity: 0.8, whiteSpace: "nowrap" }}>
-                    {isWrong ? "오답" : isUnsubmitted ? "미제출" : ""}
-                  </div>
-                </div>
-
-                <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
-                  {choices.map((c: any, i: number) => {
-                    const tag =
-                      correctIndex === i
-                        ? "정답"
-                        : selectedIndex !== null && selectedIndex === i
-                        ? "내 선택"
-                        : "";
-                    return (
-                      <div
-                        key={i}
-                        style={{
-                          border: "1px solid #eee",
-                          borderRadius: 12,
-                          padding: "10px 12px",
-                          display: "flex",
-                          justifyContent: "space-between",
-                          gap: 12,
-                        }}
-                      >
-                        <div style={{ whiteSpace: "pre-wrap" }}>
-                          {i + 1}. {String(c ?? "")}
-                        </div>
-                        <div style={{ fontSize: 12, fontWeight: 900, opacity: tag ? 0.9 : 0.2 }}>
-                          {tag || "•"}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
-                  <div>내 선택: {selectedIndex != null ? selectedIndex + 1 : "-"}</div>
-                  <div>정답: {correctIndex != null ? correctIndex + 1 : "-"}</div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      ) : (
-        <div style={{ marginTop: 14, padding: 16, border: "1px solid #eee", borderRadius: 14 }}>
-          표시할 상세 결과가 없습니다. (API가 graded를 안 내려주거나, 경로가 다를 수 있음)
-          <pre style={{ whiteSpace: "pre-wrap", marginTop: 12 }}>{JSON.stringify(payload, null, 2)}</pre>
-        </div>
-      )}
     </div>
   );
 }
