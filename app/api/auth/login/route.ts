@@ -75,7 +75,14 @@ export async function POST(req: NextRequest) {
     const body = await readBodyAny(req);
 
     // ✅ 여러 키 형태 전부 허용
-    const id = s(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id ?? body?.username ?? body?.loginId);
+    const id = s(
+      body?.id ??
+        body?.user_id ??
+        body?.empId ??
+        body?.emp_id ??
+        body?.username ??
+        body?.loginId
+    );
     const pw = s(body?.pw ?? body?.password ?? body?.pass ?? body?.pwd);
 
     if (!id || !pw) {
@@ -95,11 +102,11 @@ export async function POST(req: NextRequest) {
 
     const sb: any = supabaseAdmin;
 
-    // ✅ 계정 조회
+    // ✅ 계정 조회 (핵심 수정: user_id 컬럼 없음 → emp_id / username으로 조회)
     const { data, error } = await sb
       .from(TABLE)
       .select("*")
-      .eq("user_id", id)
+      .or(`emp_id.eq.${id},username.eq.${id}`)
       .maybeSingle();
 
     if (error) {
@@ -113,14 +120,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    // ✅ 활성 체크(컬럼명이 다를 수도 있어서 방어)
+    // ✅ 활성 체크
     const isActive =
       data?.is_active === undefined || data?.is_active === null ? true : Boolean(data.is_active);
     if (!isActive) {
       return NextResponse.json({ ok: false, error: "INACTIVE_ACCOUNT" }, { status: 403 });
     }
 
-    // ✅ 비번 검증: password_hash 우선, 없으면 password(평문) fallback (초기세팅용)
+    // ✅ 비번 검증: password_hash 우선, 없으면 password(평문) fallback
     const storedHash = s(data?.password_hash);
     const storedPlain = s(data?.password);
 
