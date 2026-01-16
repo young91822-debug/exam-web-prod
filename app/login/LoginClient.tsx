@@ -24,11 +24,26 @@ function s(v: any) {
   return String(v ?? "").trim();
 }
 
+function safePath(p: string) {
+  const x = s(p);
+  // 외부 URL 차단 + 공백 제거
+  if (!x) return "";
+  if (x.startsWith("http://") || x.startsWith("https://")) return "";
+  if (!x.startsWith("/")) return "";
+  return x;
+}
+
+function isAdminPath(p: string) {
+  const x = safePath(p);
+  return x === "/admin" || x.startsWith("/admin/");
+}
+
 /* ---------- component ---------- */
 export default function LoginClient() {
   const router = useRouter();
   const sp = useSearchParams();
-  const next = s(sp.get("next")) || "";
+  const nextRaw = s(sp.get("next"));
+  const next = safePath(nextRaw);
 
   const [id, setId] = useState("");
   const [pw, setPw] = useState("");
@@ -42,7 +57,6 @@ export default function LoginClient() {
     const id2 = s(id);
     const pw2 = s(pw);
 
-    // ✅ 프론트 1차 방어
     if (!id2 || !pw2) {
       setMsg("아이디/비밀번호를 입력하세요.");
       return;
@@ -62,7 +76,6 @@ export default function LoginClient() {
         ? JSON.parse(text)
         : ({ ok: false, error: "EMPTY_RESPONSE" } as LoginFail);
 
-      // ✅ 실패 분기 (여기서만 error 접근)
       if (!res.ok || !json.ok) {
         const errCode = (json as LoginFail)?.error || `HTTP_${res.status}`;
 
@@ -73,7 +86,7 @@ export default function LoginClient() {
             ? "계정이 없습니다."
             : errCode === "PASSWORD_NOT_SET"
             ? "비밀번호가 설정되지 않았습니다."
-            : errCode === "USER_INACTIVE"
+            : errCode === "USER_INACTIVE" || errCode === "INACTIVE_ACCOUNT"
             ? "비활성 계정입니다."
             : "로그인 실패: 아이디/비밀번호를 확인하세요."
         );
@@ -82,9 +95,27 @@ export default function LoginClient() {
 
       // ✅ 성공
       const ok = json as LoginOk;
-      const redirect =
-        s(ok.redirect) ||
-        (next ? next : ok.role === "admin" ? "/admin" : "/exam");
+      const role = s(ok.role);
+
+      // 서버가 주는 redirect(있으면)도 안전하게
+      const apiRedirect = safePath(ok.redirect || "");
+
+      // ✅ 관리자 리다이렉트 규칙:
+      // - next가 /admin... 이면 next로
+      // - 아니면 무조건 /admin
+      // (apiRedirect는 "명시적으로 서버가 준 것"이라 admin이면 admin쪽만 허용)
+      let redirect = "";
+      if (role === "admin") {
+        if (isAdminPath(next)) redirect = next;
+        else if (isAdminPath(apiRedirect)) redirect = apiRedirect;
+        else redirect = "/admin";
+      } else {
+        // ✅ 일반 사용자:
+        // - apiRedirect 있으면 그거
+        // - next 있으면 그거
+        // - 없으면 /exam
+        redirect = apiRedirect || next || "/exam";
+      }
 
       router.replace(redirect);
       router.refresh();
