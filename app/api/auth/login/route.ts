@@ -1,17 +1,24 @@
 // app/api/auth/login/route.ts
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 const TABLE = "accounts";
+const sb: any = supabaseAdmin;
+
+// ✅ 관리자 fallback
+const ADMIN_IDS = new Set(["admin", "admin_gs"]);
 
 function s(v: any) {
   return String(v ?? "").trim();
 }
 
-/** scrypt 저장 포맷: scrypt$<saltB64>$<hashB64> */
-function verifyScrypt(plain: string, stored: string) {
+/** stored 포맷: scrypt$<saltB64>$<hashB64> */
+function verifyPasswordHash(plain: string, stored: string) {
   try {
     const [algo, saltB64, hashB64] = String(stored || "").split("$");
     if (algo !== "scrypt" || !saltB64 || !hashB64) return false;
@@ -29,191 +36,92 @@ function verifyScrypt(plain: string, stored: string) {
   }
 }
 
-async function readBodyAny(req: NextRequest): Promise<any> {
+async function readBody(req: Request) {
   try {
     return await req.json();
-  } catch {}
-  try {
-    const fd = await req.formData();
-    const obj: any = {};
-    fd.forEach((v, k) => (obj[k] = v));
-    if (Object.keys(obj).length) return obj;
-  } catch {}
-  try {
-    const t = await req.text();
-    if (!t) return {};
-    try {
-      return JSON.parse(t);
-    } catch {}
-    const params = new URLSearchParams(t);
-    const obj: any = {};
-    params.forEach((v, k) => (obj[k] = v));
-    return obj;
   } catch {
-    return {};
+    try {
+      const t = await req.text();
+      return t ? JSON.parse(t) : {};
+    } catch {
+      return {};
+    }
   }
 }
 
-const ADMIN_IDS = new Set(["admin", "admin_gs"]);
-
-function getProjectRef() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
-  const m = url.match(/^https:\/\/([^.]+)\.supabase\.co/i);
-  return m?.[1] || "(no_url)";
+function cookieStr(name: string, value: string, opt?: { maxAgeSec?: number }) {
+  const maxAge = opt?.maxAgeSec ?? 60 * 60 * 24 * 7; // 7일
+  const isProd = process.env.NODE_ENV === "production";
+  const base = [
+    `${name}=${encodeURIComponent(value)}`,
+    `Path=/`,
+    `Max-Age=${maxAge}`,
+    `SameSite=Lax`,
+    `HttpOnly`,
+  ];
+  if (isProd) base.push("Secure");
+  return base.join("; ");
 }
 
-function isMissingColumn(err: any, col: string) {
-  const msg = String(err?.message || err || "");
-  return (
-    msg.includes(`column ${TABLE}.${col} does not exist`) ||
-    msg.includes(`Could not find the '${col}' column`) ||
-    (msg.toLowerCase().includes(col) && msg.toLowerCase().includes("does not exist"))
-  );
-}
-
-/**
- * ✅ 핵심: password_hash가 비어있어도,
- * password 컬럼에 scrypt$... 해시가 들어간 경우 자동으로 해시로 검증
- */
-function pickStoredForVerify(password_hash: any, password: any) {
-  const ph = s(password_hash);
-  const pw = s(password);
-
-  // 해시는 둘 중 어디에 있어도 OK
-  const isScryptHash = (x: string) => x.startsWith("scrypt$");
-
-  if (isScryptHash(ph)) return { mode: "scrypt" as const, hash: ph, plain: "" };
-  if (isScryptHash(pw)) return { mode: "scrypt" as const, hash: pw, plain: "" };
-
-  // 해시가 없으면 평문 비교(기존 호환)
-  return { mode: "plain" as const, hash: "", plain: pw };
-}
-
-export async function POST(req: NextRequest) {
-  const projectRef = getProjectRef();
-
+export async function POST(req: Request) {
   try {
-    const body = await readBodyAny(req);
-
-    const id = s(
-      body?.id ??
-        body?.emp_id ??
-        body?.empId ??
-        body?.username ??
-        body?.loginId ??
-        body?.user_id
-    );
-    const pw = s(body?.pw ?? body?.password ?? body?.pass ?? body?.pwd);
+    const body = await readBody(req);
+    const id = s(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id);
+    const pw = s(body?.pw ?? body?.password);
 
     if (!id || !pw) {
-      return NextResponse.json({ ok: false, error: "MISSING_FIELDS", projectRef }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "MISSING_FIELDS" }, { status: 400 });
     }
 
-    const sb: any = supabaseAdmin;
-
-    // 1) emp_id로 조회
-    let matchedBy: "emp_id" | "username" = "emp_id";
-    const r1 = await sb.from(TABLE).select("*").eq("emp_id", id).maybeSingle();
-
-    if (r1.error) {
-      return NextResponse.json(
-        { ok: false, error: "DB_READ_FAILED", projectRef, detail: r1.error.message },
-        { status: 500 }
-      );
+    // emp_id 기준 조회(너 시스템 기준)
+    const r = await sb.from(TABLE).select("*").eq("emp_id", id).maybeSingle();
+    if (r.error) {
+      return NextResponse.json({ ok: false, error: "DB_ERROR", detail: String(r.error.message || r.error) }, { status: 500 });
     }
-
-    let row: any = r1.data;
-
-    // 2) 없으면 username fallback (컬럼 없으면 스킵)
+    const row = r.data;
     if (!row) {
-      matchedBy = "username";
-      const r2 = await sb.from(TABLE).select("*").eq("username", id).maybeSingle();
-
-      if (r2.error) {
-        if (!isMissingColumn(r2.error, "username")) {
-          return NextResponse.json(
-            { ok: false, error: "DB_READ_FAILED", projectRef, detail: r2.error.message },
-            { status: 500 }
-          );
-        }
-      } else {
-        row = r2.data;
-      }
+      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    if (!row) {
-      return NextResponse.json(
-        { ok: false, error: "INVALID_CREDENTIALS", projectRef, detail: { matchedBy, found: false } },
-        { status: 401 }
-      );
-    }
-
-    const isActive =
-      row.is_active === null || row.is_active === undefined ? true : Boolean(row.is_active);
-
+    const isActive = row.is_active === undefined || row.is_active === null ? true : Boolean(row.is_active);
     if (!isActive) {
-      return NextResponse.json(
-        { ok: false, error: "INACTIVE_ACCOUNT", projectRef, detail: { matchedBy } },
-        { status: 403 }
-      );
+      return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
     }
 
-    const picked = pickStoredForVerify(row.password_hash, row.password);
-
-    let matchHash = false;
-    let matchPlain = false;
-
-    if (picked.mode === "scrypt") {
-      matchHash = verifyScrypt(pw, picked.hash);
-    } else {
-      matchPlain = picked.plain ? pw === picked.plain : false;
+    const stored = s(row.password_hash ?? row.password ?? "");
+    if (!stored || !verifyPasswordHash(pw, stored)) {
+      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    if (!(matchHash || matchPlain)) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "INVALID_CREDENTIALS",
-          projectRef,
-          detail: {
-            matchedBy,
-            found: true,
-            hasHash: !!s(row.password_hash),
-            hasPlain: !!s(row.password),
-            pwLen: pw.length,
-            plainLen: s(row.password).length,
-            pickedMode: picked.mode,
-            matchHash,
-            matchPlain,
-          },
-        },
-        { status: 401 }
-      );
-    }
+    const empId = s(row.emp_id) || id;
+    const team = s(row.team) || null;
 
-    // ✅ 권장: role은 DB 우선, 없으면 관리자ID 기준 fallback
-    const dbRole = s(row.role);
-    const role = dbRole || (ADMIN_IDS.has(id) ? "admin" : "user");
-    const team = s(row.team);
+    // ✅ role 결정: DB role 우선 → ADMIN fallback
+    let role = s(row.role);
+    if (!role) role = ADMIN_IDS.has(empId) || ADMIN_IDS.has(id) ? "admin" : "user";
+    if (role !== "admin" && role !== "user") role = "user";
 
-    const res = NextResponse.json({ ok: true, role, empId: row.emp_id, team, projectRef });
+    // ✅ redirect 결정: 관리자는 무조건 /admin
+    const redirect = role === "admin" ? "/admin" : "/exam";
 
-    const cookieOpts = {
-      httpOnly: true,
-      secure: true,
-      sameSite: "lax" as const,
-      path: "/",
-      maxAge: 60 * 60 * 12,
-    };
+    const res = NextResponse.json({
+      ok: true,
+      empId,
+      role,
+      team,
+      isAdmin: role === "admin",
+      redirect,
+      marker: "LOGIN_OK_V2",
+    });
 
-    res.cookies.set("empId", row.emp_id, cookieOpts);
-    res.cookies.set("role", role, cookieOpts);
-    if (team) res.cookies.set("team", team, cookieOpts);
-
+    // ✅ 쿠키 세팅 (middleware/me가 이걸로 판정)
+    res.headers.append("Set-Cookie", cookieStr("empId", empId));
+    res.headers.append("Set-Cookie", cookieStr("role", role));
+    res.headers.append("Set-Cookie", cookieStr("team", team ?? ""));
     return res;
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: "LOGIN_FAILED", projectRef, detail: String(e?.message ?? e) },
+      { ok: false, error: "LOGIN_CRASH", detail: String(e?.message || e) },
       { status: 500 }
     );
   }

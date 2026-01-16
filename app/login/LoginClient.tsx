@@ -1,35 +1,21 @@
+// app/login/LoginClient.tsx
 "use client";
 
 import React, { useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-type LoginOk = {
-  ok: true;
-  empId: string;
-  role: string;
-  name?: string;
-  redirect?: string;
-};
-
-type LoginFail = { ok: false; error: string };
+type LoginOk = { ok: true; empId: string; role: string; team?: string | null; redirect?: string };
+type LoginFail = { ok: false; error: string; detail?: any };
 type LoginResp = LoginOk | LoginFail;
 
 function s(v: any) {
   return String(v ?? "").trim();
 }
 
-function safeJsonParse<T>(text: string, fallback: T): T {
-  try {
-    return text ? (JSON.parse(text) as T) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 export default function LoginClient() {
   const router = useRouter();
   const sp = useSearchParams();
-  const next = s(sp.get("next")) || "";
+  const next = s(sp.get("next")) || ""; // next는 참고만
 
   const [id, setId] = useState("");
   const [pw, setPw] = useState("");
@@ -40,10 +26,7 @@ export default function LoginClient() {
     e.preventDefault();
     setMsg("");
 
-    const id2 = s(id);
-    const pw2 = s(pw);
-
-    if (!id2 || !pw2) {
+    if (!id || !pw) {
       setMsg("아이디/비밀번호를 입력하세요.");
       return;
     }
@@ -52,88 +35,40 @@ export default function LoginClient() {
     try {
       const res = await fetch("/api/auth/login", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "content-type": "application/json" },
         cache: "no-store",
-        body: JSON.stringify({ id: id2, pw: pw2 }),
+        body: JSON.stringify({ id, pw }),
       });
 
-      const text = await res.text();
-      const json = safeJsonParse<LoginResp>(text, { ok: false, error: "EMPTY_RESPONSE" });
+      const json: LoginResp = await res.json();
 
-      if (!res.ok || !json.ok) {
-        const errCode = (json as LoginFail)?.error || `HTTP_${res.status}`;
-        setMsg(
-          errCode === "MISSING_FIELDS"
-            ? "아이디/비밀번호를 입력하세요."
-            : errCode === "USER_NOT_FOUND"
-            ? "계정이 없습니다."
-            : errCode === "PASSWORD_NOT_SET"
-            ? "비밀번호가 설정되지 않았습니다."
-            : errCode === "USER_INACTIVE"
-            ? "비활성 계정입니다."
-            : errCode === "INACTIVE_ACCOUNT"
-            ? "비활성 계정입니다."
-            : "로그인 실패: 아이디/비밀번호를 확인하세요."
-        );
+      if (!json || (json as any).ok !== true) {
+        setMsg((json as any)?.error || "로그인 실패");
+        setLoading(false);
         return;
       }
 
-      const ok = json as LoginOk;
-      const role = s(ok.role);
+      // ✅ 서버가 내려준 redirect 우선
+      const serverRedirect = s((json as any).redirect);
 
-      // ✅ 관리자면 next가 /admin 계열일 때만 next 허용
-      //    (next=/exam 같은거로 관리자 보내버리는 사고 방지)
-      let redirect = "";
-      if (s(ok.redirect)) {
-        redirect = s(ok.redirect);
-      } else if (role === "admin") {
-        redirect = next.startsWith("/admin") ? next : "/admin";
-      } else {
-        redirect = next ? next : "/exam";
-      }
+      // ✅ next는 “사용자”만 의미 있게 처리 (관리자 강제 /admin)
+      let target = serverRedirect || "/exam";
+      if (s((json as any).role) !== "admin" && next) target = next;
 
-      router.replace(redirect);
-      router.refresh();
+      router.replace(target);
     } catch (err: any) {
-      setMsg(String(err?.message ?? err));
+      setMsg(String(err?.message || err));
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-6">
-      <form onSubmit={onSubmit} className="w-full max-w-sm space-y-4">
-        <h1 className="text-2xl font-bold text-center">로그인</h1>
-
-        <div className="space-y-2">
-          <input
-            value={id}
-            onChange={(e) => setId(e.target.value)}
-            placeholder="아이디"
-            className="w-full border rounded px-3 py-2"
-            autoComplete="username"
-          />
-          <input
-            value={pw}
-            onChange={(e) => setPw(e.target.value)}
-            type="password"
-            placeholder="비밀번호"
-            className="w-full border rounded px-3 py-2"
-            autoComplete="current-password"
-          />
-        </div>
-
-        <button
-          type="submit"
-          disabled={loading}
-          className="w-full rounded px-3 py-2 border bg-gray-100 hover:bg-gray-200 disabled:opacity-50"
-        >
-          {loading ? "로그인 중..." : "로그인"}
-        </button>
-
-        {msg && <div className="text-sm text-red-600">{msg}</div>}
-      </form>
-    </div>
+    <form onSubmit={onSubmit}>
+      <input value={id} onChange={(e) => setId(e.target.value)} placeholder="아이디" />
+      <input value={pw} onChange={(e) => setPw(e.target.value)} placeholder="비밀번호" type="password" />
+      <button disabled={loading} type="submit">{loading ? "로그인 중..." : "로그인"}</button>
+      {msg ? <div style={{ color: "crimson", marginTop: 8 }}>{msg}</div> : null}
+    </form>
   );
 }
