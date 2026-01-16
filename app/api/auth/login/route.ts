@@ -68,18 +68,19 @@ async function readBodyAny(req: NextRequest): Promise<any> {
   }
 }
 
-const ADMIN_IDS = new Set(["admin", "admin_gs"]); // 필요하면 추가
+// ✅ 관리자 아이디 목록(요구사항: admin, admin_gs)
+const ADMIN_IDS = new Set(["admin", "admin_gs"]);
 
 export async function POST(req: NextRequest) {
   try {
     const body = await readBodyAny(req);
 
-    // ✅ 여러 키 형태 전부 허용
+    // ✅ 여러 키 형태 전부 허용 (프론트가 id/pw로 보내는 것 유지)
     const id = s(
       body?.id ??
-        body?.user_id ??
         body?.empId ??
         body?.emp_id ??
+        body?.user_id ??
         body?.username ??
         body?.loginId
     );
@@ -102,11 +103,11 @@ export async function POST(req: NextRequest) {
 
     const sb: any = supabaseAdmin;
 
-    // ✅ 계정 조회 (핵심 수정: user_id 컬럼 없음 → emp_id / username으로 조회)
+    // ✅✅✅ 핵심: accounts는 emp_id로만 조회 (username/user_id 사용 금지)
     const { data, error } = await sb
       .from(TABLE)
       .select("*")
-      .or(`emp_id.eq.${id},username.eq.${id}`)
+      .eq("emp_id", id)
       .maybeSingle();
 
     if (error) {
@@ -127,7 +128,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "INACTIVE_ACCOUNT" }, { status: 403 });
     }
 
-    // ✅ 비번 검증: password_hash 우선, 없으면 password(평문) fallback
+    // ✅ 비번 검증: password_hash 우선(scrypt), 없으면 password(평문) fallback
     const storedHash = s(data?.password_hash);
     const storedPlain = s(data?.password);
 
@@ -139,13 +140,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
     }
 
-    // ✅ role 결정
+    // ✅ role/team
     const role = ADMIN_IDS.has(id) ? "admin" : "user";
     const team = s(data?.team ?? "");
 
     const res = NextResponse.json({ ok: true, role, empId: id, team });
 
-    // ✅ 쿠키 세팅(실서버 https 기준)
+    // ✅ 쿠키(실서버 https 기준 secure=true)
     const cookieOpts = {
       httpOnly: true,
       secure: true,
