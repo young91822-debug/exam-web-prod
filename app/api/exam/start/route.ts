@@ -8,6 +8,10 @@ const sb: any = supabaseAdmin;
 function s(v: any) {
   return String(v ?? "").trim();
 }
+function upperTeam(v: any) {
+  const t = s(v);
+  return (t ? t.toUpperCase() : "A") as string;
+}
 function n(v: any, d: number) {
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
@@ -34,74 +38,95 @@ function getCookie(req: Request, name: string) {
 
 function isMissingColumn(err: any, col: string) {
   const msg = String(err?.message || err || "");
+  const low = msg.toLowerCase();
   return (
-    msg.includes(`column accounts.${col} does not exist`) ||
-    msg.includes(`Could not find the '${col}' column`) ||
-    (msg.toLowerCase().includes(col) && msg.toLowerCase().includes("does not exist"))
-  );
+    low.includes("does not exist") && low.includes(col.toLowerCase())
+  ) || msg.includes(`Could not find the '${col}' column`);
 }
 
 /**
- * ✅ accounts에서 team/role/is_active 읽기 (없으면 A/user)
- * ✅ username 컬럼이 없는 DB에서도 절대 안 터지게 안전 처리
+ * ✅ accounts에서 team/role/is_active를 "안 터지게" 가져오기
+ * - 어떤 컬럼이 없어도 단계적 fallback
+ * - username 컬럼은 있으면 쓰고, 없으면 스킵
+ * - role/is_active/team 컬럼이 없어도 기본값으로 진행
  */
-async function pickAccountInfo(empId: string) {
-  // 1) emp_id로 먼저
-  const r1 = await sb
+async function pickAccountInfo(loginId: string) {
+  // 1) emp_id 기준으로 시도 (풀 컬럼)
+  let r = await sb
     .from("accounts")
     .select("emp_id, team, role, is_active")
-    .eq("emp_id", empId)
+    .eq("emp_id", loginId)
     .maybeSingle();
 
-  if (r1.error) throw r1.error;
-
-  if (r1.data) {
-    const isActive = r1.data.is_active === false ? false : true;
-    const team = s(r1.data.team || "A") || "A";
-    const role = s(r1.data.role || "user") || "user";
-    return { team, role, isActive, matchedBy: "emp_id" as const };
+  // ✅ select에 없는 컬럼 때문에 터지면 -> 최소 컬럼로 재시도
+  if (r.error && (isMissingColumn(r.error, "role") || isMissingColumn(r.error, "is_active") || isMissingColumn(r.error, "team"))) {
+    r = await sb
+      .from("accounts")
+      .select("emp_id, team") // 최소
+      .eq("emp_id", loginId)
+      .maybeSingle();
   }
 
-  // 2) 없으면 username fallback (단, username 컬럼 없으면 스킵)
-  const r2 = await sb
+  if (r.error) throw r.error;
+
+  if (r.data) {
+    return {
+      found: true as const,
+      emp_id: s(r.data.emp_id) || loginId,
+      team: upperTeam((r.data as any).team || "A"),
+      role: s((r.data as any).role || "user") || "user",
+      is_active: (r.data as any).is_active === false ? false : true,
+      matchedBy: "emp_id" as const,
+      hasRoleCol: (r.data as any).role !== undefined,
+      hasActiveCol: (r.data as any).is_active !== undefined,
+    };
+  }
+
+  // 2) username fallback (username 컬럼 없으면 스킵)
+  let r2 = await sb
     .from("accounts")
     .select("emp_id, team, role, is_active")
-    .eq("username", empId)
+    .eq("username", loginId)
     .maybeSingle();
 
   if (r2.error) {
     if (isMissingColumn(r2.error, "username")) {
-      return {
-        team: "A",
-        role: "user",
-        isActive: true,
-        matchedBy: "none" as const,
-        notFound: true as const,
-      };
+      return { found: false as const };
     }
-    throw r2.error;
+    // role/is_active/team 없어서 터진 경우 최소로 재시도
+    if (isMissingColumn(r2.error, "role") || isMissingColumn(r2.error, "is_active") || isMissingColumn(r2.error, "team")) {
+      r2 = await sb
+        .from("accounts")
+        .select("emp_id, team")
+        .eq("username", loginId)
+        .maybeSingle();
+      if (r2.error) {
+        if (isMissingColumn(r2.error, "username")) return { found: false as const };
+        throw r2.error;
+      }
+    } else {
+      throw r2.error;
+    }
   }
 
-  if (!r2.data) {
-    return {
-      team: "A",
-      role: "user",
-      isActive: true,
-      matchedBy: "none" as const,
-      notFound: true as const,
-    };
-  }
+  if (!r2.data) return { found: false as const };
 
-  const isActive = r2.data.is_active === false ? false : true;
-  const team = s(r2.data.team || "A") || "A";
-  const role = s(r2.data.role || "user") || "user";
-  return { team, role, isActive, matchedBy: "username" as const };
+  return {
+    found: true as const,
+    emp_id: s(r2.data.emp_id) || loginId,
+    team: upperTeam((r2.data as any).team || "A"),
+    role: s((r2.data as any).role || "user") || "user",
+    is_active: (r2.data as any).is_active === false ? false : true,
+    matchedBy: "username" as const,
+    hasRoleCol: (r2.data as any).role !== undefined,
+    hasActiveCol: (r2.data as any).is_active !== undefined,
+  };
 }
 
 export async function POST(req: Request) {
   try {
     const empId = s(getCookie(req, "empId"));
-    const cookieRole = s(getCookie(req, "role")); // 로그인 API가 심은 role 쿠키 (있으면 참고)
+    const cookieRole = s(getCookie(req, "role")).toLowerCase(); // login API cookie
 
     if (!empId) {
       return NextResponse.json({ ok: false, error: "NO_SESSION" }, { status: 401 });
@@ -109,29 +134,29 @@ export async function POST(req: Request) {
 
     const info: any = await pickAccountInfo(empId);
 
-    if (info?.notFound) {
-      return NextResponse.json(
-        { ok: false, error: "ACCOUNT_NOT_FOUND", detail: { empId } },
-        { status: 401 }
-      );
+    if (!info?.found) {
+      return NextResponse.json({ ok: false, error: "ACCOUNT_NOT_FOUND", detail: { empId } }, { status: 401 });
     }
 
-    if (!info.isActive) {
+    // ✅ 비활성(컬럼 없으면 기본 true로 이미 처리됨)
+    if (info.is_active === false) {
       return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
     }
 
-    // ✅ 관리자면 시험 시작 자체를 막는다 (admin이 /exam로 들어와도 더 이상 start가 안 돎)
-    const effectiveRole = (s(info.role) || cookieRole || "user").toLowerCase();
+    // ✅ 관리자 차단: DB role 컬럼이 있으면 DB 우선, 없으면 cookieRole로라도 막음
+    const dbRole = s(info.role).toLowerCase();
+    const effectiveRole = (dbRole && dbRole !== "user") ? dbRole : cookieRole || "user";
+
     if (effectiveRole === "admin") {
       return NextResponse.json(
-        { ok: false, error: "ADMIN_CANNOT_TAKE_EXAM", detail: { empId } },
+        { ok: false, error: "ADMIN_CANNOT_TAKE_EXAM", detail: { empId, matchedBy: info.matchedBy } },
         { status: 403 }
       );
     }
 
-    const team = s(info.team || "A") || "A";
+    const team = upperTeam(info.team || "A");
 
-    // ✅ 내 팀 문제만 가져오기
+    // ✅ 내 팀 문제만
     const q1 = await sb
       .from("questions")
       .select("id, content, choices, points, is_active, team")
@@ -139,39 +164,37 @@ export async function POST(req: Request) {
       .eq("is_active", true)
       .limit(5000);
 
-    if (q1.error) {
-      // is_active 컬럼 없을 수도 있으니 fallback
-      const q2 = await sb
-        .from("questions")
-        .select("id, content, choices, points, team")
-        .eq("team", team)
-        .limit(5000);
+    // is_active 컬럼이 없을 수 있으니 fallback
+    let qrows: any[] | null = null;
 
-      if (q2.error) {
-        return NextResponse.json(
-          { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q2.error },
-          { status: 500 }
-        );
+    if (!q1.error) {
+      qrows = q1.data || [];
+    } else {
+      // is_active가 없어서 터졌으면 fallback
+      if (isMissingColumn(q1.error, "is_active")) {
+        const q2 = await sb
+          .from("questions")
+          .select("id, content, choices, points, team")
+          .eq("team", team)
+          .limit(5000);
+
+        if (q2.error) {
+          return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q2.error }, { status: 500 });
+        }
+        qrows = q2.data || [];
+      } else {
+        return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q1.error }, { status: 500 });
       }
-
-      if (!q2.data?.length) {
-        return NextResponse.json(
-          { ok: false, error: "NO_QUESTIONS", detail: { team } },
-          { status: 500 }
-        );
-      }
-
-      return await createAttemptAndRespond(empId, team, q2.data);
     }
 
-    if (!q1.data?.length) {
+    if (!qrows || qrows.length === 0) {
       return NextResponse.json(
-        { ok: false, error: "NO_QUESTIONS", detail: { team } },
+        { ok: false, error: "NO_QUESTIONS", detail: { team, note: "questions table has 0 rows for this team" } },
         { status: 500 }
       );
     }
 
-    return await createAttemptAndRespond(empId, team, q1.data);
+    return await createAttemptAndRespond(info.emp_id || empId, team, qrows);
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "START_FATAL", detail: String(e?.message ?? e) },
@@ -208,8 +231,6 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
     );
   }
 
-  const attempt = r1.data;
-
   const outQuestions = picked.map((q: any) => ({
     id: String(q.id),
     content: String(q.content ?? ""),
@@ -223,7 +244,7 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
 
   return NextResponse.json({
     ok: true,
-    attemptId: String(attempt.id),
+    attemptId: String(r1.data.id),
     questions: outQuestions,
     debug: { empId, team, picked: outQuestions.length, totalPoints },
   });
