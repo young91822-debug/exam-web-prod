@@ -1,3 +1,4 @@
+// app/exam/ExamClient.tsx
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
@@ -19,9 +20,9 @@ type SubmitResp =
       ok: true;
       attemptId: string;
       score: number;
-      totalPoints: number;
-      correctCount: number;
-      wrongQuestionIds: string[];
+      totalPoints?: number;
+      correctCount?: number;
+      wrongQuestionIds?: string[];
       debug?: any;
     }
   | { ok: false; error: string; detail?: any };
@@ -48,7 +49,7 @@ function fmtRemain(sec: number) {
   return `${m}:${String(r).padStart(2, "0")}`;
 }
 
-const EXAM_LIMIT_SEC = 15 * 60; // 15분
+const EXAM_LIMIT_SEC = 15 * 60;
 
 export default function ExamClient() {
   const router = useRouter();
@@ -57,12 +58,11 @@ export default function ExamClient() {
   const [attemptId, setAttemptId] = useState<string | null>(null);
   const [questions, setQuestions] = useState<Q[]>([]);
   const [answers, setAnswers] = useState<Record<string, number>>({});
-  const [errText, setErrText] = useState<string>("");
+  const [errText, setErrText] = useState("");
 
-  const [remainSec, setRemainSec] = useState<number>(EXAM_LIMIT_SEC);
+  const [remainSec, setRemainSec] = useState(EXAM_LIMIT_SEC);
   const submittingRef = useRef(false);
 
-  // 시작
   useEffect(() => {
     let alive = true;
 
@@ -76,12 +76,26 @@ export default function ExamClient() {
         const res = await fetch("/api/exam/start", {
           method: "POST",
           cache: "no-store",
+          credentials: "include", // ✅ 쿠키 강제 포함
         });
 
         const json: StartResp = await res.json().catch(() => ({} as any));
+        const errCode = (json as any)?.error || "";
 
-        if (!res.ok || !json || (json as any).ok !== true) {
-          const msg = (json as any)?.error || `START_FAILED (status ${res.status})`;
+        // ✅ 세션 없으면 로그인으로
+        if (res.status === 401) {
+          router.replace("/login?next=/exam");
+          return;
+        }
+
+        // ✅ 관리자 차단이면 관리자 페이지로
+        if (res.status === 403 && errCode === "ADMIN_CANNOT_TAKE_EXAM") {
+          router.replace("/admin");
+          return;
+        }
+
+        if (!res.ok || (json as any).ok !== true) {
+          const msg = errCode || `START_FAILED (status ${res.status})`;
           const detail = (json as any)?.detail;
           throw new Error(detail ? `${msg}\n${safeText(detail)}` : msg);
         }
@@ -103,9 +117,8 @@ export default function ExamClient() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [router]);
 
-  // 15분 타이머
   useEffect(() => {
     if (!attemptId) return;
 
@@ -136,11 +149,9 @@ export default function ExamClient() {
       return;
     }
 
-    if (!isAuto) {
-      if (!answers || Object.keys(answers).length === 0) {
-        setErrText("답안을 하나도 선택하지 않았습니다.");
-        return;
-      }
+    if (!isAuto && Object.keys(answers).length === 0) {
+      setErrText("답안을 하나도 선택하지 않았습니다.");
+      return;
     }
 
     submittingRef.current = true;
@@ -151,12 +162,18 @@ export default function ExamClient() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
+        credentials: "include", // ✅ 쿠키 포함
         body: JSON.stringify({ attemptId, answers, isAuto }),
       });
 
       const json: SubmitResp = await res.json().catch(() => ({} as any));
 
-      if (!res.ok || !json || (json as any).ok !== true) {
+      if (res.status === 401) {
+        router.replace("/login?next=/exam");
+        return;
+      }
+
+      if (!res.ok || (json as any).ok !== true) {
         const msg = (json as any)?.error || `SUBMIT_FAILED (status ${res.status})`;
         const detail = (json as any)?.detail;
         throw new Error(detail ? `${msg}\n${safeText(detail)}` : msg);

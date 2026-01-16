@@ -10,11 +10,23 @@ export const revalidate = 0;
 const TABLE = "accounts";
 const sb: any = supabaseAdmin;
 
-// ✅ 관리자 fallback
 const ADMIN_IDS = new Set(["admin", "admin_gs"]);
 
 function s(v: any) {
   return String(v ?? "").trim();
+}
+
+async function readBody(req: Request) {
+  try {
+    return await req.json();
+  } catch {
+    try {
+      const t = await req.text();
+      return t ? JSON.parse(t) : {};
+    } catch {
+      return {};
+    }
+  }
 }
 
 /** stored 포맷: scrypt$<saltB64>$<hashB64> */
@@ -36,21 +48,8 @@ function verifyPasswordHash(plain: string, stored: string) {
   }
 }
 
-async function readBody(req: Request) {
-  try {
-    return await req.json();
-  } catch {
-    try {
-      const t = await req.text();
-      return t ? JSON.parse(t) : {};
-    } catch {
-      return {};
-    }
-  }
-}
-
 function cookieStr(name: string, value: string, opt?: { maxAgeSec?: number }) {
-  const maxAge = opt?.maxAgeSec ?? 60 * 60 * 24 * 7; // 7일
+  const maxAge = opt?.maxAgeSec ?? 60 * 60 * 24 * 7;
   const isProd = process.env.NODE_ENV === "production";
   const base = [
     `${name}=${encodeURIComponent(value)}`,
@@ -63,65 +62,79 @@ function cookieStr(name: string, value: string, opt?: { maxAgeSec?: number }) {
   return base.join("; ");
 }
 
+async function fetchAccount(loginId: string) {
+  // 1) emp_id 우선
+  const r1 = await sb.from(TABLE).select("*").eq("emp_id", loginId).maybeSingle();
+  if (r1.error) throw r1.error;
+  if (r1.data) return { row: r1.data, matchedBy: "emp_id" as const };
+
+  // 2) username fallback (너 테이블은 username NOT NULL임)
+  const r2 = await sb.from(TABLE).select("*").eq("username", loginId).maybeSingle();
+  if (r2.error) throw r2.error;
+  if (r2.data) return { row: r2.data, matchedBy: "username" as const };
+
+  return { row: null, matchedBy: "none" as const };
+}
+
 export async function POST(req: Request) {
   try {
     const body = await readBody(req);
-    const id = s(body?.id ?? body?.user_id ?? body?.empId ?? body?.emp_id);
+    const id = s(body?.id ?? body?.empId ?? body?.emp_id ?? body?.user_id ?? body?.username);
     const pw = s(body?.pw ?? body?.password);
 
     if (!id || !pw) {
       return NextResponse.json({ ok: false, error: "MISSING_FIELDS" }, { status: 400 });
     }
 
-    // emp_id 기준 조회(너 시스템 기준)
-    const r = await sb.from(TABLE).select("*").eq("emp_id", id).maybeSingle();
-    if (r.error) {
-      return NextResponse.json({ ok: false, error: "DB_ERROR", detail: String(r.error.message || r.error) }, { status: 500 });
-    }
-    const row = r.data;
+    const { row, matchedBy } = await fetchAccount(id);
+
     if (!row) {
-      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
+      return NextResponse.json(
+        { ok: false, error: "INVALID_CREDENTIALS", marker: "LOGIN_NO_ACCOUNT", matchedBy },
+        { status: 401 }
+      );
     }
 
     const isActive = row.is_active === undefined || row.is_active === null ? true : Boolean(row.is_active);
     if (!isActive) {
-      return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
+      return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED", marker: "LOGIN_DISABLED", matchedBy }, { status: 403 });
     }
 
-    const stored = s(row.password_hash ?? row.password ?? "");
+    const stored = s(row.password_hash || "");
     if (!stored || !verifyPasswordHash(pw, stored)) {
-      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
+      return NextResponse.json(
+        { ok: false, error: "INVALID_CREDENTIALS", marker: "LOGIN_BAD_PASSWORD", matchedBy },
+        { status: 401 }
+      );
     }
 
-    const empId = s(row.emp_id) || id;
-    const team = s(row.team) || null;
+    const empId = s(row.emp_id) || s(row.username) || id;
+    const team = s(row.team) || "";
 
-    // ✅ role 결정: DB role 우선 → ADMIN fallback
     let role = s(row.role);
     if (!role) role = ADMIN_IDS.has(empId) || ADMIN_IDS.has(id) ? "admin" : "user";
     if (role !== "admin" && role !== "user") role = "user";
 
-    // ✅ redirect 결정: 관리자는 무조건 /admin
     const redirect = role === "admin" ? "/admin" : "/exam";
 
     const res = NextResponse.json({
       ok: true,
       empId,
       role,
-      team,
+      team: team || null,
       isAdmin: role === "admin",
       redirect,
-      marker: "LOGIN_OK_V2",
+      matchedBy,
+      marker: "LOGIN_OK_V3",
     });
 
-    // ✅ 쿠키 세팅 (middleware/me가 이걸로 판정)
     res.headers.append("Set-Cookie", cookieStr("empId", empId));
     res.headers.append("Set-Cookie", cookieStr("role", role));
-    res.headers.append("Set-Cookie", cookieStr("team", team ?? ""));
+    res.headers.append("Set-Cookie", cookieStr("team", team));
     return res;
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: "LOGIN_CRASH", detail: String(e?.message || e) },
+      { ok: false, error: "LOGIN_CRASH", detail: String(e?.message || e), marker: "LOGIN_CRASH" },
       { status: 500 }
     );
   }
