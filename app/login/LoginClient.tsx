@@ -81,34 +81,40 @@ export default function LoginClient() {
       });
 
       const text = await res.text();
-let data: LoginResp | null = null;
+      let data: LoginResp | null = null;
 
-try {
-  data = text ? (JSON.parse(text) as LoginResp) : null;
-} catch {
-  data = null;
-}
+      try {
+        data = text ? (JSON.parse(text) as LoginResp) : null;
+      } catch {
+        data = null;
+      }
 
-// ✅ JSON 자체가 없거나 깨졌을 때만 "서버응답 이상"
-if (!data) {
-  setMsg("서버 응답이 올바르지 않아요. 잠시 후 다시 시도해 주세요.");
-  return;
-}
+      // ✅ JSON이 깨진 경우만 서버응답 오류
+      if (!data) {
+        setMsg("서버 응답이 올바르지 않아요. 잠시 후 다시 시도해 주세요.");
+        return;
+      }
 
-// ✅ ok=false면 (HTTP 401/403이어도) 정상적인 로그인 실패로 처리
-if (!data.ok) {
-  const err = s((data as any)?.error) || "LOGIN_FAILED";
-  setMsg(friendlyError(err));
-  return;
-}
+      // ✅ ok=false면 (401/403이어도) 정상 로그인 실패로 처리
+      if (!data.ok) {
+        const err = s((data as any)?.error) || "LOGIN_FAILED";
+        setMsg(friendlyError(err));
+        return;
+      }
 
-// ✅ ok=true일 때만 이동
-const ok = data as LoginOk;
-const dest = s(ok.redirect) || next || (ok.role === "admin" ? "/admin" : "/exam");
-router.replace(dest);
-router.refresh();
+      // ✅ ok=true일 때만 이동
+      const ok = data as LoginOk;
+      const dest = s(ok.redirect) || next || (ok.role === "admin" ? "/admin" : "/exam");
+      router.replace(dest);
+      router.refresh();
+    } catch (err: any) {
+      setMsg(`네트워크 오류: ${String(err?.message ?? err)}`);
+    } finally {
+      setLoading(false);
+    }
+  }
 
-  // --- Base styles (Tailwind 없어도 유지) ---
+  // --- Styles (Tailwind 있으면 className, 없어도 style로 보장) ---
   const pageStyle: React.CSSProperties = {
     minHeight: "100vh",
     display: "grid",
@@ -248,14 +254,10 @@ router.refresh();
             )}
           </button>
 
-          <div className="pt-2 text-center text-xs text-white/50">
-            문제가 계속되면 관리자에게 문의해 주세요.
-          </div>
+          <div className="pt-2 text-center text-xs text-white/50">문제가 계속되면 관리자에게 문의해 주세요.</div>
         </form>
 
-        <div className="mt-6 text-center text-[11px] text-white/35">
-          © {new Date().getFullYear()} Exam Web • Internal Use Only
-        </div>
+        <div className="mt-6 text-center text-[11px] text-white/35">© {new Date().getFullYear()} Exam Web • Internal Use Only</div>
       </div>
     </div>
   );
