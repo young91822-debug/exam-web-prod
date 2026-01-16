@@ -5,6 +5,7 @@ import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
 const TABLE = "accounts";
+const MARKER = "LOGIN_EMP_ID_ONLY_v2026-01-16_01";
 
 function s(v: any) {
   return String(v ?? "").trim();
@@ -29,20 +30,11 @@ function verifyPasswordHash(plain: string, stored: string) {
   }
 }
 
-/**
- * body를 "뭐로 보내든" 최대한 읽어준다:
- * - JSON
- * - text(JSON 문자열)
- * - x-www-form-urlencoded
- * - multipart/form-data
- */
 async function readBodyAny(req: NextRequest): Promise<any> {
-  // 1) JSON 우선
   try {
     return await req.json();
   } catch {}
 
-  // 2) form-data
   try {
     const fd = await req.formData();
     const obj: any = {};
@@ -50,15 +42,12 @@ async function readBodyAny(req: NextRequest): Promise<any> {
     if (Object.keys(obj).length) return obj;
   } catch {}
 
-  // 3) text / urlencoded
   try {
     const t = await req.text();
     if (!t) return {};
-    // JSON string
     try {
       return JSON.parse(t);
     } catch {}
-    // x-www-form-urlencoded
     const params = new URLSearchParams(t);
     const obj: any = {};
     params.forEach((v, k) => (obj[k] = v));
@@ -68,14 +57,12 @@ async function readBodyAny(req: NextRequest): Promise<any> {
   }
 }
 
-// ✅ 관리자 아이디 목록(요구사항: admin, admin_gs)
 const ADMIN_IDS = new Set(["admin", "admin_gs"]);
 
 export async function POST(req: NextRequest) {
   try {
     const body = await readBodyAny(req);
 
-    // ✅ 여러 키 형태 전부 허용 (프론트가 id/pw로 보내는 것 유지)
     const id = s(
       body?.id ??
         body?.empId ??
@@ -88,22 +75,14 @@ export async function POST(req: NextRequest) {
 
     if (!id || !pw) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: "MISSING_FIELDS",
-          detail: {
-            gotKeys: Object.keys(body || {}),
-            idPreview: id ? id.slice(0, 2) + "***" : "",
-            pwLength: pw ? pw.length : 0,
-          },
-        },
+        { ok: false, error: "MISSING_FIELDS", marker: MARKER },
         { status: 400 }
       );
     }
 
     const sb: any = supabaseAdmin;
 
-    // ✅✅✅ 핵심: accounts는 emp_id로만 조회 (username/user_id 사용 금지)
+    // ✅✅✅ accounts는 emp_id로만 조회
     const { data, error } = await sb
       .from(TABLE)
       .select("*")
@@ -112,23 +91,25 @@ export async function POST(req: NextRequest) {
 
     if (error) {
       return NextResponse.json(
-        { ok: false, error: "DB_READ_FAILED", detail: String(error?.message ?? error) },
+        { ok: false, error: "DB_READ_FAILED", detail: String(error?.message ?? error), marker: MARKER },
         { status: 500 }
       );
     }
 
     if (!data) {
-      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
+      // ✅ 반영 확인용(민감정보 없음)
+      return NextResponse.json(
+        { ok: false, error: "INVALID_CREDENTIALS", marker: MARKER, detail: { found: false } },
+        { status: 401 }
+      );
     }
 
-    // ✅ 활성 체크
     const isActive =
       data?.is_active === undefined || data?.is_active === null ? true : Boolean(data.is_active);
     if (!isActive) {
-      return NextResponse.json({ ok: false, error: "INACTIVE_ACCOUNT" }, { status: 403 });
+      return NextResponse.json({ ok: false, error: "INACTIVE_ACCOUNT", marker: MARKER }, { status: 403 });
     }
 
-    // ✅ 비번 검증: password_hash 우선(scrypt), 없으면 password(평문) fallback
     const storedHash = s(data?.password_hash);
     const storedPlain = s(data?.password);
 
@@ -137,22 +118,28 @@ export async function POST(req: NextRequest) {
       (!!storedPlain && pw === storedPlain);
 
     if (!ok) {
-      return NextResponse.json({ ok: false, error: "INVALID_CREDENTIALS" }, { status: 401 });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "INVALID_CREDENTIALS",
+          marker: MARKER,
+          detail: { found: true, hasHash: !!storedHash, hasPlain: !!storedPlain, pwLen: pw.length },
+        },
+        { status: 401 }
+      );
     }
 
-    // ✅ role/team
     const role = ADMIN_IDS.has(id) ? "admin" : "user";
     const team = s(data?.team ?? "");
 
-    const res = NextResponse.json({ ok: true, role, empId: id, team });
+    const res = NextResponse.json({ ok: true, role, empId: id, team, marker: MARKER });
 
-    // ✅ 쿠키(실서버 https 기준 secure=true)
     const cookieOpts = {
       httpOnly: true,
       secure: true,
       sameSite: "lax" as const,
       path: "/",
-      maxAge: 60 * 60 * 12, // 12h
+      maxAge: 60 * 60 * 12,
     };
 
     res.cookies.set("empId", id, cookieOpts);
@@ -162,7 +149,7 @@ export async function POST(req: NextRequest) {
     return res;
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: "LOGIN_FAILED", detail: String(e?.message ?? e) },
+      { ok: false, error: "LOGIN_FAILED", detail: String(e?.message ?? e), marker: MARKER },
       { status: 500 }
     );
   }
