@@ -69,9 +69,45 @@ function verifyScrypt(plain: string, stored: string) {
   }
 }
 
+/** 쿠키 세팅 헬퍼 */
+function setAuthCookies(res: NextResponse, empId: string, role: string, team: string | null) {
+  const secure = process.env.NODE_ENV === "production";
+
+  res.cookies.set("empId", empId, {
+    httpOnly: false,
+    sameSite: "lax",
+    secure,
+    path: "/",
+    maxAge: 60 * 60 * 24 * 7, // 7d
+  });
+
+  res.cookies.set("role", role, {
+    httpOnly: false,
+    sameSite: "lax",
+    secure,
+    path: "/",
+    maxAge: 60 * 60 * 24 * 7,
+  });
+
+  if (team) {
+    res.cookies.set("team", team, {
+      httpOnly: false,
+      sameSite: "lax",
+      secure,
+      path: "/",
+      maxAge: 60 * 60 * 24 * 7,
+    });
+  } else {
+    // team 없으면 혹시 예전 값 남아있을까봐 삭제
+    res.cookies.delete("team");
+  }
+}
+
 export async function POST(req: Request) {
   try {
     const body = await readBody(req);
+
+    // 프론트에서 {id, pw} / {username, password} 등 어떤 조합이 와도 처리
     const id = s(body?.id ?? body?.username ?? body?.empId ?? body?.emp_id);
     const pw = s(body?.pw ?? body?.password);
 
@@ -82,14 +118,14 @@ export async function POST(req: Request) {
       );
     }
 
-    // emp_id 우선
+    // 1) emp_id 우선 조회
     let r = await sb.from(TABLE).select("*").eq("emp_id", id).maybeSingle();
     if (r.error) throw r.error;
 
-    let matchedBy = "emp_id";
+    let matchedBy: "emp_id" | "username" = "emp_id";
     let row = r.data;
 
-    // username fallback
+    // 2) username fallback
     if (!row) {
       matchedBy = "username";
       const r2 = await sb.from(TABLE).select("*").eq("username", id).maybeSingle();
@@ -104,6 +140,7 @@ export async function POST(req: Request) {
       );
     }
 
+    // 활성 체크
     const isActive =
       row.is_active === null || row.is_active === undefined ? true : Boolean(row.is_active);
     if (!isActive) {
@@ -113,10 +150,10 @@ export async function POST(req: Request) {
       );
     }
 
+    // 비밀번호 검증
     const storedHash = s(row.password_hash);
     const storedPlain = s(row.password);
 
-    // ✅ hash 우선
     if (storedHash && storedHash.startsWith("scrypt$")) {
       const v = verifyScrypt(pw, storedHash);
       if (!v.ok) {
@@ -126,7 +163,7 @@ export async function POST(req: Request) {
             error: "INVALID_CREDENTIALS",
             marker: "LOGIN_BAD_PASSWORD",
             matchedBy,
-            verify: v, // ✅ 여기 디버그가 핵심
+            verify: v,
           },
           { status: 401 }
         );
@@ -145,11 +182,25 @@ export async function POST(req: Request) {
       );
     }
 
+    // ✅ 여기서부터가 핵심: 관리자 판별을 DB role보다 우선시
     const empId = s(row.emp_id || id);
-    const role = s(row.role) || (empId === "admin" || empId === "admin_gs" ? "admin" : "user");
+    const username = s(row.username);
     const team = s(row.team) || null;
 
-    return NextResponse.json({
+    const isAdminId =
+      empId === "admin" ||
+      empId === "admin_gs" ||
+      username === "admin" ||
+      username === "admin_gs";
+
+    // DB에 role이 user로 박혀 있어도, admin 계정이면 강제로 admin
+    const dbRole = s(row.role);
+    const role = isAdminId ? "admin" : (dbRole || "user");
+
+    const redirect = role === "admin" ? "/admin" : "/exam";
+
+    // ✅ JSON만 주지 말고 쿠키도 같이 구워야 middleware/페이지들이 안 튐
+    const res = NextResponse.json({
       ok: true,
       empId,
       role,
@@ -157,8 +208,12 @@ export async function POST(req: Request) {
       isAdmin: role === "admin",
       matchedBy,
       marker: "LOGIN_OK_DEBUG",
-      redirect: role === "admin" ? "/admin" : "/exam",
+      redirect,
     });
+
+    setAuthCookies(res, empId, role, team);
+
+    return res;
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "LOGIN_CRASH", marker: "LOGIN_CRASH", detail: String(e?.message || e) },
