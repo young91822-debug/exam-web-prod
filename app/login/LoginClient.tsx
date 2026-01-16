@@ -81,32 +81,32 @@ export default function LoginClient() {
       });
 
       const text = await res.text();
-      let data: LoginResp | null = null;
-      try {
-        data = text ? (JSON.parse(text) as LoginResp) : null;
-      } catch {
-        data = null;
-      }
+let data: LoginResp | null = null;
 
-      if (!res.ok || !data) {
-        setMsg("서버 응답이 올바르지 않아요. 잠시 후 다시 시도해 주세요.");
-        return;
-      }
+try {
+  data = text ? (JSON.parse(text) as LoginResp) : null;
+} catch {
+  data = null;
+}
 
-      if (!data.ok) {
+// ✅ JSON 자체가 없거나 깨졌을 때만 "서버응답 이상"
+if (!data) {
+  setMsg("서버 응답이 올바르지 않아요. 잠시 후 다시 시도해 주세요.");
+  return;
+}
+
+// ✅ ok=false면 (HTTP 401/403이어도) 정상적인 로그인 실패로 처리
+if (!data.ok) {
   const err = s((data as any)?.error) || "LOGIN_FAILED";
   setMsg(friendlyError(err));
   return;
 }
-      const dest = s((data as LoginOk).redirect) || next || (data.role === "admin" ? "/admin" : "/exam");
-      router.replace(dest);
-      router.refresh();
-    } catch (err: any) {
-      setMsg(`네트워크 오류: ${String(err?.message ?? err)}`);
-    } finally {
-      setLoading(false);
-    }
-  }
+
+// ✅ ok=true일 때만 이동
+const ok = data as LoginOk;
+const dest = s(ok.redirect) || next || (ok.role === "admin" ? "/admin" : "/exam");
+router.replace(dest);
+router.refresh();
 
   // --- Base styles (Tailwind 없어도 유지) ---
   const pageStyle: React.CSSProperties = {
