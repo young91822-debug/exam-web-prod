@@ -154,35 +154,49 @@ export async function POST(req: Request) {
 
     // 비밀번호 검증
     const storedHash = s(row.password_hash);
-    const storedPlain = s(row.password); // (있으면) 구버전 평문
+    const storedPlain = row.password ? String(row.password) : "";
+ // (있으면) 구버전 평문
 
     if (storedHash && storedHash.startsWith("scrypt$")) {
-      const v = verifyScrypt(pw, storedHash);
-      if (!v.ok) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: "INVALID_CREDENTIALS",
-            marker: "LOGIN_BAD_PASSWORD",
-            matchedBy,
-            verify: v,
-          },
-          { status: 401 }
-        );
-      }
-    } else if (storedPlain) {
-      if (pw !== storedPlain) {
-        return NextResponse.json(
-          { ok: false, error: "INVALID_CREDENTIALS", marker: "LOGIN_BAD_PASSWORD_PLAIN", matchedBy },
-          { status: 401 }
-        );
-      }
-    } else {
-      return NextResponse.json(
-        { ok: false, error: "INVALID_CREDENTIALS", marker: "LOGIN_NO_PASSWORD", matchedBy },
-        { status: 401 }
-      );
-    }
+  const v = verifyScrypt(pw, storedHash);
+  if (!v.ok) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "INVALID_CREDENTIALS",
+        marker: "LOGIN_BAD_PASSWORD",
+        matchedBy,
+        verify: v,
+      },
+      { status: 401 }
+    );
+  }
+}
+// 👇 이 분기는 진짜 legacy 계정만
+else if (storedPlain.length > 0) {
+  if (pw !== storedPlain) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "INVALID_CREDENTIALS",
+        marker: "LOGIN_BAD_PASSWORD_PLAIN",
+        matchedBy,
+      },
+      { status: 401 }
+    );
+  }
+}
+else {
+  return NextResponse.json(
+    {
+      ok: false,
+      error: "INVALID_CREDENTIALS",
+      marker: "LOGIN_NO_PASSWORD",
+      matchedBy,
+    },
+    { status: 401 }
+  );
+}
 
     // ✅ 여기서부터: 관리자 판별 (id/username 둘 다 체크)
     const empId = s(row.emp_id || id);
