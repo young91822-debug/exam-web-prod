@@ -34,6 +34,7 @@ function parseScrypt(stored: string) {
   if (parts.length !== 3) return null;
   const [algo, saltB64, hashB64] = parts;
   if (algo !== "scrypt") return null;
+  if (!saltB64 || !hashB64) return null;
   return { algo, saltB64, hashB64 };
 }
 
@@ -49,8 +50,7 @@ function verifyScrypt(plain: string, stored: string) {
     const derived = crypto.scryptSync(plain, salt, expected.length);
 
     const equal =
-      derived.length === expected.length &&
-      crypto.timingSafeEqual(derived, expected);
+      derived.length === expected.length && crypto.timingSafeEqual(derived, expected);
 
     return {
       ok: equal,
@@ -73,8 +73,10 @@ function verifyScrypt(plain: string, stored: string) {
 function setAuthCookies(res: NextResponse, empId: string, role: string, team: string | null) {
   const secure = process.env.NODE_ENV === "production";
 
+  // ✅ middleware / 서버 컴포넌트에서 안정적으로 쓰려면 httpOnly=true가 정상
+  // (client에서 JS로 읽을 필요 없음)
   res.cookies.set("empId", empId, {
-    httpOnly: false,
+    httpOnly: true,
     sameSite: "lax",
     secure,
     path: "/",
@@ -82,7 +84,7 @@ function setAuthCookies(res: NextResponse, empId: string, role: string, team: st
   });
 
   res.cookies.set("role", role, {
-    httpOnly: false,
+    httpOnly: true,
     sameSite: "lax",
     secure,
     path: "/",
@@ -91,14 +93,13 @@ function setAuthCookies(res: NextResponse, empId: string, role: string, team: st
 
   if (team) {
     res.cookies.set("team", team, {
-      httpOnly: false,
+      httpOnly: true,
       sameSite: "lax",
       secure,
       path: "/",
       maxAge: 60 * 60 * 24 * 7,
     });
   } else {
-    // team 없으면 혹시 예전 값 남아있을까봐 삭제
     res.cookies.delete("team");
   }
 }
@@ -110,6 +111,7 @@ export async function POST(req: Request) {
     // 프론트에서 {id, pw} / {username, password} 등 어떤 조합이 와도 처리
     const id = s(body?.id ?? body?.username ?? body?.empId ?? body?.emp_id);
     const pw = s(body?.pw ?? body?.password);
+    const next = s(body?.next);
 
     if (!id || !pw) {
       return NextResponse.json(
@@ -152,7 +154,7 @@ export async function POST(req: Request) {
 
     // 비밀번호 검증
     const storedHash = s(row.password_hash);
-    const storedPlain = s(row.password);
+    const storedPlain = s(row.password); // (있으면) 구버전 평문
 
     if (storedHash && storedHash.startsWith("scrypt$")) {
       const v = verifyScrypt(pw, storedHash);
@@ -182,7 +184,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 여기서부터가 핵심: 관리자 판별을 DB role보다 우선시
+    // ✅ 여기서부터: 관리자 판별 (id/username 둘 다 체크)
     const empId = s(row.emp_id || id);
     const username = s(row.username);
     const team = s(row.team) || null;
@@ -193,26 +195,24 @@ export async function POST(req: Request) {
       username === "admin" ||
       username === "admin_gs";
 
-    // DB에 role이 user로 박혀 있어도, admin 계정이면 강제로 admin
     const dbRole = s(row.role);
     const role = isAdminId ? "admin" : (dbRole || "user");
 
-    const redirect = role === "admin" ? "/admin" : "/exam";
+    // ✅ next 우선, 없으면 role 기준
+    const redirect = next || (role === "admin" ? "/admin" : "/exam");
 
-    // ✅ JSON만 주지 말고 쿠키도 같이 구워야 middleware/페이지들이 안 튐
     const res = NextResponse.json({
       ok: true,
       empId,
       role,
       team,
-      isAdmin: role === "admin",
+      isAdmin: role === "admin", // ✅ 여기 따옴표/문법 오류 수정
       matchedBy,
-      marker: "LOGIN_OK_DEBUG",
+      marker: "LOGIN_OK",
       redirect,
     });
 
     setAuthCookies(res, empId, role, team);
-
     return res;
   } catch (e: any) {
     return NextResponse.json(
@@ -220,4 +220,8 @@ export async function POST(req: Request) {
       { status: 500 }
     );
   }
+}
+
+export async function OPTIONS() {
+  return NextResponse.json({ ok: true });
 }
