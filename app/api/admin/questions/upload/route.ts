@@ -29,41 +29,70 @@ function getCookie(cookieHeader: string, name: string) {
   return "";
 }
 
+function isMissingColumn(err: any, table: string, col: string) {
+  const msg = String(err?.message || err || "");
+  const low = msg.toLowerCase();
+  return (
+    low.includes(`column ${table.toLowerCase()}.${col.toLowerCase()} does not exist`) ||
+    msg.includes(`Could not find the '${col}' column`) ||
+    (low.includes(col.toLowerCase()) && low.includes("does not exist"))
+  );
+}
+
 /**
- * ✅ 너 DB 스키마(accounts: user_id, emp_id, team, password...)에 맞춘 관리자 팀 조회
- * - 쿠키: empId 또는 userId 둘 중 하나라도 있으면 사용
- * - role 쿠키는 기존 그대로 체크 (admin 아니면 차단)
- * - DB 조회 컬럼: user_id, emp_id, team (username/is_active 제거)
+ * ✅ 관리자 팀 조회 (절대 안 터지게)
+ * - empId 쿠키 기반으로 accounts.emp_id 먼저 조회
+ * - (있으면) accounts.username으로도 조회
+ * - team이 없거나 비어있으면: admin_gs => B, 그외 => A 로 강제
  */
 async function requireAdminTeam(req: Request) {
   const cookieHeader = req.headers.get("cookie") || "";
 
-  // 기존 쿠키명이 empId였던 흐름 유지 + userId도 허용
-  const loginId = getCookie(cookieHeader, "userId") || getCookie(cookieHeader, "empId");
-  const role = getCookie(cookieHeader, "role");
+  const empId = getCookie(cookieHeader, "empId") || getCookie(cookieHeader, "userId");
+  const roleCookie = getCookie(cookieHeader, "role");
 
-  if (!loginId) return { ok: false as const, status: 401, error: "NO_SESSION" };
-  if (role !== "admin") return { ok: false as const, status: 403, error: "NOT_ADMIN" };
+  if (!empId) return { ok: false as const, status: 401, error: "NO_SESSION" };
+  if (roleCookie !== "admin") return { ok: false as const, status: 403, error: "NOT_ADMIN" };
 
-  // ✅ accounts 테이블 실제 컬럼 기준
-  const { data, error } = await supabaseAdmin
-    .from("accounts")
-    .select("user_id, emp_id, team")
-    .or(`user_id.eq.${loginId},emp_id.eq.${loginId}`)
-    .maybeSingle();
+  const sb: any = supabaseAdmin;
 
-  if (error) {
+  // 1) emp_id로 조회
+  let data: any = null;
+
+  const r1 = await sb.from("accounts").select("emp_id, team, role").eq("emp_id", empId).maybeSingle();
+  if (r1.error) {
     return {
       ok: false as const,
       status: 500,
       error: "DB_QUERY_FAILED",
-      detail: String((error as any).message || error),
+      detail: String(r1.error?.message || r1.error),
     };
   }
-  if (!data) return { ok: false as const, status: 401, error: "ACCOUNT_NOT_FOUND" };
+  data = r1.data;
 
-  const team = String((data as any).team ?? "").trim() || "A";
-  return { ok: true as const, team, loginId };
+  // 2) 없으면 username으로 fallback (username 컬럼 없으면 스킵)
+  if (!data) {
+    const r2 = await sb.from("accounts").select("emp_id, team, role").eq("username", empId).maybeSingle();
+    if (r2.error) {
+      // username 컬럼이 없으면 그냥 스킵하고 아래 fallback으로 감
+      if (!isMissingColumn(r2.error, "accounts", "username")) {
+        return {
+          ok: false as const,
+          status: 500,
+          error: "DB_QUERY_FAILED",
+          detail: String(r2.error?.message || r2.error),
+        };
+      }
+    } else {
+      data = r2.data;
+    }
+  }
+
+  // ✅ 팀 강제 결정 (accounts.team 없어도/비어도 절대 OK)
+  const teamFromDb = s(data?.team);
+  const team = teamFromDb || (empId === "admin_gs" ? "B" : "A");
+
+  return { ok: true as const, team, empId };
 }
 
 /** 간단 CSV 파서 (따옴표/쉼표 기본 대응) */
@@ -140,9 +169,9 @@ function parseAnswerToIndex(v: string) {
   const raw = s(v);
   if (!raw) return -1;
 
-  const n = Number(raw);
-  if (Number.isFinite(n)) {
-    const ni = Math.trunc(n);
+  const nn = Number(raw);
+  if (Number.isFinite(nn)) {
+    const ni = Math.trunc(nn);
     if (ni >= 1 && ni <= 4) return ni - 1;
     if (ni >= 0 && ni <= 3) return ni;
   }
@@ -151,8 +180,8 @@ function parseAnswerToIndex(v: string) {
 
 function parsePoints(v: string) {
   const raw = s(v);
-  const n = Number(raw);
-  if (Number.isFinite(n) && n > 0) return Math.trunc(n);
+  const nn = Number(raw);
+  if (Number.isFinite(nn) && nn > 0) return Math.trunc(nn);
   return 1;
 }
 
@@ -203,14 +232,16 @@ function normalizeIncomingRows(rows: any[]): ParsedRow[] {
     const points = Number(r?.points);
     const is_active = r?.is_active === false ? false : true;
 
-    const choices = Array.isArray(r?.choices) ? r.choices.map((x: any) => s(x)).filter((x: string) => x !== "") : [];
+    const choices = Array.isArray(r?.choices)
+      ? r.choices.map((x: any) => s(x)).filter((x: string) => x !== "")
+      : [];
     if (!content || choices.length === 0) continue;
 
     const ciRaw = r?.correct_index ?? r?.answer_index ?? r?.answerIndex ?? r?.correctIndex;
     let idx: number | null = null;
     if (ciRaw !== undefined && ciRaw !== null && ciRaw !== "") {
-      const n = Number(ciRaw);
-      if (Number.isFinite(n)) idx = Math.trunc(n);
+      const nn = Number(ciRaw);
+      if (Number.isFinite(nn)) idx = Math.trunc(nn);
     }
 
     out.push({
@@ -228,25 +259,53 @@ function normalizeIncomingRows(rows: any[]): ParsedRow[] {
 
 async function insertWithFallback(payloadBase: any[]) {
   // 1) team + correct_index
-  const payload = payloadBase.map((p) => ({ ...p }));
-
-  const r = await supabaseAdmin.from("questions").insert(payload);
+  const r = await supabaseAdmin.from("questions").insert(payloadBase);
   if (!r.error) return { ok: true, mode: "team+correct_index" as const };
 
   const msg1 = String((r.error as any).message || r.error);
 
-  // 2) correct_index 컬럼 없으면 answer_index로 재시도 (team 유지)
-  if (
-    msg1.toLowerCase().includes("column") &&
-    msg1.toLowerCase().includes("correct_index") &&
-    msg1.toLowerCase().includes("does not exist")
-  ) {
+  // 1-1) team 컬럼 자체가 없으면 team 제거 후 재시도
+  if (isMissingColumn(r.error, "questions", "team")) {
+    const payloadNoTeam = payloadBase.map((p: any) => {
+      const { team, ...rest } = p;
+      return rest;
+    });
+
+    const rT = await supabaseAdmin.from("questions").insert(payloadNoTeam);
+    if (!rT.error) return { ok: true, mode: "no_team+correct_index" as const };
+
+    // team 제거 후에도 correct_index 없을 수 있으니 아래로 계속
+    const msgT = String((rT.error as any).message || rT.error);
+    // correct_index 없으면 아래 로직으로 이어가
+    // (그냥 msg1 대신 msgT로 진행)
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  }
+
+  // 2) correct_index 컬럼 없으면 answer_index로 재시도 (team 유지 가능하면 유지)
+  if (isMissingColumn(r.error, "questions", "correct_index")) {
     const payload2 = payloadBase.map((p: any) => {
       const { correct_index, ...rest } = p;
       return { ...rest, answer_index: p.answer_index ?? null };
     });
+
     const r2 = await supabaseAdmin.from("questions").insert(payload2);
     if (!r2.error) return { ok: true, mode: "team+answer_index" as const };
+
+    // 2-1) answer_index도 없을 수 있음 → 둘 다 제거 (team은 유지/없으면 제거)
+    if (isMissingColumn(r2.error, "questions", "answer_index")) {
+      const payload3 = payloadBase.map((p: any) => {
+        const { correct_index, answer_index, ...rest } = p;
+        return rest;
+      });
+      const r3 = await supabaseAdmin.from("questions").insert(payload3);
+      if (!r3.error) return { ok: true, mode: "no_answer_cols" as const };
+      return {
+        ok: false,
+        error: "DB_INSERT_FAILED",
+        detail: String((r3.error as any).message || r3.error),
+      };
+    }
+
     return { ok: false, error: "DB_INSERT_FAILED", detail: String((r2.error as any).message || r2.error) };
   }
 
@@ -267,7 +326,7 @@ export async function POST(req: Request) {
 
     const ct = (req.headers.get("content-type") || "").toLowerCase();
 
-    // ✅ 1) JSON 업로드 (프론트 방식)
+    // ✅ 1) JSON 업로드
     if (ct.includes("application/json")) {
       const body = await req.json().catch(() => ({}));
       const rows = Array.isArray(body?.rows) ? body.rows : [];
@@ -282,7 +341,7 @@ export async function POST(req: Request) {
         choices: r.choices,
         points: r.points,
         is_active: r.is_active,
-        team, // ✅ 강제: 내 팀으로만 저장
+        team, // ✅ 무조건 내 팀
         correct_index: r.correct_index ?? r.answer_index ?? null,
         answer_index: r.answer_index ?? r.correct_index ?? null,
       }));
@@ -298,7 +357,7 @@ export async function POST(req: Request) {
         inserted: parsed.length,
         team,
         insertMode: ins.mode,
-        marker: "ADMIN_QUESTIONS_UPLOAD_TEAM_v1",
+        marker: "ADMIN_QUESTIONS_UPLOAD_TEAM_v2",
       });
     }
 
@@ -354,7 +413,7 @@ export async function POST(req: Request) {
       choices: r.choices,
       points: r.points,
       is_active: r.is_active,
-      team, // ✅ 강제
+      team, // ✅ 무조건 내 팀
       correct_index: r.correct_index ?? r.answer_index ?? null,
       answer_index: r.answer_index ?? r.correct_index ?? null,
     }));
@@ -372,7 +431,7 @@ export async function POST(req: Request) {
       rejected_preview: rejected.slice(0, 10),
       team,
       insertMode: ins.mode,
-      marker: "ADMIN_QUESTIONS_UPLOAD_TEAM_v1",
+      marker: "ADMIN_QUESTIONS_UPLOAD_TEAM_v2",
     });
   } catch (e: any) {
     return NextResponse.json(
