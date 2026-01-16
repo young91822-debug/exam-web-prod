@@ -1,265 +1,251 @@
-// app/admin/results/[attemptId]/page.tsx
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 
-type ApiOk = {
-  ok: true;
-  attempt: any;
-  graded: any[];
-  wrongQuestions?: any[];
-  wrongCount?: number;
-  totalQuestions?: number;
-  meta?: any;
-};
+type DetailResp =
+  | {
+      ok: true;
+      attempt: {
+        id: any;
+        emp_id: string | null;
+        team: string | null;
+        status: string | null;
+        score: number;
+        total_questions: number;
+        started_at: any;
+        submitted_at: any;
+      };
+      wrongItems: {
+        questionId: string | null;
+        content: string;
+        choices: string[];
+        selectedIndex: number | null;
+        correctIndex: number | null;
+        points: number;
+        isWrong: boolean;
+      }[];
+      meta?: any;
+    }
+  | { ok: false; error: string; detail?: any };
 
-type ApiErr = { ok: false; error: string; detail?: any };
-type ApiResp = ApiOk | ApiErr;
-
-function fmtDate(v: any) {
+function fmt(v: any) {
   if (!v) return "-";
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) return String(v);
   return d.toLocaleString();
 }
 
-function s(v: any) {
-  return String(v ?? "").trim();
-}
-
-function looksLikeUuid(x: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);
+function pill(text: string) {
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        padding: "4px 10px",
+        borderRadius: 999,
+        fontSize: 12,
+        fontWeight: 800,
+        background: "#f3f4f6",
+        color: "#111827",
+        border: "1px solid #e5e7eb",
+      }}
+    >
+      {text}
+    </span>
+  );
 }
 
 export default function AdminResultDetailPage() {
-  const params = useParams();
+  const router = useRouter();
+  const params = useParams() as any;
+  const attemptId = useMemo(() => String(params?.attemptId ?? ""), [params]);
 
-  // ✅ 숫자든 UUID든 "문자열 그대로" 받는다
-  const attemptKey = useMemo(() => {
-    const raw = (params as any)?.attemptId ?? (params as any)?.attemptID ?? "";
-    const key = s(raw);
-    return key ? key : null;
-  }, [params]);
+  const apiUrl = useMemo(() => `/api/admin/result-detail?attemptId=${encodeURIComponent(attemptId)}`, [attemptId]);
 
   const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-  const [data, setData] = useState<ApiResp | null>(null);
+  const [data, setData] = useState<DetailResp | null>(null);
 
   useEffect(() => {
-    let dead = false;
-
+    let alive = true;
     async function run() {
-      if (!attemptKey) {
-        if (!dead) {
-          setErr("INVALID_ATTEMPT_ID");
-          setData({ ok: false, error: "INVALID_ATTEMPT_ID" });
-          setLoading(false);
-        }
-        return;
-      }
-
-      if (!dead) {
-        setLoading(true);
-        setErr(null);
-      }
-
-      try {
-        // ✅ attemptId에 그대로 넣어서 보냄 (API가 숫자/UUID 알아서 처리하게)
-        // + 혹시 API가 attemptUuid를 따로 받는 버전이면 같이 보냄(안 받으면 무시됨)
-        const qs = new URLSearchParams();
-        qs.set("attemptId", attemptKey);
-        if (looksLikeUuid(attemptKey)) qs.set("attemptUuid", attemptKey);
-
-        const res = await fetch(`/api/admin/result-detail?${qs.toString()}`, {
-          cache: "no-store",
-        });
-
-        const text = await res.text();
-        let json: any = null;
-        try {
-          json = text ? JSON.parse(text) : null;
-        } catch {
-          json = null;
-        }
-
-        if (dead) return;
-
-        if (!res.ok || !json?.ok) {
-          console.error("RESULT_DETAIL_FETCH_FAILED", { status: res.status, text, json, attemptKey });
-
-          setErr(json?.error || `HTTP_${res.status}`);
-          setData(json ?? { ok: false, error: `HTTP_${res.status}`, detail: text });
-        } else {
-          setData(json as ApiOk);
-        }
-      } catch (e: any) {
-        if (dead) return;
-        console.error("RESULT_DETAIL_FETCH_EXCEPTION", e);
-        setErr("NETWORK_OR_RUNTIME_ERROR");
-        setData({ ok: false, error: "NETWORK_OR_RUNTIME_ERROR", detail: String(e?.message ?? e) });
-      } finally {
-        if (!dead) setLoading(false);
-      }
+      setLoading(true);
+      const res = await fetch(apiUrl, { cache: "no-store" });
+      const json: DetailResp = await res.json().catch(() => ({} as any));
+      if (!alive) return;
+      setData(json);
+      setLoading(false);
     }
-
     run();
     return () => {
-      dead = true;
+      alive = false;
     };
-  }, [attemptKey]);
+  }, [apiUrl]);
 
-  const attempt = data && (data as any).ok ? (data as any).attempt : null;
-  const gradedAll = data && (data as any).ok ? ((data as any).graded ?? []) : [];
+  if (loading) return <div style={{ padding: 20 }}>로딩중...</div>;
 
-  // ✅ 오답/미제출만 표시(네가 쓰던 로직 유지)
-  const graded = useMemo(() => {
-    return gradedAll.filter((g: any) => g?.status === "unsubmitted" || g?.isCorrect === false);
-  }, [gradedAll]);
-
-  async function downloadExcel() {
-    if (!attemptKey) return;
-
-    const qs = new URLSearchParams();
-    qs.set("attemptId", attemptKey);
-    if (looksLikeUuid(attemptKey)) qs.set("attemptUuid", attemptKey);
-
-    window.location.href = `/api/admin/result-detail/download?${qs.toString()}`;
-  }
-
-  if (loading) return <div style={{ padding: 16 }}>불러오는 중...</div>;
-
-  if (err) {
+  if (!data || (data as any).ok !== true) {
     return (
-      <div style={{ padding: 16 }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>에러</div>
-        <pre style={{ whiteSpace: "pre-wrap" }}>{err}</pre>
-        {data && <pre style={{ whiteSpace: "pre-wrap", marginTop: 12 }}>{JSON.stringify(data, null, 2)}</pre>}
+      <div style={{ padding: 20 }}>
+        <div style={{ fontSize: 18, fontWeight: 900, marginBottom: 10 }}>에러</div>
+        <pre style={{ background: "#111827", color: "white", padding: 14, borderRadius: 12, overflow: "auto" }}>
+          {JSON.stringify(data, null, 2)}
+        </pre>
+        <button
+          onClick={() => router.push("/admin/results")}
+          style={{
+            marginTop: 12,
+            padding: "10px 14px",
+            borderRadius: 12,
+            border: "1px solid #e5e7eb",
+            background: "white",
+            fontWeight: 900,
+            cursor: "pointer",
+          }}
+        >
+          목록으로
+        </button>
       </div>
     );
   }
 
+  const ok = data as Extract<DetailResp, { ok: true }>;
+  const a = ok.attempt;
+
+  const wrong = ok.wrongItems ?? [];
+  const wrongCount = wrong.length;
+
   return (
-    <div style={{ padding: 16, maxWidth: 980, margin: "0 auto" }}>
+    <div style={{ padding: 20, maxWidth: 1100, margin: "0 auto", fontFamily: "system-ui" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
         <div>
-          <div style={{ fontSize: 18, fontWeight: 800 }}>결과 상세</div>
-          <div style={{ marginTop: 6, fontSize: 13, opacity: 0.8 }}>attemptId: {attemptKey}</div>
+          <div style={{ fontSize: 22, fontWeight: 950 }}>결과 상세</div>
+          <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {pill(`attemptId: ${a.id}`)}
+            {pill(`응시자: ${a.emp_id ?? "-"}`)}
+            {pill(`팀: ${a.team ?? "-"}`)}
+            {pill(`상태: ${a.status ?? "-"}`)}
+          </div>
         </div>
 
         <button
-          onClick={downloadExcel}
+          onClick={() => router.push("/admin/results")}
           style={{
-            padding: "10px 12px",
-            borderRadius: 10,
-            border: "1px solid #ddd",
+            padding: "10px 14px",
+            borderRadius: 12,
+            border: "1px solid #e5e7eb",
             background: "white",
+            fontWeight: 900,
             cursor: "pointer",
-            fontWeight: 700,
           }}
         >
-          엑셀 다운로드
+          ← 목록
         </button>
       </div>
 
-      {/* 기본 정보 */}
-      <div style={{ marginTop: 14, border: "1px solid #eee", borderRadius: 14, padding: 14 }}>
-        <div style={{ fontWeight: 800, marginBottom: 8 }}>기본 정보</div>
-        <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", rowGap: 6, columnGap: 12, fontSize: 14 }}>
-          <div style={{ opacity: 0.75 }}>응시자ID</div>
-          <div>{attempt?.emp_id ?? "-"}</div>
-
-          <div style={{ opacity: 0.75 }}>점수</div>
-          <div>
-            {attempt?.score ?? 0} / {attempt?.total_points ?? "-"}
+      {/* 요약 카드 */}
+      <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10 }}>
+        {[
+          { label: "점수", value: `${a.score} / ${a.total_questions}` },
+          { label: "오답", value: `${wrongCount}개` },
+          { label: "시작", value: fmt(a.started_at) },
+          { label: "제출", value: fmt(a.submitted_at) },
+        ].map((x) => (
+          <div
+            key={x.label}
+            style={{
+              padding: 14,
+              border: "1px solid #e5e7eb",
+              borderRadius: 16,
+              background: "white",
+              boxShadow: "0 1px 0 rgba(0,0,0,0.03)",
+            }}
+          >
+            <div style={{ fontSize: 12, opacity: 0.65, fontWeight: 800 }}>{x.label}</div>
+            <div style={{ marginTop: 6, fontSize: 16, fontWeight: 950 }}>{x.value}</div>
           </div>
-
-          <div style={{ opacity: 0.75 }}>응시 시작</div>
-          <div>{fmtDate(attempt?.started_at)}</div>
-
-          <div style={{ opacity: 0.75 }}>제출 시각</div>
-          <div>{fmtDate(attempt?.submitted_at)}</div>
-
-          <div style={{ opacity: 0.75 }}>상태</div>
-          <div>{attempt?.status ?? "-"}</div>
-        </div>
-
-        <div style={{ marginTop: 10, fontSize: 13, opacity: 0.75 }}>❌ 오답 및 미제출 문제만 표시됩니다.</div>
+        ))}
       </div>
 
-      {/* 문제 리스트 */}
-      <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
-        {graded.length === 0 ? (
-          <div style={{ padding: 16, border: "1px solid #eee", borderRadius: 14 }}>표시할 오답/미제출 문제가 없습니다.</div>
+      {/* 오답 리스트 */}
+      <div style={{ marginTop: 16 }}>
+        <div style={{ fontSize: 16, fontWeight: 950, marginBottom: 10 }}>틀린 문제</div>
+
+        {wrongCount === 0 ? (
+          <div
+            style={{
+              padding: 14,
+              border: "1px dashed #d1d5db",
+              borderRadius: 16,
+              background: "#fafafa",
+              color: "#374151",
+              fontWeight: 800,
+            }}
+          >
+            오답이 없거나(만점), 오답 데이터를 아직 저장하지 않는 구조일 수 있어요.
+          </div>
         ) : (
-          graded.map((g: any, idx: number) => {
-            const isUnsubmitted = g?.status === "unsubmitted";
-            const isWrong = g?.status === "submitted" && g?.isCorrect === false;
-
-            const borderColor = isWrong ? "#ff3b30" : isUnsubmitted ? "#bbb" : "#eee";
-            const bg = isWrong ? "rgba(255,59,48,0.04)" : isUnsubmitted ? "rgba(0,0,0,0.03)" : "white";
-
-            const choices: any[] = Array.isArray(g?.choices) ? g.choices : [];
-            const selectedIndex = typeof g?.selectedIndex === "number" ? g.selectedIndex : null;
-            const correctIndex = typeof g?.correctIndex === "number" ? g.correctIndex : null;
-
-            return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {wrong.map((w, idx) => (
               <div
-                key={String(g?.questionId ?? idx)}
+                key={`${w.questionId ?? "q"}-${idx}`}
                 style={{
-                  border: `2px solid ${borderColor}`,
-                  background: bg,
-                  borderRadius: 14,
                   padding: 14,
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 16,
+                  background: "white",
                 }}
               >
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ fontWeight: 800 }}>
-                    Q{idx + 1}. {g?.content ?? ""}
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ fontWeight: 950 }}>
+                    Q{idx + 1}. {w.content}
                   </div>
-                  <div style={{ fontSize: 12, opacity: 0.8, whiteSpace: "nowrap" }}>
-                    {isWrong ? "오답" : isUnsubmitted ? "미제출" : ""}
-                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.7, fontWeight: 900 }}>points: {w.points}</div>
                 </div>
 
-                <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
-                  {choices.map((c: any, i: number) => {
-                    const isSelected = !isUnsubmitted && selectedIndex === i;
-                    const isCorrectChoice = correctIndex === i;
+                {w.choices?.length ? (
+                  <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+                    {w.choices.map((c, i) => {
+                      const isCorrect = w.correctIndex === i;
+                      const isSelected = w.selectedIndex === i;
 
-                    let tag = "";
-                    if (isCorrectChoice) tag = "정답";
-                    else if (isSelected) tag = "내 선택";
-
-                    return (
-                      <div
-                        key={i}
-                        style={{
-                          border: "1px solid #eee",
-                          borderRadius: 12,
-                          padding: "10px 12px",
-                          display: "flex",
-                          justifyContent: "space-between",
-                          gap: 12,
-                          opacity: isUnsubmitted ? 0.9 : 1,
-                        }}
-                      >
-                        <div style={{ whiteSpace: "pre-wrap" }}>
-                          {i + 1}. {String(c ?? "")}
+                      return (
+                        <div
+                          key={i}
+                          style={{
+                            padding: 10,
+                            borderRadius: 12,
+                            border: "1px solid #e5e7eb",
+                            background: isCorrect ? "#ecfdf5" : isSelected ? "#fff7ed" : "#fafafa",
+                            fontWeight: 800,
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                            <div>
+                              <span style={{ opacity: 0.7, marginRight: 6 }}>{i + 1}.</span>
+                              {c}
+                            </div>
+                            <div style={{ fontSize: 12 }}>
+                              {isCorrect ? "정답" : isSelected ? "내 선택" : ""}
+                            </div>
+                          </div>
                         </div>
-                        <div style={{ fontSize: 12, fontWeight: 800, opacity: tag ? 0.9 : 0.2 }}>{tag || "•"}</div>
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 10, opacity: 0.7 }}>
+                    보기 데이터가 없는 유형(주관식 등)일 수 있어요.
+                  </div>
+                )}
 
-                <div style={{ marginTop: 10, fontSize: 13, opacity: 0.85 }}>
-                  <div>내 선택: {isUnsubmitted ? "-" : selectedIndex != null ? selectedIndex + 1 : "-"}</div>
-                  <div>정답: {correctIndex != null ? correctIndex + 1 : "-"}</div>
+                <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75, fontWeight: 800 }}>
+                  선택: {w.selectedIndex === null ? "-" : w.selectedIndex + 1} / 정답:{" "}
+                  {w.correctIndex === null ? "-" : w.correctIndex + 1}
                 </div>
               </div>
-            );
-          })
+            ))}
+          </div>
         )}
       </div>
     </div>

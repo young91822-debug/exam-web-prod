@@ -2,7 +2,9 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 function s(v: any) {
   return String(v ?? "").trim();
@@ -44,7 +46,7 @@ function isMissingColumn(err: any, col?: string) {
   const msg = String(err?.message ?? err ?? "");
   const low = msg.toLowerCase();
   if (!col) {
-    return msg.includes("does not exist") || msg.includes("Could not find") || msg.includes("schema cache");
+    return low.includes("does not exist") || low.includes("could not find") || low.includes("schema cache");
   }
   return (
     (low.includes("does not exist") && low.includes(col.toLowerCase())) ||
@@ -52,33 +54,27 @@ function isMissingColumn(err: any, col?: string) {
   );
 }
 
-/** 팀 → 소유 관리자 고정 매핑 */
-function mapOwnerAdminByTeam(team: string) {
-  const t = s(team).toUpperCase();
-  return t === "B" ? "admin_gs" : "admin";
-}
-
 /**
  * ✅ 관리자 권한 가드 + (가능하면) owner_admin 가드
  * - owner_admin 컬럼이 있으면: attempt.owner_admin === adminEmpId 이어야 통과
- * - owner_admin 컬럼이 없으면: attempt.team 기준으로 adminEmpId 매핑이 맞아야 통과
+ * - owner_admin 컬럼이 없으면: adminTeam 쿠키 있으면 attempt.team 과 일치해야 통과
+ * - adminTeam 쿠키 없으면: 슈퍼관리자로 보고 전체 허용(원하면 false로 바꿔도 됨)
  */
-function authorizeAdminForAttempt(adminEmpId: string, attempt: any) {
-  const team = s(attempt?.team).toUpperCase(); // A/B
-  const owner = s(attempt?.owner_admin); // 있을 수도/없을 수도
+function authorizeAdminForAttempt(adminEmpId: string, attempt: any, adminTeam: string | null) {
+  const attemptTeam = s(attempt?.team).toUpperCase(); // A/B
+  const owner = s(attempt?.owner_admin);
 
-  // 1) owner_admin 값이 들어있으면 그걸로 강제
-  if (owner) {
-    return owner === adminEmpId;
+  // 1) owner_admin 있으면 최우선
+  if (owner) return owner === adminEmpId;
+
+  // 2) adminTeam 쿠키 있으면 team 일치만 허용
+  if (adminTeam) {
+    if (!attemptTeam) return false;
+    return attemptTeam === s(adminTeam).toUpperCase();
   }
 
-  // 2) owner_admin이 비어있으면 team으로 fallback (고정 규칙)
-  if (team) {
-    return mapOwnerAdminByTeam(team) === adminEmpId;
-  }
-
-  // 3) 둘 다 없으면 안전하게 차단
-  return false;
+  // 3) adminTeam 없으면 슈퍼관리자(전체 허용)
+  return true;
 }
 
 function pickChoices(q: any): string[] {
@@ -231,7 +227,8 @@ async function resolveLegacyByStartedAt(attemptUuidRow: any) {
   if (!startedAt) return { ok: false as const, error: "UUID_ATTEMPT_NO_STARTED_AT" };
 
   const d = new Date(startedAt);
-  if (Number.isNaN(d.getTime())) return { ok: false as const, error: "UUID_ATTEMPT_BAD_STARTED_AT", detail: startedAt };
+  if (Number.isNaN(d.getTime()))
+    return { ok: false as const, error: "UUID_ATTEMPT_BAD_STARTED_AT", detail: startedAt };
 
   // ±2분 window
   const t0 = new Date(d.getTime() - 2 * 60 * 1000).toISOString();
@@ -262,6 +259,7 @@ export async function GET(req: Request) {
     // ✅ 관리자 인증
     const adminEmpId = s(getCookie(req, "empId"));
     const role = s(getCookie(req, "role"));
+    const adminTeam = s(getCookie(req, "team")) || null;
 
     if (!adminEmpId || role !== "admin") {
       return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
@@ -307,14 +305,17 @@ export async function GET(req: Request) {
       // ✅ UUID row를 legacy(exam_attempts)로 매칭해서 상세 만들기
       const resolved = await resolveLegacyByStartedAt(uuidAttempt);
       if (resolved.ok) {
-        // ✅ 보안 가드: legacy attempt가 이 관리자 소유인지 확인
-        if (!authorizeAdminForAttempt(adminEmpId, resolved.attempt)) {
+        // ✅ 보안 가드
+        if (!authorizeAdminForAttempt(adminEmpId, resolved.attempt, adminTeam)) {
           return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
         }
 
         const legacyDetail = await buildLegacyDetailFromExamAttempts(resolved.attempt);
         if (!legacyDetail.ok) {
-          return NextResponse.json({ ok: false, error: legacyDetail.error, detail: legacyDetail.detail }, { status: 500 });
+          return NextResponse.json(
+            { ok: false, error: legacyDetail.error, detail: legacyDetail.detail },
+            { status: 500 }
+          );
         }
 
         return NextResponse.json({
@@ -332,7 +333,7 @@ export async function GET(req: Request) {
         });
       }
 
-      // ❗ legacy 매칭 실패 시: 안전상 상세 제공 금지(다른 팀/관리자 가능성)
+      // ❗ legacy 매칭 실패 시: 안전상 상세 제공 금지
       return NextResponse.json(
         {
           ok: false,
@@ -352,7 +353,11 @@ export async function GET(req: Request) {
     // =====================================================
     if (!isNumericId(attemptKey)) {
       return NextResponse.json(
-        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { url: req.url, got: raw, allParams: Array.from(u.searchParams.entries()) } },
+        {
+          ok: false,
+          error: "INVALID_ATTEMPT_ID",
+          detail: { url: req.url, got: raw, allParams: Array.from(u.searchParams.entries()) },
+        },
         { status: 400 }
       );
     }
@@ -360,12 +365,15 @@ export async function GET(req: Request) {
     const attemptId = n(attemptKey, null);
     if (!attemptId || attemptId <= 0) {
       return NextResponse.json(
-        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { url: req.url, got: raw, allParams: Array.from(u.searchParams.entries()) } },
+        {
+          ok: false,
+          error: "INVALID_ATTEMPT_ID",
+          detail: { url: req.url, got: raw, allParams: Array.from(u.searchParams.entries()) },
+        },
         { status: 400 }
       );
     }
 
-    // ✅ 가능하면 owner_admin을 이용해 "내 것만" 조회(컬럼 없으면 fallback)
     let attempt: any = null;
 
     // 1) owner_admin 컬럼이 있을 때: 강제 필터
@@ -381,16 +389,18 @@ export async function GET(req: Request) {
       r1 = await supabaseAdmin.from("exam_attempts").select("*").eq("id", attemptId).maybeSingle();
     }
 
-    if (r1.error) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: r1.error }, { status: 500 });
+    if (r1.error) {
+      return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: r1.error }, { status: 500 });
+    }
+
     attempt = r1.data;
 
     if (!attempt) {
-      // owner_admin 필터로 못 찾은 경우도 포함
       return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
     }
 
-    // ✅ owner_admin이 없었거나(또는 값이 비어있어) 필터가 못 막는 경우 대비: 최종 가드
-    if (!authorizeAdminForAttempt(adminEmpId, attempt)) {
+    // ✅ 최종 가드
+    if (!authorizeAdminForAttempt(adminEmpId, attempt, adminTeam)) {
       return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
     }
 
