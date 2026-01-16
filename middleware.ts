@@ -4,28 +4,42 @@ import { NextRequest, NextResponse } from "next/server";
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
-  // 로그인/정적/API는 여기까지 오지 않음 (matcher에서 제외됨)
+  // 항상 허용
+  if (
+    pathname.startsWith("/login") ||
+    pathname.startsWith("/api") ||
+    pathname.startsWith("/_next") ||
+    pathname.startsWith("/favicon.ico")
+  ) {
+    return NextResponse.next();
+  }
 
   const empId = req.cookies.get("empId")?.value || "";
   const role = req.cookies.get("role")?.value || "";
 
-  // 관리자
+  // ❌ 로그인 안 했으면 무조건 로그인
+  if (!empId) {
+    const url = req.nextUrl.clone();
+    url.pathname = "/login";
+    url.searchParams.set("next", pathname);
+    return NextResponse.redirect(url);
+  }
+
+  // ✅ 관리자 보호
   if (pathname.startsWith("/admin")) {
-    if (!empId || role !== "admin") {
+    if (role !== "admin") {
       const url = req.nextUrl.clone();
       url.pathname = "/login";
-      url.searchParams.set("next", pathname);
       return NextResponse.redirect(url);
     }
     return NextResponse.next();
   }
 
-  // 시험/결과
-  if (pathname.startsWith("/exam") || pathname.startsWith("/result")) {
-    if (!empId) {
+  // 🚫 관리자면 시험 접근 금지
+  if (pathname.startsWith("/exam")) {
+    if (role === "admin") {
       const url = req.nextUrl.clone();
-      url.pathname = "/login";
-      url.searchParams.set("next", pathname);
+      url.pathname = "/admin";
       return NextResponse.redirect(url);
     }
     return NextResponse.next();
@@ -35,5 +49,5 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!api|_next|favicon.ico|.*\\..*).*)"],
+  matcher: ["/((?!_next/static|_next/image).*)"],
 };
