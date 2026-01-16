@@ -34,8 +34,6 @@ function getCookie(req: Request, name: string) {
 
 function isMissingColumn(err: any, col: string) {
   const msg = String(err?.message || err || "");
-  // 예: column accounts.username does not exist
-  // 예: Could not find the 'username' column of 'accounts' in the schema cache
   return (
     msg.includes(`column accounts.${col} does not exist`) ||
     msg.includes(`Could not find the '${col}' column`) ||
@@ -43,68 +41,95 @@ function isMissingColumn(err: any, col: string) {
   );
 }
 
-// ✅ accounts에서 team 읽기 (없으면 A)
-// ✅ username 컬럼이 없는 DB에서도 절대 안 터지게 안전 처리
-async function pickTeamFromAccounts(empId: string) {
+/**
+ * ✅ accounts에서 team/role/is_active 읽기 (없으면 A/user)
+ * ✅ username 컬럼이 없는 DB에서도 절대 안 터지게 안전 처리
+ */
+async function pickAccountInfo(empId: string) {
   // 1) emp_id로 먼저
   const r1 = await sb
     .from("accounts")
-    .select("team, is_active, emp_id")
+    .select("emp_id, team, role, is_active")
     .eq("emp_id", empId)
     .maybeSingle();
 
   if (r1.error) throw r1.error;
+
   if (r1.data) {
     const isActive = r1.data.is_active === false ? false : true;
     const team = s(r1.data.team || "A") || "A";
-    return { team, isActive, matchedBy: "emp_id" as const };
+    const role = s(r1.data.role || "user") || "user";
+    return { team, role, isActive, matchedBy: "emp_id" as const };
   }
 
-  // 2) 없으면 username으로 fallback (단, username 컬럼 없으면 스킵)
+  // 2) 없으면 username fallback (단, username 컬럼 없으면 스킵)
   const r2 = await sb
     .from("accounts")
-    .select("team, is_active, emp_id")
+    .select("emp_id, team, role, is_active")
     .eq("username", empId)
     .maybeSingle();
 
   if (r2.error) {
-    // ✅ username 컬럼이 없으면 그냥 계정 없음 처리로 넘김
     if (isMissingColumn(r2.error, "username")) {
-      return { team: "A", isActive: true, matchedBy: "none" as const, notFound: true as const };
+      return {
+        team: "A",
+        role: "user",
+        isActive: true,
+        matchedBy: "none" as const,
+        notFound: true as const,
+      };
     }
     throw r2.error;
   }
 
   if (!r2.data) {
-    return { team: "A", isActive: true, matchedBy: "none" as const, notFound: true as const };
+    return {
+      team: "A",
+      role: "user",
+      isActive: true,
+      matchedBy: "none" as const,
+      notFound: true as const,
+    };
   }
 
   const isActive = r2.data.is_active === false ? false : true;
   const team = s(r2.data.team || "A") || "A";
-  return { team, isActive, matchedBy: "username" as const };
+  const role = s(r2.data.role || "user") || "user";
+  return { team, role, isActive, matchedBy: "username" as const };
 }
 
 export async function POST(req: Request) {
   try {
     const empId = s(getCookie(req, "empId"));
+    const cookieRole = s(getCookie(req, "role")); // 로그인 API가 심은 role 쿠키 (있으면 참고)
+
     if (!empId) {
       return NextResponse.json({ ok: false, error: "NO_SESSION" }, { status: 401 });
     }
 
-    const teamInfo: any = await pickTeamFromAccounts(empId);
+    const info: any = await pickAccountInfo(empId);
 
-    if (teamInfo?.notFound) {
+    if (info?.notFound) {
       return NextResponse.json(
         { ok: false, error: "ACCOUNT_NOT_FOUND", detail: { empId } },
         { status: 401 }
       );
     }
 
-    if (!teamInfo.isActive) {
+    if (!info.isActive) {
       return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
     }
 
-    const team = s(teamInfo.team || "A") || "A";
+    // ✅ 관리자면 시험 시작 자체를 막는다 (admin이 /exam로 들어와도 더 이상 start가 안 돎)
+    const effectiveRole = (s(info.role) || cookieRole || "user").toLowerCase();
+    if (effectiveRole === "admin") {
+      return NextResponse.json(
+        { ok: false, error: "ADMIN_CANNOT_TAKE_EXAM", detail: { empId } },
+        { status: 403 }
+      );
+    }
+
+    const team = s(info.team || "A") || "A";
 
     // ✅ 내 팀 문제만 가져오기
     const q1 = await sb
@@ -170,9 +195,8 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
     total_questions: pickedIds.length,
     score: 0,
     question_ids: pickedIds,
-    answers: {}, // map 형태(JSON)
-    team,        // ✅ team 저장
-    // total_points 는 DB 컬럼 없으면 넣지 말자 (안전)
+    answers: {},
+    team,
   };
 
   const r1 = await sb.from("exam_attempts").insert(insertRow).select("id").single();
