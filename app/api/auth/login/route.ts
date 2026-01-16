@@ -79,11 +79,11 @@ export async function POST(req: NextRequest) {
 
     const sb: any = supabaseAdmin;
 
-    // ✅ 핵심 수정: emp_id OR username 으로 조회
-    const { data, error } = await sb
+    // ✅ 1차: emp_id로 조회
+    let { data, error } = await sb
       .from(TABLE)
       .select("*")
-      .or(`emp_id.eq.${id},username.eq.${id}`)
+      .eq("emp_id", id)
       .maybeSingle();
 
     if (error) {
@@ -91,6 +91,23 @@ export async function POST(req: NextRequest) {
         { ok: false, error: "DB_READ_FAILED", detail: error.message },
         { status: 500 }
       );
+    }
+
+    // ✅ 2차: emp_id 없으면 username으로 재조회
+    if (!data) {
+      const r2 = await sb
+        .from(TABLE)
+        .select("*")
+        .eq("username", id)
+        .maybeSingle();
+
+      if (r2.error) {
+        return NextResponse.json(
+          { ok: false, error: "DB_READ_FAILED", detail: r2.error.message },
+          { status: 500 }
+        );
+      }
+      data = r2.data;
     }
 
     if (!data) {
@@ -136,31 +153,17 @@ export async function POST(req: NextRequest) {
       team,
     });
 
-    res.cookies.set("empId", data.emp_id, {
+    const cookieOpts = {
       httpOnly: true,
       secure: true,
-      sameSite: "lax",
+      sameSite: "lax" as const,
       path: "/",
       maxAge: 60 * 60 * 12,
-    });
+    };
 
-    res.cookies.set("role", role, {
-      httpOnly: true,
-      secure: true,
-      sameSite: "lax",
-      path: "/",
-      maxAge: 60 * 60 * 12,
-    });
-
-    if (team) {
-      res.cookies.set("team", team, {
-        httpOnly: true,
-        secure: true,
-        sameSite: "lax",
-        path: "/",
-        maxAge: 60 * 60 * 12,
-      });
-    }
+    res.cookies.set("empId", data.emp_id, cookieOpts);
+    res.cookies.set("role", role, cookieOpts);
+    if (team) res.cookies.set("team", team, cookieOpts);
 
     return res;
   } catch (e: any) {
