@@ -1,11 +1,9 @@
-// app/api/auth/login/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
 const TABLE = "accounts";
-const MARKER = "LOGIN_EMP_ID_ONLY_v2026-01-16_01";
 
 function s(v: any) {
   return String(v ?? "").trim();
@@ -65,53 +63,57 @@ export async function POST(req: NextRequest) {
 
     const id = s(
       body?.id ??
-        body?.empId ??
-        body?.emp_id ??
-        body?.user_id ??
-        body?.username ??
-        body?.loginId
+      body?.emp_id ??
+      body?.empId ??
+      body?.username ??
+      body?.loginId
     );
     const pw = s(body?.pw ?? body?.password ?? body?.pass ?? body?.pwd);
 
     if (!id || !pw) {
       return NextResponse.json(
-        { ok: false, error: "MISSING_FIELDS", marker: MARKER },
+        { ok: false, error: "MISSING_FIELDS" },
         { status: 400 }
       );
     }
 
     const sb: any = supabaseAdmin;
 
-    // ✅✅✅ accounts는 emp_id로만 조회
+    // ✅ 핵심 수정: emp_id OR username 으로 조회
     const { data, error } = await sb
       .from(TABLE)
       .select("*")
-      .eq("emp_id", id)
+      .or(`emp_id.eq.${id},username.eq.${id}`)
       .maybeSingle();
 
     if (error) {
       return NextResponse.json(
-        { ok: false, error: "DB_READ_FAILED", detail: String(error?.message ?? error), marker: MARKER },
+        { ok: false, error: "DB_READ_FAILED", detail: error.message },
         { status: 500 }
       );
     }
 
     if (!data) {
-      // ✅ 반영 확인용(민감정보 없음)
       return NextResponse.json(
-        { ok: false, error: "INVALID_CREDENTIALS", marker: MARKER, detail: { found: false } },
+        { ok: false, error: "INVALID_CREDENTIALS" },
         { status: 401 }
       );
     }
 
     const isActive =
-      data?.is_active === undefined || data?.is_active === null ? true : Boolean(data.is_active);
+      data.is_active === null || data.is_active === undefined
+        ? true
+        : Boolean(data.is_active);
+
     if (!isActive) {
-      return NextResponse.json({ ok: false, error: "INACTIVE_ACCOUNT", marker: MARKER }, { status: 403 });
+      return NextResponse.json(
+        { ok: false, error: "INACTIVE_ACCOUNT" },
+        { status: 403 }
+      );
     }
 
-    const storedHash = s(data?.password_hash);
-    const storedPlain = s(data?.password);
+    const storedHash = s(data.password_hash);
+    const storedPlain = s(data.password);
 
     const ok =
       (storedHash && verifyPasswordHash(pw, storedHash)) ||
@@ -119,37 +121,51 @@ export async function POST(req: NextRequest) {
 
     if (!ok) {
       return NextResponse.json(
-        {
-          ok: false,
-          error: "INVALID_CREDENTIALS",
-          marker: MARKER,
-          detail: { found: true, hasHash: !!storedHash, hasPlain: !!storedPlain, pwLen: pw.length },
-        },
+        { ok: false, error: "INVALID_CREDENTIALS" },
         { status: 401 }
       );
     }
 
     const role = ADMIN_IDS.has(id) ? "admin" : "user";
-    const team = s(data?.team ?? "");
+    const team = s(data.team);
 
-    const res = NextResponse.json({ ok: true, role, empId: id, team, marker: MARKER });
+    const res = NextResponse.json({
+      ok: true,
+      role,
+      empId: data.emp_id,
+      team,
+    });
 
-    const cookieOpts = {
+    res.cookies.set("empId", data.emp_id, {
       httpOnly: true,
       secure: true,
-      sameSite: "lax" as const,
+      sameSite: "lax",
       path: "/",
       maxAge: 60 * 60 * 12,
-    };
+    });
 
-    res.cookies.set("empId", id, cookieOpts);
-    res.cookies.set("role", role, cookieOpts);
-    if (team) res.cookies.set("team", team, cookieOpts);
+    res.cookies.set("role", role, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      path: "/",
+      maxAge: 60 * 60 * 12,
+    });
+
+    if (team) {
+      res.cookies.set("team", team, {
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+        path: "/",
+        maxAge: 60 * 60 * 12,
+      });
+    }
 
     return res;
   } catch (e: any) {
     return NextResponse.json(
-      { ok: false, error: "LOGIN_FAILED", detail: String(e?.message ?? e), marker: MARKER },
+      { ok: false, error: "LOGIN_FAILED", detail: String(e?.message ?? e) },
       { status: 500 }
     );
   }
