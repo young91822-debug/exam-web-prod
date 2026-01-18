@@ -12,49 +12,14 @@ function n(v: any, d: number) {
   const x = Number(v);
   return Number.isFinite(x) ? x : d;
 }
-
-function isMissingColumn(err: any) {
-  const msg = String(err?.message ?? err ?? "");
-  return msg.includes("does not exist") || msg.includes("Could not find") || msg.includes("schema cache");
+function upperTeam(v: any) {
+  const t = s(v).toUpperCase();
+  return t === "B" ? "B" : "A";
 }
-
-/** ✅ 팀 → 소유 관리자 고정 매핑 */
-function mapOwnerAdminByTeam(team: string) {
-  const t = s(team).toUpperCase();
-  return t === "B" ? "admin_gs" : "admin";
-}
-
-/**
- * ✅ 시도1: owner_admin 필터(가능하면) + team 보조필터
- * ✅ owner_admin 컬럼이 없으면 자동으로 제외하고 재시도할 수 있도록
- *    여기서는 "필터를 옵션으로" 받는다.
- */
-async function trySelect(opts: {
-  teamFilter: string | null;
-  ownerAdminFilter: string | null;
-  from: number;
-  to: number;
-  selectExpr: string;
-}) {
-  const { teamFilter, ownerAdminFilter, from, to, selectExpr } = opts;
-
-  let q = sb
-    .from("exam_attempts")
-    .select(selectExpr, { count: "exact" })
-    .order("submitted_at", { ascending: false })
-    .range(from, to);
-
-  // ✅ 1순위: owner_admin으로 관리자 분리
-  if (ownerAdminFilter) {
-    q = q.eq("owner_admin", ownerAdminFilter);
-  }
-
-  // ✅ 2순위(보조): team도 포함 + empty/null도 포함(기존 동작 유지)
-  if (teamFilter !== null) {
-    q = q.or(`team.eq.${teamFilter},team.is.null,team.eq.`);
-  }
-
-  return await q;
+function toCsvCell(v: any) {
+  const t = String(v ?? "");
+  if (t.includes('"') || t.includes(",") || t.includes("\n")) return `"${t.replace(/"/g, '""')}"`;
+  return t;
 }
 
 export async function GET(req: NextRequest) {
@@ -70,129 +35,90 @@ export async function GET(req: NextRequest) {
     const url = new URL(req.url);
     const page = Math.max(1, n(url.searchParams.get("page"), 1));
     const pageSize = Math.min(200, Math.max(1, n(url.searchParams.get("pageSize"), 50)));
+    const format = s(url.searchParams.get("format")); // "csv"면 csv
     const from = (page - 1) * pageSize;
     const to = from + pageSize - 1;
 
-    // ✅ 기본 팀 (admin_gs는 B, 그 외 A)
-    const team = (teamCookie || (empId === "admin_gs" ? "B" : "A")).toUpperCase();
+    const adminTeam = upperTeam(teamCookie || (empId === "admin_gs" ? "B" : "A"));
 
-    // ✅ 고정 매핑: 내 팀의 소유 관리자
-    // - 팀/쿠키가 꼬여도 "이 관리자"가 보는 건 "이 관리자 소유(owner_admin=empId)"가 1순위.
-    // - 단, 혹시 너가 관리자 계정을 늘리거나 바꿀 수 있으니: 1순위는 그냥 empId로.
-    const ownerAdmin = empId || mapOwnerAdminByTeam(team);
+    // ✅ 최대한 안전: team 기준으로만 보여줌 (owner_admin 없더라도 교차노출 방지)
+    // 레거시 team null도 있을 수 있으니 "내 팀 또는 null"만 허용
+    const r = await sb
+      .from("exam_attempts")
+      .select("id, emp_id, score, total_points, started_at, submitted_at, total_questions, wrong_count, team, status", { count: "exact" })
+      .or(`team.eq.${adminTeam},team.is.null,team.eq.`)
+      .order("submitted_at", { ascending: false })
+      .order("id", { ascending: false })
+      .range(from, to);
 
-    const selectCandidates = [
-      "id",
-      "emp_id",
-      "score",
-      "started_at",
-      "submitted_at",
-      "total_questions",
-      "team",
-      "status",
-      "total_points",
-      "correct_count",
-      "wrong_count",
-      // ✅ 새 컬럼 후보로 포함 (없으면 자동 제거됨)
-      "owner_admin",
-    ];
-
-    let cols = [...selectCandidates];
-    let lastErr: any = null;
-
-    // owner_admin 필터는 기본 ON, 컬럼 없으면 OFF로 자동 전환
-    let useOwnerAdminFilter = true;
-
-    for (let tries = 0; tries < 12; tries++) {
-      const selectExpr = cols.join(",");
-      const r = await trySelect({
-        teamFilter: team, // 보조
-        ownerAdminFilter: useOwnerAdminFilter ? ownerAdmin : null, // 1순위
-        from,
-        to,
-        selectExpr,
-      });
-
-      if (!r.error) {
-        return NextResponse.json({
-          ok: true,
-          mode: useOwnerAdminFilter ? "OWNER_ADMIN_FILTERED" : "TEAM_ONLY_FALLBACK",
-          page,
-          pageSize,
-          total: r.count ?? (r.data?.length ?? 0),
-          selectExpr,
-          filters: {
-            owner_admin: useOwnerAdminFilter ? ownerAdmin : null,
-            team,
-          },
-          items: r.data ?? [],
-        });
-      }
-
-      lastErr = r.error;
-
-      if (isMissingColumn(r.error)) {
-        const msg = String(r.error?.message ?? "");
-
-        // ✅ 에러에서 컬럼명을 뽑아 제거
-        const m = msg.match(/exam_attempts\.([a-zA-Z0-9_]+)/);
-        const badCol = m?.[1];
-
-        // 1) owner_admin 컬럼/필터가 원인일 수 있음
-        // - selectExpr에 owner_admin이 포함되어 있거나
-        // - 필터(eq owner_admin)가 걸려서 터질 수 있음
-        // PostgREST는 필터 컬럼이 없으면 에러가 나니,
-        // 이 경우 "owner_admin 필터를 끈다"가 맞음.
-        if (msg.toLowerCase().includes("owner_admin")) {
-          // select에서 제거
-          if (cols.includes("owner_admin")) cols = cols.filter((c) => c !== "owner_admin");
-          // 필터도 끔
-          useOwnerAdminFilter = false;
-          continue;
-        }
-
-        if (badCol && cols.includes(badCol)) {
-          cols = cols.filter((c) => c !== badCol);
-          continue;
-        }
-
-        // 2) 못 뽑았으면 “잘 터질만한 애들” 우선 제거
-        const fallbackRemoveOrder = [
-          "total_points",
-          "correct_count",
-          "wrong_count",
-          "status",
-          "team",
-          "started_at",
-        ];
-        const remove = fallbackRemoveOrder.find((c) => cols.includes(c));
-        if (remove) {
-          cols = cols.filter((c) => c !== remove);
-          continue;
-        }
-
-        // 3) 그래도 안 되면 마지막으로 owner_admin 필터 OFF 한번 시도
-        if (useOwnerAdminFilter) {
-          useOwnerAdminFilter = false;
-          continue;
-        }
-      }
-
-      // 컬럼 없음이 아닌 에러면 바로 반환
-      return NextResponse.json(
-        { ok: false, error: "DB_READ_FAILED", detail: String(r.error?.message ?? r.error) },
-        { status: 500 }
-      );
+    if (r.error) {
+      return NextResponse.json({ ok: false, error: "DB_READ_FAILED", detail: String(r.error?.message ?? r.error) }, { status: 500 });
     }
 
-    return NextResponse.json(
-      { ok: false, error: "DB_READ_FAILED", detail: String(lastErr?.message ?? lastErr) },
-      { status: 500 }
-    );
+    const items = r.data ?? [];
+    const total = r.count ?? items.length;
+
+    // ✅ CSV 응답
+    if (format.toLowerCase() === "csv") {
+      const header = [
+        "attempt_id",
+        "emp_id",
+        "team",
+        "status",
+        "score",
+        "total_points",
+        "wrong_count",
+        "total_questions",
+        "started_at",
+        "submitted_at",
+      ];
+
+      const lines = [
+        header.join(","),
+        ...items.map((x: any) =>
+          [
+            toCsvCell(x?.id),
+            toCsvCell(x?.emp_id),
+            toCsvCell(x?.team),
+            toCsvCell(x?.status),
+            toCsvCell(x?.score),
+            toCsvCell(x?.total_points),
+            toCsvCell(x?.wrong_count),
+            toCsvCell(x?.total_questions),
+            toCsvCell(x?.started_at),
+            toCsvCell(x?.submitted_at),
+          ].join(",")
+        ),
+      ].join("\n");
+
+      return new NextResponse(lines, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="results_${adminTeam}_p${page}.csv"`,
+        },
+      });
+    }
+
+    return NextResponse.json({
+      ok: true,
+      page,
+      pageSize,
+      total,
+      filters: { adminTeam },
+      items: items.map((x: any) => ({
+        id: String(x?.id),
+        idType: "num",
+        empId: s(x?.emp_id),
+        score: Number(x?.score ?? 0),
+        totalPoints: Number(x?.total_points ?? 0),
+        startedAt: x?.started_at ?? null,
+        submittedAt: x?.submitted_at ?? null,
+        totalQuestions: Number(x?.total_questions ?? 0),
+        wrongCount: Number(x?.wrong_count ?? 0),
+      })),
+    });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "RESULTS_FAILED", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "RESULTS_FAILED", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }

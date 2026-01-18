@@ -52,24 +52,26 @@ function isMissingColumn(err: any, col?: string) {
   );
 }
 
-/**
- * ✅ 관리자 권한 가드 (팀 쿠키 기반)
- * - owner_admin이 있으면: owner_admin === adminEmpId
- * - owner_admin이 없으면:
- *    - adminTeam 쿠키가 있으면 attempt.team과 일치해야 통과
- *    - adminTeam 쿠키가 없으면(슈퍼관리자) 전체 허용
- */
-function authorizeAdminForAttempt(adminEmpId: string, attempt: any, adminTeam: string | null) {
-  const attemptTeam = s(attempt?.team).toUpperCase();
-  const owner = s(attempt?.owner_admin);
+function upperTeam(v: any) {
+  const t = s(v).toUpperCase();
+  return t === "B" ? "B" : "A";
+}
 
+/**
+ * ✅ 관리자 소유/팀 가드
+ * 우선순위:
+ * 1) owner_admin 값이 있으면 무조건 owner_admin === adminEmpId
+ * 2) 없으면 attempt.team 이 adminTeam과 같아야 함
+ * 3) attempt.team도 없으면 안전하게 adminTeam 기준으로만 허용(레거시 null 대응)
+ */
+function authorizeAdminForAttempt(adminEmpId: string, adminTeam: "A" | "B", attempt: any) {
+  const owner = s(attempt?.owner_admin);
   if (owner) return owner === adminEmpId;
 
-  if (adminTeam) {
-    if (!attemptTeam) return false;
-    return attemptTeam === s(adminTeam).toUpperCase();
-  }
+  const attemptTeamRaw = s(attempt?.team);
+  if (attemptTeamRaw) return upperTeam(attemptTeamRaw) === adminTeam;
 
+  // 레거시 데이터(team null): adminTeam 기준으로만 허용 (교차노출 방지)
   return true;
 }
 
@@ -114,6 +116,7 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
+/** attempt.answers에서 map/ids 추출 */
 function parseAttemptAnswers(attempt: any): { map: Record<string, number>; questionIds: string[] } {
   let a: any = attempt?.answers;
 
@@ -151,6 +154,7 @@ function parseAttemptAnswers(attempt: any): { map: Record<string, number>; quest
   return { map, questionIds };
 }
 
+/** legacy(exam_attempts)에서 graded 만들기: question_ids + answers(map) 기반 */
 async function buildLegacyDetailFromExamAttempts(attempt: any) {
   let questionIds: string[] = Array.isArray(attempt?.question_ids)
     ? attempt.question_ids.map((x: any) => s(x)).filter(Boolean)
@@ -169,7 +173,9 @@ async function buildLegacyDetailFromExamAttempts(attempt: any) {
     .select("*")
     .in("id", questionIds.length ? questionIds : ["__never__"]);
 
-  if (qErr) return { ok: false as const, error: "QUESTIONS_QUERY_FAILED", detail: qErr };
+  if (qErr) {
+    return { ok: false as const, error: "QUESTIONS_QUERY_FAILED", detail: qErr };
+  }
 
   const qById = new Map<string, any>();
   for (const q of questions ?? []) qById.set(String((q as any).id), q);
@@ -209,6 +215,7 @@ async function buildLegacyDetailFromExamAttempts(attempt: any) {
   };
 }
 
+/** UUID attempt를 legacy(exam_attempts)로 매칭: started_at 기준(±2분) */
 async function resolveLegacyByStartedAt(attemptUuidRow: any) {
   const startedAt = attemptUuidRow?.started_at ?? attemptUuidRow?.startedAt ?? null;
   if (!startedAt) return { ok: false as const, error: "UUID_ATTEMPT_NO_STARTED_AT" };
@@ -243,11 +250,14 @@ export async function GET(req: Request) {
   try {
     const adminEmpId = s(getCookie(req, "empId"));
     const role = s(getCookie(req, "role"));
-    const adminTeam = s(getCookie(req, "team")) || null; // ✅ 추가
+    const teamCookie = s(getCookie(req, "team"));
 
     if (!adminEmpId || role !== "admin") {
       return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
     }
+
+    // ✅ adminTeam 확정(쿠키 우선, 없으면 empId로 추론)
+    const adminTeam = upperTeam(teamCookie || (adminEmpId === "admin_gs" ? "B" : "A")) as "A" | "B";
 
     const u = new URL(req.url);
     const raw =
@@ -261,7 +271,9 @@ export async function GET(req: Request) {
       );
     }
 
-    // ✅ 1) UUID attempt 처리
+    // =========================
+    // 1) UUID attempt
+    // =========================
     if (isUuid(attemptKey)) {
       const { data: uuidAttempt, error: aErr } = await supabaseAdmin
         .from("attempts")
@@ -270,88 +282,64 @@ export async function GET(req: Request) {
         .maybeSingle();
 
       if (aErr) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: aErr }, { status: 500 });
-      if (!uuidAttempt) {
-        return NextResponse.json(
-          { ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId: attemptKey, source: "attempts" } },
-          { status: 404 }
-        );
-      }
+      if (!uuidAttempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
 
       const resolved = await resolveLegacyByStartedAt(uuidAttempt);
-      if (resolved.ok) {
-        if (!authorizeAdminForAttempt(adminEmpId, resolved.attempt, adminTeam)) {
-          return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
-        }
-
-        const legacyDetail = await buildLegacyDetailFromExamAttempts(resolved.attempt);
-        if (!legacyDetail.ok) {
-          return NextResponse.json({ ok: false, error: legacyDetail.error, detail: legacyDetail.detail }, { status: 500 });
-        }
-
-        return NextResponse.json({
-          ok: true,
-          attempt: legacyDetail.attempt,
-          graded: legacyDetail.graded,
-          meta: {
-            ...legacyDetail.meta,
-            idType: "uuid->num",
-            source: "attempts + exam_attempts",
-            originalUuid: attemptKey,
-            matchedBy: "started_at_window_±2m",
-            legacyCandidates: resolved.candidates,
-          },
-        });
+      if (!resolved.ok) {
+        return NextResponse.json({ ok: false, error: "LEGACY_MATCH_FAILED", detail: resolved }, { status: 404 });
       }
 
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "LEGACY_MATCH_FAILED",
-          detail: { attemptId: attemptKey, note: "Legacy match failed; refusing UUID-only detail for security.", matchFail: resolved },
+      if (!authorizeAdminForAttempt(adminEmpId, adminTeam, resolved.attempt)) {
+        return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
+      }
+
+      const legacyDetail = await buildLegacyDetailFromExamAttempts(resolved.attempt);
+      if (!legacyDetail.ok) {
+        return NextResponse.json({ ok: false, error: legacyDetail.error, detail: legacyDetail.detail }, { status: 500 });
+      }
+
+      return NextResponse.json({
+        ok: true,
+        attempt: legacyDetail.attempt,
+        graded: legacyDetail.graded,
+        meta: {
+          ...legacyDetail.meta,
+          idType: "uuid->num",
+          source: "attempts + exam_attempts",
+          originalUuid: attemptKey,
+          adminTeam,
+          legacyCandidates: resolved.candidates,
         },
-        { status: 404 }
-      );
+      });
     }
 
-    // ✅ 2) 숫자 attempt => exam_attempts
+    // =========================
+    // 2) numeric attempt (legacy)
+    // =========================
     if (!isNumericId(attemptKey)) {
-      return NextResponse.json(
-        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { url: req.url, got: raw, allParams: Array.from(u.searchParams.entries()) } },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
     const attemptId = n(attemptKey, null);
     if (!attemptId || attemptId <= 0) {
-      return NextResponse.json(
-        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { url: req.url, got: raw, allParams: Array.from(u.searchParams.entries()) } },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
-    let attempt: any = null;
+    // ✅ 우선 id로 조회(팀/owner 판단은 authorize에서)
+    let r1 = await supabaseAdmin.from("exam_attempts").select("*").eq("id", attemptId).maybeSingle();
 
-    // 1) owner_admin 컬럼이 있을 때: 강제 필터
-    let r1 = await supabaseAdmin
-      .from("exam_attempts")
-      .select("*")
-      .eq("id", attemptId)
-      .eq("owner_admin", adminEmpId)
-      .maybeSingle();
-
+    // owner_admin 컬럼 없어서 터진 케이스 방어(드물지만)
     if (r1.error && isMissingColumn(r1.error, "owner_admin")) {
       r1 = await supabaseAdmin.from("exam_attempts").select("*").eq("id", attemptId).maybeSingle();
     }
 
     if (r1.error) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: r1.error }, { status: 500 });
-    attempt = r1.data;
 
-    if (!attempt) {
-      return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
-    }
+    const attempt = r1.data;
+    if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
 
-    if (!authorizeAdminForAttempt(adminEmpId, attempt, adminTeam)) {
-      return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
+    if (!authorizeAdminForAttempt(adminEmpId, adminTeam, attempt)) {
+      return NextResponse.json({ ok: false, error: "FORBIDDEN", detail: { adminTeam } }, { status: 403 });
     }
 
     const legacyDetail = await buildLegacyDetailFromExamAttempts(attempt);
@@ -359,9 +347,17 @@ export async function GET(req: Request) {
       return NextResponse.json({ ok: false, error: legacyDetail.error, detail: legacyDetail.detail }, { status: 500 });
     }
 
-    return NextResponse.json({ ok: true, attempt: legacyDetail.attempt, graded: legacyDetail.graded, meta: legacyDetail.meta });
+    return NextResponse.json({
+      ok: true,
+      attempt: legacyDetail.attempt,
+      graded: legacyDetail.graded,
+      meta: { ...legacyDetail.meta, adminTeam },
+    });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: "RESULT_DETAIL_UNHANDLED", detail: String(e?.message ?? e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "RESULT_DETAIL_UNHANDLED", detail: String(e?.message ?? e) },
+      { status: 500 }
+    );
   }
 }
 
