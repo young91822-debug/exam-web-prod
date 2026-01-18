@@ -45,32 +45,21 @@ function isMissingColumn(err: any, col: string) {
   );
 }
 
-/**
- * ✅ accounts에서 team/role/is_active를 "안 터지게" 가져오기
- * - 어떤 컬럼이 없어도 단계적 fallback
- * - username 컬럼은 있으면 쓰고, 없으면 스킵
- * - role/is_active/team 컬럼이 없어도 기본값으로 진행
- */
+/** ✅ accounts에서 team/role/is_active를 "안 터지게" 가져오기 */
 async function pickAccountInfo(loginId: string) {
-  // 1) emp_id 기준으로 시도 (풀 컬럼)
   let r = await sb
     .from("accounts")
     .select("emp_id, team, role, is_active")
     .eq("emp_id", loginId)
     .maybeSingle();
 
-  // ✅ select에 없는 컬럼 때문에 터지면 -> 최소 컬럼로 재시도
   if (
     r.error &&
     (isMissingColumn(r.error, "role") ||
       isMissingColumn(r.error, "is_active") ||
       isMissingColumn(r.error, "team"))
   ) {
-    r = await sb
-      .from("accounts")
-      .select("emp_id, team") // 최소
-      .eq("emp_id", loginId)
-      .maybeSingle();
+    r = await sb.from("accounts").select("emp_id, team").eq("emp_id", loginId).maybeSingle();
   }
 
   if (r.error) throw r.error;
@@ -83,12 +72,9 @@ async function pickAccountInfo(loginId: string) {
       role: s((r.data as any).role || "user") || "user",
       is_active: (r.data as any).is_active === false ? false : true,
       matchedBy: "emp_id" as const,
-      hasRoleCol: (r.data as any).role !== undefined,
-      hasActiveCol: (r.data as any).is_active !== undefined,
     };
   }
 
-  // 2) username fallback (username 컬럼 없으면 스킵)
   let r2 = await sb
     .from("accounts")
     .select("emp_id, team, role, is_active")
@@ -96,20 +82,13 @@ async function pickAccountInfo(loginId: string) {
     .maybeSingle();
 
   if (r2.error) {
-    if (isMissingColumn(r2.error, "username")) {
-      return { found: false as const };
-    }
-    // role/is_active/team 없어서 터진 경우 최소로 재시도
+    if (isMissingColumn(r2.error, "username")) return { found: false as const };
     if (
       isMissingColumn(r2.error, "role") ||
       isMissingColumn(r2.error, "is_active") ||
       isMissingColumn(r2.error, "team")
     ) {
-      r2 = await sb
-        .from("accounts")
-        .select("emp_id, team")
-        .eq("username", loginId)
-        .maybeSingle();
+      r2 = await sb.from("accounts").select("emp_id, team").eq("username", loginId).maybeSingle();
       if (r2.error) {
         if (isMissingColumn(r2.error, "username")) return { found: false as const };
         throw r2.error;
@@ -128,22 +107,19 @@ async function pickAccountInfo(loginId: string) {
     role: s((r2.data as any).role || "user") || "user",
     is_active: (r2.data as any).is_active === false ? false : true,
     matchedBy: "username" as const,
-    hasRoleCol: (r2.data as any).role !== undefined,
-    hasActiveCol: (r2.data as any).is_active !== undefined,
   };
 }
 
 /** ✅ 팀 → 소유 관리자 고정 매핑 */
 function mapOwnerAdminByTeam(team: string) {
   const t = upperTeam(team);
-  // B팀은 admin_gs, 그 외는 admin
   return t === "B" ? "admin_gs" : "admin";
 }
 
 export async function POST(req: Request) {
   try {
     const empId = s(getCookie(req, "empId"));
-    const cookieRole = s(getCookie(req, "role")).toLowerCase(); // login API cookie
+    const cookieRole = s(getCookie(req, "role")).toLowerCase();
 
     if (!empId) {
       return NextResponse.json({ ok: false, error: "NO_SESSION" }, { status: 401 });
@@ -152,13 +128,9 @@ export async function POST(req: Request) {
     const info: any = await pickAccountInfo(empId);
 
     if (!info?.found) {
-      return NextResponse.json(
-        { ok: false, error: "ACCOUNT_NOT_FOUND", detail: { empId } },
-        { status: 401 }
-      );
+      return NextResponse.json({ ok: false, error: "ACCOUNT_NOT_FOUND", detail: { empId } }, { status: 401 });
     }
 
-    // ✅ 비활성
     if (info.is_active === false) {
       return NextResponse.json({ ok: false, error: "ACCOUNT_DISABLED" }, { status: 403 });
     }
@@ -183,7 +155,6 @@ export async function POST(req: Request) {
       .eq("is_active", true)
       .limit(5000);
 
-    // is_active 컬럼 없을 수 있으니 fallback
     let qrows: any[] | null = null;
 
     if (!q1.error) {
@@ -197,17 +168,11 @@ export async function POST(req: Request) {
           .limit(5000);
 
         if (q2.error) {
-          return NextResponse.json(
-            { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q2.error },
-            { status: 500 }
-          );
+          return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q2.error }, { status: 500 });
         }
         qrows = q2.data || [];
       } else {
-        return NextResponse.json(
-          { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q1.error },
-          { status: 500 }
-        );
+        return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: q1.error }, { status: 500 });
       }
     }
 
@@ -218,23 +183,18 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ 팀 기준으로 owner_admin 고정 저장
     const ownerAdmin = mapOwnerAdminByTeam(team);
-
     return await createAttemptAndRespond(info.emp_id || empId, team, qrows, ownerAdmin);
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "START_FATAL", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "START_FATAL", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }
 
 async function createAttemptAndRespond(empId: string, team: string, qrows: any[], ownerAdmin: string) {
   const picked = shuffle(qrows).slice(0, Math.min(20, qrows.length));
   const pickedIds = picked.map((q: any) => String(q.id));
-  const totalPoints = picked.reduce((sum: number, q: any) => sum + n(q?.points, 5), 0);
 
+  const totalPoints = picked.reduce((sum: number, q: any) => sum + n(q?.points, 5), 0);
   const nowIso = new Date().toISOString();
 
   const insertRow: any = {
@@ -243,47 +203,61 @@ async function createAttemptAndRespond(empId: string, team: string, qrows: any[]
     started_at: nowIso,
     submitted_at: null,
     total_questions: pickedIds.length,
+    total_points: totalPoints,       // ✅ 있으면 저장
     score: 0,
     question_ids: pickedIds,
-    answers: {},
+    answers: { map: {} },            // ✅ 형태 통일
     team,
-
-    // ✅ 추가: 소유 관리자(팀 기준 고정)
     owner_admin: ownerAdmin,
   };
 
-  // owner_admin 컬럼이 아직 없으면(배포/마이그레이션 전) 터질 수 있으니 fallback
-  let r1 = await sb.from("exam_attempts").insert(insertRow).select("id").single();
+  // owner_admin / total_points 같은 컬럼 없을 수 있어서 단계적 제거
+  let row = { ...insertRow };
 
-  if (r1.error && isMissingColumn(r1.error, "owner_admin")) {
-    const { owner_admin, ...withoutOwner } = insertRow;
-    r1 = await sb.from("exam_attempts").insert(withoutOwner).select("id").single();
+  for (let tries = 0; tries < 6; tries++) {
+    let r1 = await sb.from("exam_attempts").insert(row).select("id").single();
+    if (!r1.error && r1.data?.id) {
+      const outQuestions = picked.map((q: any) => ({
+        id: String(q.id),
+        content: String(q.content ?? ""),
+        choices: Array.isArray(q.choices)
+          ? q.choices
+          : typeof q.choices === "string"
+          ? safeParseChoices(q.choices)
+          : [],
+        points: n(q?.points, 5),
+      }));
+
+      return NextResponse.json({
+        ok: true,
+        attemptId: String(r1.data.id),
+        questions: outQuestions,
+        debug: { empId, team, picked: outQuestions.length, totalPoints, owner_admin: ownerAdmin },
+      });
+    }
+
+    const err = r1.error;
+
+    if (err && isMissingColumn(err, "owner_admin") && "owner_admin" in row) {
+      const { owner_admin, ...rest } = row;
+      row = rest;
+      continue;
+    }
+    if (err && isMissingColumn(err, "total_points") && "total_points" in row) {
+      const { total_points, ...rest } = row;
+      row = rest;
+      continue;
+    }
+    if (err && isMissingColumn(err, "answers") && "answers" in row) {
+      const { answers, ...rest } = row;
+      row = rest;
+      continue;
+    }
+
+    return NextResponse.json({ ok: false, error: "ATTEMPT_INSERT_FAILED", detail: err ?? "no id" }, { status: 500 });
   }
 
-  if (r1.error || !r1.data?.id) {
-    return NextResponse.json(
-      { ok: false, error: "ATTEMPT_INSERT_FAILED", detail: r1.error ?? "no id" },
-      { status: 500 }
-    );
-  }
-
-  const outQuestions = picked.map((q: any) => ({
-    id: String(q.id),
-    content: String(q.content ?? ""),
-    choices: Array.isArray(q.choices)
-      ? q.choices
-      : typeof q.choices === "string"
-      ? safeParseChoices(q.choices)
-      : [],
-    points: n(q?.points, 5),
-  }));
-
-  return NextResponse.json({
-    ok: true,
-    attemptId: String(r1.data.id),
-    questions: outQuestions,
-    debug: { empId, team, picked: outQuestions.length, totalPoints, owner_admin: ownerAdmin },
-  });
+  return NextResponse.json({ ok: false, error: "ATTEMPT_INSERT_FAILED", detail: "tries exceeded" }, { status: 500 });
 }
 
 function safeParseChoices(v: string): string[] {
