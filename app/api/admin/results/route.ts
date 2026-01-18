@@ -98,7 +98,7 @@ async function safeSelectAttempts(
     try {
       if (p.used.team) {
         r = await q
-          .or(`team.eq.${adminTeam},team.is.null`)
+          .eq("team", adminTeam)
           .order("submitted_at", { ascending: false })
           .order("id", { ascending: false })
           .range(from, to);
