@@ -1,4 +1,5 @@
 // app/result/[attemptId]/page.tsx
+export const dynamic = "force-dynamic";
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
