@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "../../../../lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
+const sb: any = supabaseAdmin;
 
 function s(v: any) {
   return String(v ?? "").trim();
@@ -18,22 +19,12 @@ function isUUIDStr(v: any) {
   const t = s(v);
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
 }
-function isValidQid(v: any) {
-  return isNumericIdStr(v) || isUUIDStr(v);
-}
-function normQid(v: any) {
-  const t = s(v);
-  if (isNumericIdStr(t)) return Number(t);
-  return t;
-}
-
 function pickChoices(q: any): string[] {
   const c = q?.choices ?? q?.options ?? q?.choice_list ?? q?.choice_texts ?? [];
   if (Array.isArray(c)) return c.map((x) => String(x ?? ""));
   if (typeof c === "string") return c.split("\n").map((x) => x.trim()).filter(Boolean);
   return [];
 }
-
 function pickCorrectIndex(q: any): number | null {
   const cands = [
     q?.correct_index,
@@ -52,75 +43,6 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
-function pickAttemptQuestionIds(attempt: any): string[] {
-  const cands = [
-    attempt?.question_ids,
-    attempt?.questionIds,
-    attempt?.questions,
-    attempt?.question_list,
-    attempt?.questionList,
-    attempt?.qids,
-  ];
-
-  for (const v of cands) {
-    if (!v) continue;
-
-    if (Array.isArray(v)) {
-      const out = v.map((x: any) => s(x)).filter((x) => isValidQid(x));
-      if (out.length) return out;
-    }
-
-    if (typeof v === "string") {
-      const t = v.trim();
-      if (!t) continue;
-
-      try {
-        const parsed = JSON.parse(t);
-        if (Array.isArray(parsed)) {
-          const out = parsed.map((x: any) => s(x)).filter((x) => isValidQid(x));
-          if (out.length) return out;
-        }
-      } catch {}
-
-      if (t.includes(",")) {
-        const out = t.split(",").map((x) => s(x)).filter((x) => isValidQid(x));
-        if (out.length) return out;
-      }
-    }
-  }
-
-  return [];
-}
-
-function pickAttemptAnswersMap(attempt: any): Map<string, number> {
-  const m = new Map<string, number>();
-  const raw = attempt?.answers;
-  if (!raw) return m;
-
-  const feed = (obj: any) => {
-    if (!obj || typeof obj !== "object") return;
-    for (const [k, v] of Object.entries(obj)) {
-      const key = s(k);
-      if (!isValidQid(key)) continue;
-      const val = n(v, null);
-      if (val !== null) m.set(key, val);
-    }
-  };
-
-  if (typeof raw === "string") {
-    try {
-      const parsed = JSON.parse(raw);
-      feed(parsed);
-    } catch {
-      return m;
-    }
-    return m;
-  }
-
-  feed(raw);
-  return m;
-}
-
 export async function GET(_req: NextRequest, context: { params: Promise<{ attemptId: string }> }) {
   try {
     const { attemptId: raw } = await context.params;
@@ -131,113 +53,85 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
 
     const attemptId = Number(attemptIdStr);
 
-    // 1) attempt
-    const { data: attempt, error: e1 } = await supabaseAdmin
+    // 1) attempt (uuid 포함)
+    const { data: attempt, error: e1 } = await sb
       .from("exam_attempts")
       .select("*")
       .eq("id", attemptId)
       .maybeSingle();
 
-    if (e1) {
-      return NextResponse.json(
-        { ok: false, error: "ATTEMPT_QUERY_FAILED", detail: String((e1 as any)?.message ?? e1) },
-        { status: 500 }
-      );
-    }
+    if (e1) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: e1 }, { status: 500 });
     if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
 
-    // 2) answers
+    const attemptUuid = s((attempt as any)?.uuid);
+    const qids: string[] = Array.isArray((attempt as any)?.question_ids)
+      ? (attempt as any).question_ids.map((x: any) => s(x)).filter(Boolean)
+      : [];
+
+    const uniqQids = Array.from(new Set(qids)).filter(Boolean);
+
+    // 2) answers: attempt_answers(uuid) 우선
     const ansMap = new Map<string, number>();
+    let answersSource = "none";
 
-    const { data: answers, error: eAns } = await supabaseAdmin
-      .from("exam_answers")
-      .select("question_id, selected_index")
-      .eq("attempt_id", attemptId);
+    if (isUUIDStr(attemptUuid)) {
+      const { data: aRows, error: aErr } = await sb
+        .from("attempt_answers")
+        .select("question_id, selected_index")
+        .eq("attempt_id", attemptUuid);
 
-    if (eAns) {
-      return NextResponse.json(
-        { ok: false, error: "ANSWERS_QUERY_FAILED", detail: String((eAns as any)?.message ?? eAns) },
-        { status: 500 }
-      );
+      if (aErr) return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: aErr }, { status: 500 });
+
+      for (const a of aRows ?? []) {
+        const qid = s((a as any)?.question_id);
+        const sel = (a as any)?.selected_index;
+        if (!isUUIDStr(qid)) continue;
+        if (sel === null || sel === undefined) continue;
+        ansMap.set(qid, Number(sel));
+      }
+      if (ansMap.size > 0) answersSource = "attempt_answers(uuid)";
     }
 
-    for (const a of answers ?? []) {
-      const qid = s((a as any)?.question_id);
-      const sel = (a as any)?.selected_index;
-      if (!isValidQid(qid)) continue;
-      if (sel === null || sel === undefined) continue;
-      ansMap.set(qid, Number(sel));
-    }
-
-    let answersSource = "exam_answers(attempt_id)";
-    if (ansMap.size === 0) {
-      const fallback = pickAttemptAnswersMap(attempt);
-      if (fallback.size > 0) {
-        for (const [k, v] of fallback.entries()) ansMap.set(k, v);
-        answersSource = "attempt.answers(JSON)";
+    // 3) fallback: attempt.answers(JSON)
+    if (ansMap.size === 0 && (attempt as any)?.answers && typeof (attempt as any).answers === "object") {
+      const rawA = (attempt as any).answers?.map ?? (attempt as any).answers;
+      if (rawA && typeof rawA === "object") {
+        for (const [k, v] of Object.entries(rawA)) {
+          const qid = s(k);
+          const sel = n(v, null);
+          if (!isUUIDStr(qid)) continue;
+          if (sel === null) continue;
+          ansMap.set(qid, Number(sel));
+        }
+        if (ansMap.size > 0) answersSource = "attempt.answers(JSON)";
       }
     }
 
-    // 3) qids
-    const attemptQids = pickAttemptQuestionIds(attempt);
-    const qids = attemptQids.length > 0 ? attemptQids : Array.from(ansMap.keys());
-    const uniqQidsStr = Array.from(new Set(qids.map((x) => s(x)).filter((x) => isValidQid(x))));
-
-    if (!uniqQidsStr.length) {
-      return NextResponse.json({
-        ok: true,
-        attempt: {
-          id: attempt.id,
-          emp_id: attempt.emp_id,
-          started_at: attempt.started_at,
-          submitted_at: attempt.submitted_at,
-          total_questions: attempt.total_questions,
-          status: attempt.status,
-          answers_source: answersSource,
-          score: 0,
-          total_points: 0,
-          correct_count: 0,
-        },
-        graded: [],
-        totalQuestions: 0,
-        wrongCount: 0,
-        totalPoints: 0,
-      });
-    }
-
-    const uniqQidsQuery = uniqQidsStr.map(normQid);
-
     // 4) questions
-    const { data: questions, error: eQ } = await supabaseAdmin
-      .from("questions")
-      .select("*")
-      .in("id", uniqQidsQuery as any);
+    const { data: questions, error: eQ } = uniqQids.length
+      ? await sb.from("questions").select("*").in("id", uniqQids as any)
+      : { data: [], error: null as any };
 
-    if (eQ) {
-      return NextResponse.json(
-        { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String((eQ as any)?.message ?? eQ) },
-        { status: 500 }
-      );
-    }
+    if (eQ) return NextResponse.json({ ok: false, error: "QUESTIONS_QUERY_FAILED", detail: eQ }, { status: 500 });
 
     const qById = new Map<string, any>();
     for (const q of questions ?? []) qById.set(s((q as any)?.id), q);
 
-    // 5) graded + 총점 계산
+    // 5) graded + 점수
     let score = 0;
-    let correctCount = 0;
     let totalPoints = 0;
 
-    const graded = uniqQidsStr
-      .map((qidStr) => {
-        const q = qById.get(s(qidStr));
+    const graded = uniqQids
+      .map((qid) => {
+        const q = qById.get(s(qid));
         if (!q) return null;
 
-        const pts = n(q?.points, 0) ?? 0;
-        totalPoints += pts;
+        const pts = n(q?.points, null);
+        const point = pts === null ? 1 : (pts ?? 0);
+        totalPoints += point;
 
         const correctIndex = pickCorrectIndex(q);
-        const chosen = ansMap.has(qidStr) ? ansMap.get(qidStr)! : null;
+        const chosen = ansMap.has(qid) ? ansMap.get(qid)! : null;
 
         const isCorrect =
           correctIndex !== null &&
@@ -246,10 +140,7 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
           Number.isFinite(Number(chosen)) &&
           Number(correctIndex) === Number(chosen);
 
-        if (isCorrect) {
-          score += pts;
-          correctCount += 1;
-        }
+        if (isCorrect) score += point;
 
         return {
           questionId: q?.id,
@@ -258,7 +149,7 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
           correctIndex: correctIndex === null ? null : Number(correctIndex),
           selectedIndex: chosen === null ? null : Number(chosen),
           isCorrect,
-          points: pts,
+          points: Number(point),
         };
       })
       .filter(Boolean) as any[];
@@ -267,27 +158,22 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
       ok: true,
       attempt: {
         id: attempt.id,
-        emp_id: attempt.emp_id,
-        started_at: attempt.started_at,
-        submitted_at: attempt.submitted_at,
-        status: attempt.status,
+        uuid: attemptUuid || null,
+        emp_id: (attempt as any).emp_id,
+        started_at: (attempt as any).started_at,
+        submitted_at: (attempt as any).submitted_at,
+        status: (attempt as any).status,
         answers_source: answersSource,
-        // ✅ 화면용으로 항상 내려줌
         score,
         total_points: totalPoints,
-        correct_count: correctCount,
         total_questions: graded.length,
       },
       graded,
       totalQuestions: graded.length,
       wrongCount: graded.filter((g: any) => g?.isCorrect === false).length,
-      // ✅ 프론트가 이거 써도 됨
       totalPoints,
     });
   } catch (err: any) {
-    return NextResponse.json(
-      { ok: false, error: "UNEXPECTED_ERROR", detail: String(err?.message ?? err) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "UNEXPECTED_ERROR", detail: String(err?.message ?? err) }, { status: 500 });
   }
 }
