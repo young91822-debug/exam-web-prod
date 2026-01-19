@@ -31,6 +31,22 @@ function isMissingColumn(err: any, table: string, col: string) {
   );
 }
 
+function isMissingTable(err: any) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return (
+    msg.includes("could not find the table") ||
+    msg.includes("relation") && msg.includes("does not exist") ||
+    msg.includes("not found")
+  );
+}
+
+function isFkViolation(err: any) {
+  // Postgres FK violation code: 23503
+  const code = String((err as any)?.code || "");
+  const msg = String((err as any)?.message || err || "").toLowerCase();
+  return code === "23503" || msg.includes("foreign key") || msg.includes("violates foreign key");
+}
+
 async function requireAdminTeam(req: Request) {
   const cookie = req.headers.get("cookie") || "";
   const empId = getCookie(cookie, "empId") || getCookie(cookie, "userId");
@@ -60,9 +76,11 @@ async function requireAdminTeam(req: Request) {
       row = r.data;
       break;
     }
-    if (isMissingColumn(r.error, "accounts", "username") || String(r.error?.message || "").includes("does not exist")) {
-      continue;
-    }
+
+    // 컬럼 차이로 실패 → 다음 시도
+    const msg = String(r.error?.message || r.error || "");
+    if (msg.includes("does not exist") || msg.toLowerCase().includes("column")) continue;
+
     return {
       ok: false as const,
       status: 500,
@@ -87,7 +105,7 @@ export async function GET(req: Request) {
   const u = new URL(req.url);
   return NextResponse.json({
     ok: true,
-    marker: "CLEAR_ROUTE_PING",
+    marker: "CLEAR_ROUTE_PING_v2",
     method: "Use POST to clear questions",
     path: u.pathname,
   });
@@ -97,10 +115,7 @@ export async function GET(req: Request) {
 async function tableExists(table: string) {
   const { error } = await sb.from(table).select("*", { head: true, count: "exact" }).limit(1);
   if (!error) return true;
-
-  const msg = String(error.message || "").toLowerCase();
-  if (msg.includes("could not find the table") || msg.includes("relation") || msg.includes("not found")) return false;
-
+  if (isMissingTable(error)) return false;
   // 권한/기타면 존재는 할 수 있으니 true 취급
   return true;
 }
@@ -126,11 +141,52 @@ async function deleteByQuestionIds(table: string, ids: string[]) {
 
     if (isMissingColumn(r.error, table, col)) continue;
 
-    // 그 외 에러는 리턴
-    return { table, ok: false, by: col, detail: String((r.error as any).message || r.error) };
+    return {
+      table,
+      ok: false,
+      by: col,
+      detail: String((r.error as any).message || r.error),
+      fk: isFkViolation(r.error),
+    };
   }
 
   return { table, ok: false, detail: "No matching FK column candidates found" };
+}
+
+/** questions에서 "내 팀" id를 가져오기 (team 컬럼 없으면 전체) */
+async function selectQuestionIds(team: string) {
+  // 1) team 컬럼 있는 케이스
+  let r = await sb.from("questions").select("id,team").eq("team", team).limit(BATCH);
+  if (!r.error) {
+    const ids = (r.data || []).map((x: any) => s(x?.id)).filter(Boolean);
+    return { ids, mode: "team_filtered" as const, err: null };
+  }
+
+  // team 컬럼이 없으면 fallback (전체에서 삭제 — 최후수단)
+  if (isMissingColumn(r.error, "questions", "team")) {
+    const r2 = await sb.from("questions").select("id").limit(BATCH);
+    if (r2.error) return { ids: [] as string[], mode: "fallback_failed" as const, err: r2.error };
+    const ids = (r2.data || []).map((x: any) => s(x?.id)).filter(Boolean);
+    return { ids, mode: "no_team_column_all_rows" as const, err: null };
+  }
+
+  return { ids: [] as string[], mode: "select_failed" as const, err: r.error };
+}
+
+/** questions를 하드삭제 (team 컬럼 있으면 team도 같이) */
+async function deleteQuestions(ids: string[], team: string) {
+  // 1) team 컬럼 있는 케이스
+  let r = await sb.from("questions").delete().in("id", ids).eq("team", team);
+  if (!r.error) return { ok: true, mode: "team_filtered" as const, err: null };
+
+  // team 컬럼이 없으면 fallback
+  if (isMissingColumn(r.error, "questions", "team")) {
+    const r2 = await sb.from("questions").delete().in("id", ids);
+    if (r2.error) return { ok: false, mode: "no_team_column_all_rows" as const, err: r2.error };
+    return { ok: true, mode: "no_team_column_all_rows" as const, err: null };
+  }
+
+  return { ok: false, mode: "delete_failed" as const, err: r.error };
 }
 
 /** POST: 진짜 하드 삭제 */
@@ -160,55 +216,78 @@ export async function POST(req: Request) {
 
     let deletedQuestions = 0;
     const childResults: any[] = [];
+    let loop = 0;
 
     while (true) {
-      // ✅ 여기서 IMPORTANT: id를 절대 Number()로 바꾸지 말 것 (uuid면 다 날아감)
-      const { data: rows, error: selErr } = await sb
-        .from("questions")
-        .select("id")
-        .eq("team", auth.team)
-        .limit(BATCH);
+      loop++;
 
-      if (selErr) {
+      const sel = await selectQuestionIds(auth.team);
+      if (sel.err) {
         return NextResponse.json(
-          { ok: false, error: "CLEAR_FAILED", detail: `SELECT questions failed: ${String(selErr.message || selErr)}` },
+          {
+            ok: false,
+            error: "CLEAR_FAILED",
+            detail: `SELECT questions failed: ${String(sel.err?.message || sel.err)}`,
+            team: auth.team,
+          },
           { status: 500 }
         );
       }
 
-      const ids = (rows || []).map((r: any) => s(r?.id)).filter(Boolean);
+      const ids = sel.ids;
       if (ids.length === 0) break;
 
       // 1) 자식 테이블 먼저 삭제
       for (const t of childTables) {
         const rr = await deleteByQuestionIds(t, ids);
-        childResults.push({ team: auth.team, batchSize: ids.length, ...rr });
+        childResults.push({
+          team: auth.team,
+          batchSize: ids.length,
+          selectMode: sel.mode,
+          ...rr,
+        });
       }
 
       // 2) questions 하드삭제
-      const { error: delErr } = await sb.from("questions").delete().in("id", ids).eq("team", auth.team);
-      if (delErr) {
+      const del = await deleteQuestions(ids, auth.team);
+      if (!del.ok) {
         return NextResponse.json(
           {
             ok: false,
             error: "CLEAR_FAILED",
-            detail: `DELETE questions failed: ${String(delErr.message || delErr)}`,
+            detail: `DELETE questions failed: ${String(del.err?.message || del.err)}`,
             team: auth.team,
-            childResults,
+            selectMode: sel.mode,
+            childResultsPreview: childResults.slice(0, 30),
           },
           { status: 500 }
         );
       }
 
       deletedQuestions += ids.length;
+
+      // 무한루프 방지(이론상 ids가 줄어야 정상)
+      if (loop > 2000) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "CLEAR_ABORTED",
+            detail: "too many loops (safety stop)",
+            team: auth.team,
+            deletedQuestions,
+            childResultsPreview: childResults.slice(0, 30),
+          },
+          { status: 500 }
+        );
+      }
     }
 
     return NextResponse.json({
       ok: true,
-      marker: "QUESTIONS_HARD_CLEAR_OK",
+      marker: "QUESTIONS_HARD_CLEAR_OK_v3",
       team: auth.team,
       deletedQuestions,
-      childResultsPreview: childResults.slice(0, 20),
+      childResultsPreview: childResults.slice(0, 30),
     });
   } catch (e: any) {
     return NextResponse.json(
