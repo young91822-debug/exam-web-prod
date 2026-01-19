@@ -24,7 +24,7 @@ type SubmitResp =
       correctCount?: number;
       wrongQuestionIds?: string[];
       debug?: any;
-      redirectUrl?: string; // ✅ 서버가 내려주는 리다이렉트 URL(있으면 사용)
+      redirectUrl?: string;
     }
   | { ok: false; error: string; detail?: any };
 
@@ -105,8 +105,9 @@ export default function ExamClient() {
           return;
         }
 
+        // ✅ 관리자는 exam 금지 → 관리자 응시현황으로
         if (res.status === 403 && errCode === "ADMIN_CANNOT_TAKE_EXAM") {
-          router.replace("/admin");
+          router.replace("/admin/results");
           return;
         }
 
@@ -195,12 +196,11 @@ export default function ExamClient() {
         throw new Error(detail ? `${msg}\n${safeText(detail)}` : msg);
       }
 
-      // ✅ 결과 페이지 경로 통일: /result/:id
-      const id = String((json as any).attemptId ?? attemptId);
-      const redirectUrl = String((json as any).redirectUrl ?? "").trim();
-
-      // 서버가 URL 내려주면 그걸 우선, 아니면 /result/:id
-      router.push(redirectUrl || `/result/${id}`);
+      // ✅ 여기서부터가 변경 포인트:
+      // 결과/오답 페이지 이동 금지 → 제출 완료만 보여주고 done으로 이동
+      alert("제출이 완료되었습니다.");
+      router.replace("/exam/done");
+      return;
     } catch (e: any) {
       submittingRef.current = false;
       setErrText(String(e?.message ?? e));
