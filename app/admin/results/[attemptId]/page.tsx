@@ -3,32 +3,50 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 
+type GradedItem = {
+  questionId: string | null;
+  content: string;
+  choices: string[];
+  selectedIndex: number | null;
+  correctIndex: number | null;
+  status?: string | null;
+  isCorrect?: boolean | null;
+};
+
+type WrongItem = {
+  questionId: string | null;
+  content: string;
+  choices: string[];
+  selectedIndex: number | null;
+  correctIndex: number | null;
+  points: number;
+  isWrong: boolean;
+};
+
 type DetailResp =
   | {
       ok: true;
-      attempt: {
-        id: any;
-        emp_id: string | null;
-        team: string | null;
-        status: string | null;
-        score: number;
-        total_questions: number;
-        started_at: any;
-        submitted_at: any;
-      };
-      wrongItems: {
-        questionId: string | null;
-        content: string;
-        choices: string[];
-        selectedIndex: number | null;
-        correctIndex: number | null;
-        points: number;
-        isWrong: boolean;
-      }[];
+
+      // ✅ attempt는 snake/camel 둘 다 들어올 수 있음
+      attempt: any;
+
+      // ✅ 예전 포맷
+      wrongItems?: WrongItem[];
+
+      // ✅ 최신 포맷(너 네트워크에서 보이던)
+      graded?: GradedItem[];
+
       meta?: any;
     }
   | { ok: false; error: string; detail?: any };
 
+function s(v: any) {
+  return String(v ?? "").trim();
+}
+function n(v: any, d = 0) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
+}
 function fmt(v: any) {
   if (!v) return "-";
   const d = new Date(v);
@@ -61,7 +79,10 @@ export default function AdminResultDetailPage() {
   const params = useParams() as any;
   const attemptId = useMemo(() => String(params?.attemptId ?? ""), [params]);
 
-  const apiUrl = useMemo(() => `/api/admin/result-detail?attemptId=${encodeURIComponent(attemptId)}`, [attemptId]);
+  const apiUrl = useMemo(
+    () => `/api/admin/result-detail?attemptId=${encodeURIComponent(attemptId)}`,
+    [attemptId]
+  );
 
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<DetailResp | null>(null);
@@ -87,8 +108,18 @@ export default function AdminResultDetailPage() {
   if (!data || (data as any).ok !== true) {
     return (
       <div style={{ padding: 20 }}>
-        <div style={{ fontSize: 18, fontWeight: 900, marginBottom: 10 }}>에러</div>
-        <pre style={{ background: "#111827", color: "white", padding: 14, borderRadius: 12, overflow: "auto" }}>
+        <div style={{ fontSize: 18, fontWeight: 900, marginBottom: 10 }}>
+          에러
+        </div>
+        <pre
+          style={{
+            background: "#111827",
+            color: "white",
+            padding: 14,
+            borderRadius: 12,
+            overflow: "auto",
+          }}
+        >
           {JSON.stringify(data, null, 2)}
         </pre>
         <button
@@ -110,10 +141,61 @@ export default function AdminResultDetailPage() {
   }
 
   const ok = data as Extract<DetailResp, { ok: true }>;
-  const a = ok.attempt;
+  const a = ok.attempt ?? {};
 
-  const wrong = ok.wrongItems ?? [];
+  // ✅ attempt 필드 snake/camel 둘 다 대응
+  const attempt = {
+    id: a.id ?? a.attemptId ?? a.attempt_id ?? "-",
+    emp_id: a.emp_id ?? a.empId ?? null,
+    team: a.team ?? null,
+    status: a.status ?? null,
+    started_at: a.started_at ?? a.startedAt ?? null,
+    submitted_at: a.submitted_at ?? a.submittedAt ?? null,
+
+    // 점수계산용
+    score: n(a.score, 0),
+    total_points: n(a.total_points ?? a.totalPoints, 0),
+    total_questions: n(a.total_questions ?? a.totalQuestions, 0),
+    wrong_count: n(a.wrong_count ?? a.wrongCount, 0),
+  };
+
+  // ✅ wrongItems가 있으면 우선 사용
+  // ✅ 없으면 graded로부터 틀린 문항만 만들어서 보여줌
+  const wrongFromApi: WrongItem[] = Array.isArray(ok.wrongItems) ? ok.wrongItems : [];
+
+  const graded: GradedItem[] = Array.isArray((ok as any).graded) ? (ok as any).graded : [];
+
+  const wrongFromGraded: WrongItem[] = graded
+    .filter((g) => {
+      // selected가 없으면 오답으로 보지 않음(미응답)
+      if (g.selectedIndex === null || g.selectedIndex === undefined) return false;
+      // correctIndex 없으면 채점 불가 → 오답 목록에서 제외
+      if (g.correctIndex === null || g.correctIndex === undefined) return false;
+      return Number(g.selectedIndex) !== Number(g.correctIndex);
+    })
+    .map((g) => ({
+      questionId: g.questionId ?? null,
+      content: g.content ?? "",
+      choices: Array.isArray(g.choices) ? g.choices : [],
+      selectedIndex: g.selectedIndex ?? null,
+      correctIndex: g.correctIndex ?? null,
+      points: 0, // points는 questions에서 안 내려오면 0
+      isWrong: true,
+    }));
+
+  const wrong: WrongItem[] = wrongFromApi.length ? wrongFromApi : wrongFromGraded;
   const wrongCount = wrong.length;
+
+  // ✅ 점수 표시 로직
+  // - total_points 있으면: score/total_points + (100점 환산)
+  // - 없으면: score만 표시
+  const totalPts = attempt.total_points;
+  const percent = totalPts > 0 ? Math.round((attempt.score / totalPts) * 100) : null;
+
+  const scoreLabel =
+    totalPts > 0
+      ? `${attempt.score} / ${totalPts} (${percent}점)`
+      : `${attempt.score}`;
 
   return (
     <div style={{ padding: 20, maxWidth: 1100, margin: "0 auto", fontFamily: "system-ui" }}>
@@ -121,10 +203,10 @@ export default function AdminResultDetailPage() {
         <div>
           <div style={{ fontSize: 22, fontWeight: 950 }}>결과 상세</div>
           <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {pill(`attemptId: ${a.id}`)}
-            {pill(`응시자: ${a.emp_id ?? "-"}`)}
-            {pill(`팀: ${a.team ?? "-"}`)}
-            {pill(`상태: ${a.status ?? "-"}`)}
+            {pill(`attemptId: ${attempt.id}`)}
+            {pill(`응시자: ${attempt.emp_id ?? "-"}`)}
+            {pill(`팀: ${attempt.team ?? "-"}`)}
+            {pill(`상태: ${attempt.status ?? "-"}`)}
           </div>
         </div>
 
@@ -146,10 +228,10 @@ export default function AdminResultDetailPage() {
       {/* 요약 카드 */}
       <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10 }}>
         {[
-          { label: "점수", value: `${a.score} / ${a.total_questions}` },
+          { label: "점수", value: scoreLabel },
           { label: "오답", value: `${wrongCount}개` },
-          { label: "시작", value: fmt(a.started_at) },
-          { label: "제출", value: fmt(a.submitted_at) },
+          { label: "시작", value: fmt(attempt.started_at) },
+          { label: "제출", value: fmt(attempt.submitted_at) },
         ].map((x) => (
           <div
             key={x.label}
@@ -182,7 +264,7 @@ export default function AdminResultDetailPage() {
               fontWeight: 800,
             }}
           >
-            오답이 없거나(만점), 오답 데이터를 아직 저장하지 않는 구조일 수 있어요.
+            오답이 없거나(만점), 답안/정답 비교 데이터(graded)가 비어있어요.
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -200,7 +282,9 @@ export default function AdminResultDetailPage() {
                   <div style={{ fontWeight: 950 }}>
                     Q{idx + 1}. {w.content}
                   </div>
-                  <div style={{ fontSize: 12, opacity: 0.7, fontWeight: 900 }}>points: {w.points}</div>
+                  <div style={{ fontSize: 12, opacity: 0.7, fontWeight: 900 }}>
+                    {w.points ? `points: ${w.points}` : ""}
+                  </div>
                 </div>
 
                 {w.choices?.length ? (
@@ -234,9 +318,7 @@ export default function AdminResultDetailPage() {
                     })}
                   </div>
                 ) : (
-                  <div style={{ marginTop: 10, opacity: 0.7 }}>
-                    보기 데이터가 없는 유형(주관식 등)일 수 있어요.
-                  </div>
+                  <div style={{ marginTop: 10, opacity: 0.7 }}>보기 데이터가 없는 유형(주관식 등)일 수 있어요.</div>
                 )}
 
                 <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75, fontWeight: 800 }}>
