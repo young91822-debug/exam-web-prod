@@ -1,7 +1,6 @@
-// app/result/[attemptId]/page.tsx
-export const dynamic = "force-dynamic";
 "use client";
 
+// app/result/[attemptId]/page.tsx
 import React, { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 
