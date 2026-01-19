@@ -34,7 +34,10 @@ function getCookie(cookieHeader: string, name: string) {
 
 function isMissingColumnMsg(msg: string, col: string) {
   const low = msg.toLowerCase();
-  return (low.includes(col.toLowerCase()) && low.includes("does not exist")) || msg.includes(`Could not find the '${col}' column`);
+  return (
+    (low.includes(col.toLowerCase()) && low.includes("does not exist")) ||
+    msg.includes(`Could not find the '${col}' column`)
+  );
 }
 
 /**
@@ -119,6 +122,7 @@ async function readBody(req: Request) {
   }
 }
 
+/* ------------------- GET ------------------- */
 export async function GET(req: Request) {
   try {
     const auth = await requireAdminTeam(req);
@@ -129,7 +133,9 @@ export async function GET(req: Request) {
     const url = new URL(req.url);
     const page = Math.max(1, num(url.searchParams.get("page"), 1));
     const pageSize = Math.min(200, Math.max(1, num(url.searchParams.get("pageSize"), 20)));
-    const includeOff = boolParam(url.searchParams.get("includeOff"), true);
+
+    // ✅ 기본값을 false로 변경: OFF는 기본 숨김 (원하면 includeOff=1로 보이게)
+    const includeOff = boolParam(url.searchParams.get("includeOff"), false);
 
     const from = (page - 1) * pageSize;
     const to = from + pageSize - 1;
@@ -194,13 +200,14 @@ export async function GET(req: Request) {
       includeOff,
       total: countRes.count ?? 0,
       items: listRes.data ?? [],
-      marker: "ADMIN_QUESTIONS_LIST_TEAM_v3_WITH_DELETE_ALL",
+      marker: "ADMIN_QUESTIONS_LIST_TEAM_v4_DEFAULT_HIDE_OFF",
     });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: "QUESTIONS_API_ERROR", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }
 
+/* ------------------- POST (create) ------------------- */
 export async function POST(req: Request) {
   try {
     const auth = await requireAdminTeam(req);
@@ -213,7 +220,9 @@ export async function POST(req: Request) {
     const points = Number(body.points);
     const is_active = body.is_active === false ? false : true;
 
-    const choices = Array.isArray(body.choices) ? body.choices.map((x: any) => s(x)).filter((x: string) => x !== "") : [];
+    const choices = Array.isArray(body.choices)
+      ? body.choices.map((x: any) => s(x)).filter((x: string) => x !== "")
+      : [];
 
     if (!content) return NextResponse.json({ ok: false, error: "MISSING_CONTENT" }, { status: 400 });
     if (choices.length < 2) return NextResponse.json({ ok: false, error: "MISSING_CHOICES" }, { status: 400 });
@@ -243,6 +252,7 @@ export async function POST(req: Request) {
   }
 }
 
+/* ------------------- PATCH (update) ------------------- */
 export async function PATCH(req: Request) {
   try {
     const auth = await requireAdminTeam(req);
@@ -287,7 +297,14 @@ export async function PATCH(req: Request) {
     }
 
     // team 컬럼 없을 수도 있어서 2단계로 시도
-    let r = await sb.from(TABLE).update(updateRow).eq("id", id).eq(COL_TEAM, auth.team).select("id, content, points, is_active").maybeSingle();
+    let r = await sb
+      .from(TABLE)
+      .update(updateRow)
+      .eq("id", id)
+      .eq(COL_TEAM, auth.team)
+      .select("id, content, points, is_active")
+      .maybeSingle();
+
     if (r.error) {
       const msg = String(r.error?.message || r.error);
       if (isMissingColumnMsg(msg, COL_TEAM)) {
@@ -306,6 +323,7 @@ export async function PATCH(req: Request) {
   }
 }
 
+/* ------------------- DELETE (hard delete first) ------------------- */
 export async function DELETE(req: Request) {
   try {
     const auth = await requireAdminTeam(req);
@@ -317,58 +335,97 @@ export async function DELETE(req: Request) {
 
     // ✅✅✅ 전체삭제: /api/admin/questions?all=1 (&hard=1)
     const all = boolParam(url.searchParams.get("all"), false);
-    const hard = boolParam(url.searchParams.get("hard"), false);
+    const hard = boolParam(url.searchParams.get("hard"), true); // ✅ 기본 true: 전체삭제는 진짜 삭제가 기본
 
     if (all) {
-      // 1) team 컬럼 있는 경우: 내 팀만
       if (!hard) {
-        // 비활성화 전체
+        // 소프트 전체 (OFF 처리)
         let r = await sb.from(TABLE).update({ is_active: false }).eq(COL_TEAM, auth.team);
         if (r.error) {
           const msg = String(r.error?.message || r.error);
           if (isMissingColumnMsg(msg, COL_TEAM)) {
-            // team 컬럼 없으면 전부 비활성화(최후수단)
             r = await sb.from(TABLE).update({ is_active: false });
           }
         }
         if (r.error) {
           return NextResponse.json({ ok: false, error: "DELETE_ALL_FAILED", detail: String(r.error.message || r.error) }, { status: 500 });
         }
-        return NextResponse.json({ ok: true, mode: "soft", team: auth.team, marker: "ADMIN_QUESTIONS_DELETE_ALL_v3" });
-      } else {
-        // 실제 삭제 전체
-        let r = await sb.from(TABLE).delete().eq(COL_TEAM, auth.team);
-        if (r.error) {
-          const msg = String(r.error?.message || r.error);
-          if (isMissingColumnMsg(msg, COL_TEAM)) {
-            r = await sb.from(TABLE).delete();
-          }
-        }
-        if (r.error) {
-          return NextResponse.json({ ok: false, error: "HARD_DELETE_ALL_FAILED", detail: String(r.error.message || r.error) }, { status: 500 });
-        }
-        return NextResponse.json({ ok: true, mode: "hard", team: auth.team, marker: "ADMIN_QUESTIONS_HARD_DELETE_ALL_v3" });
+        return NextResponse.json({ ok: true, mode: "soft", team: auth.team, marker: "ADMIN_QUESTIONS_DELETE_ALL_SOFT_v4" });
       }
+
+      // ✅ 하드 전체삭제
+      let r = await sb.from(TABLE).delete().eq(COL_TEAM, auth.team);
+      if (r.error) {
+        const msg = String(r.error?.message || r.error);
+        if (isMissingColumnMsg(msg, COL_TEAM)) {
+          r = await sb.from(TABLE).delete();
+        }
+      }
+      if (r.error) {
+        return NextResponse.json({ ok: false, error: "HARD_DELETE_ALL_FAILED", detail: String(r.error.message || r.error) }, { status: 500 });
+      }
+
+      return NextResponse.json({ ok: true, mode: "hard", team: auth.team, marker: "ADMIN_QUESTIONS_HARD_DELETE_ALL_v4" });
     }
 
-    // ✅ 단일 삭제(비활성화)
+    // ✅ 단일 삭제: 하드 삭제 우선 → FK 걸리면 소프트로 fallback
     const id = url.searchParams.get("id");
     if (!id) return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
 
-    let r = await sb.from(TABLE).update({ is_active: false }).eq("id", id).eq(COL_TEAM, auth.team).select("id, is_active").maybeSingle();
-    if (r.error) {
-      const msg = String(r.error?.message || r.error);
+    // 1) 하드 삭제 시도
+    let hardRes = await sb.from(TABLE).delete().eq("id", id).eq(COL_TEAM, auth.team).select("id").maybeSingle();
+    if (hardRes.error) {
+      const msg = String(hardRes.error?.message || hardRes.error);
       if (isMissingColumnMsg(msg, COL_TEAM)) {
-        r = await sb.from(TABLE).update({ is_active: false }).eq("id", id).select("id, is_active").maybeSingle();
+        hardRes = await sb.from(TABLE).delete().eq("id", id).select("id").maybeSingle();
       }
     }
 
-    if (r.error) {
-      return NextResponse.json({ ok: false, error: "QUESTION_DELETE_FAILED", detail: String(r.error.message || r.error) }, { status: 500 });
+    if (!hardRes.error && hardRes.data) {
+      return NextResponse.json({ ok: true, team: auth.team, mode: "hard", item: hardRes.data, marker: "ADMIN_QUESTIONS_DELETE_ONE_HARD_v4" });
     }
-    if (!r.data) return NextResponse.json({ ok: false, error: "NOT_FOUND" }, { status: 404 });
 
-    return NextResponse.json({ ok: true, team: auth.team, item: r.data, marker: "ADMIN_QUESTIONS_DELETE_ONE_v3" });
+    // 2) FK 등으로 실패하면 소프트 삭제 fallback
+    const errMsg = String(hardRes.error?.message || hardRes.error || "");
+    const isFk =
+      errMsg.toLowerCase().includes("foreign key") ||
+      errMsg.toLowerCase().includes("violates foreign key") ||
+      (hardRes.error as any)?.code === "23503";
+
+    if (!isFk) {
+      return NextResponse.json(
+        { ok: false, error: "QUESTION_DELETE_FAILED", detail: errMsg || "unknown error" },
+        { status: 500 }
+      );
+    }
+
+    let softRes = await sb
+      .from(TABLE)
+      .update({ is_active: false })
+      .eq("id", id)
+      .eq(COL_TEAM, auth.team)
+      .select("id, is_active")
+      .maybeSingle();
+
+    if (softRes.error) {
+      const msg = String(softRes.error?.message || softRes.error);
+      if (isMissingColumnMsg(msg, COL_TEAM)) {
+        softRes = await sb.from(TABLE).update({ is_active: false }).eq("id", id).select("id, is_active").maybeSingle();
+      }
+    }
+
+    if (softRes.error) {
+      return NextResponse.json({ ok: false, error: "QUESTION_SOFT_DELETE_FAILED", detail: String(softRes.error.message || softRes.error) }, { status: 500 });
+    }
+    if (!softRes.data) return NextResponse.json({ ok: false, error: "NOT_FOUND" }, { status: 404 });
+
+    return NextResponse.json({
+      ok: true,
+      team: auth.team,
+      mode: "soft_fallback_fk",
+      item: softRes.data,
+      marker: "ADMIN_QUESTIONS_DELETE_ONE_SOFT_FALLBACK_v4",
+    });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: "QUESTION_DELETE_FATAL", detail: String(e?.message ?? e) }, { status: 500 });
   }
