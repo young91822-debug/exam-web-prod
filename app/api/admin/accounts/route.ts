@@ -25,10 +25,10 @@ function toBool(v: any, d: boolean | null = null) {
   return d;
 }
 
-/** stored 포맷: scrypt$<saltB64>$<hashB64>  (✅ 로그인 API와 동일 포맷) */
+/** stored 포맷: scrypt$<saltB64>$<hashB64> (✅ 로그인 API와 동일 포맷) */
 function makePasswordHash(plain: string) {
   const salt = crypto.randomBytes(16);
-  const derived = crypto.scryptSync(plain, salt, 32); // ✅ 32 bytes면 충분 + 로그인 검증과 잘 맞음
+  const derived = crypto.scryptSync(plain, salt, 32);
   return `scrypt$${salt.toString("base64")}$${derived.toString("base64")}`;
 }
 
@@ -46,19 +46,6 @@ async function readBody(req: Request) {
   }
 }
 
-/** owner_admin 컬럼 관련 "없음" 에러 전부 캐치 (does not exist / schema cache 포함) */
-function isMissingOwnerAdminColumn(err: any) {
-  const msg = String(err?.message ?? err ?? "").toLowerCase();
-  return (
-    msg.includes("owner_admin") &&
-    (msg.includes("does not exist") ||
-      msg.includes("schema cache") ||
-      msg.includes("could not find") ||
-      msg.includes("not find") ||
-      msg.includes("column"))
-  );
-}
-
 /** 중복(유니크 위반) 판단 */
 function isUniqueViolation(err: any) {
   // Postgres unique_violation = 23505
@@ -67,28 +54,30 @@ function isUniqueViolation(err: any) {
   return code === "23505" || msg.includes("duplicate key value") || msg.includes("unique constraint");
 }
 
+/** ✅ 관리자 스코프: empId 쿠키가 곧 owner_admin */
+function getAdminEmpId(req: NextRequest) {
+  const empId = s(req.cookies.get("empId")?.value || req.cookies.get("emp_id")?.value);
+  const role = s(req.cookies.get("role")?.value);
+  if (!empId) return { ok: false as const, error: "UNAUTHORIZED" };
+  // 필요하면 role 강제
+  // if (role !== "admin") return { ok: false as const, error: "FORBIDDEN" };
+  return { ok: true as const, empId, role };
+}
+
 /* ---------------- GET ---------------- */
-/** 목록 */
-export async function GET(_req: NextRequest) {
+/** ✅ 목록: 내(owner_admin=empId) 것만 */
+export async function GET(req: NextRequest) {
+  const scope = getAdminEmpId(req);
+  if (!scope.ok) {
+    return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
+  }
+
   try {
-    // 1) owner_admin 포함 시도
-    let q1 = sb
+    const { data, error } = await sb
       .from(TABLE)
-      .select("id, emp_id, name, is_active, created_at, role, owner_admin")
-      .order("id", { ascending: false });
-
-    let { data, error } = await q1;
-
-    // 2) owner_admin 컬럼 없으면 fallback
-    if (error && isMissingOwnerAdminColumn(error)) {
-      const r2 = await sb
-        .from(TABLE)
-        .select("id, emp_id, name, is_active, created_at, role")
-        .order("id", { ascending: false });
-
-      data = r2.data;
-      error = r2.error;
-    }
+      .select("id, emp_id, name, is_active, created_at, role, owner_admin, team")
+      .eq("owner_admin", scope.empId)
+      .order("created_at", { ascending: false });
 
     if (error) {
       return NextResponse.json(
@@ -97,6 +86,7 @@ export async function GET(_req: NextRequest) {
       );
     }
 
+    // 프론트 호환: items로 내려줌
     return NextResponse.json({ ok: true, items: data ?? [] });
   } catch (e: any) {
     return NextResponse.json(
@@ -107,8 +97,17 @@ export async function GET(_req: NextRequest) {
 }
 
 /* ---------------- POST ---------------- */
-/** 생성(중복 emp_id면 비번 포함 업데이트로 전환) */
+/**
+ * ✅ 생성(혹은 내 소유 계정이면 업데이트)
+ * - emp_id 중복인데 owner_admin이 다르면: 403 (수정/생성 금지)
+ * - emp_id 중복인데 owner_admin이 나면: 업데이트 + 비번 1234로 리셋
+ */
 export async function POST(req: NextRequest) {
+  const scope = getAdminEmpId(req);
+  if (!scope.ok) {
+    return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
+  }
+
   try {
     const body = await readBody(req);
 
@@ -116,7 +115,6 @@ export async function POST(req: NextRequest) {
     const name = s(body?.name);
     const is_active = toBool(body?.isActive ?? body?.is_active, true) ?? true;
 
-    // (옵션) role 받을지 말지: 기본 user, 필요하면 admin 생성도 가능
     const role = s(body?.role) || "user";
     const allowedRole = ["user", "admin"].includes(role) ? role : "user";
 
@@ -128,53 +126,44 @@ export async function POST(req: NextRequest) {
     const tempPassword = "1234";
     const password_hash = makePasswordHash(tempPassword);
 
-    // ✅ 누가 만들었는지(있으면) 기록
-    const adminEmpId = s(req.cookies.get("empId")?.value);
+    // 0) emp_id 존재 여부 + 소유자 확인 (✅ 핵심: 다른 owner_admin이면 차단)
+    const existing = await sb
+      .from(TABLE)
+      .select("id, emp_id, owner_admin")
+      .eq("emp_id", emp_id)
+      .maybeSingle();
 
-    const baseRow: any = {
-      emp_id,
-      name: name || null,
-      is_active,
-      role: allowedRole,
-      password: password_hash,
-    };
-
-    // owner_admin 컬럼이 있으면 넣고, 없으면 자동으로 제거
-    const rowWithOwner = adminEmpId ? { ...baseRow, owner_admin: adminEmpId } : baseRow;
-
-    // ✅ 1) insert 시도
-    let ins = await sb.from(TABLE).insert(rowWithOwner).select("*").single();
-
-    // ✅ 2) owner_admin 컬럼 없으면 제거 후 재시도
-    if (ins.error && isMissingOwnerAdminColumn(ins.error)) {
-      const { owner_admin, ...rowNoOwner } = rowWithOwner;
-      ins = await sb.from(TABLE).insert(rowNoOwner).select("*").single();
+    if (existing?.error) {
+      return NextResponse.json(
+        { ok: false, error: "DB_QUERY_FAILED", detail: String(existing.error?.message ?? existing.error) },
+        { status: 500 }
+      );
     }
 
-    // ✅ 3) emp_id 중복이면 update(비번 1234로 리셋 포함)
-    if (ins.error && isUniqueViolation(ins.error)) {
+    if (existing?.data) {
+      const owner = s(existing.data.owner_admin);
+      if (owner && owner !== scope.empId) {
+        // ✅ 다른 관리자가 만든 emp_id는 수정/생성 금지
+        return NextResponse.json(
+          { ok: false, error: "FORBIDDEN_OTHER_OWNER", detail: `owner_admin=${owner}` },
+          { status: 403 }
+        );
+      }
+
+      // ✅ 내 소유(or owner_admin 비어있으면) → 업데이트 + 비번 리셋
       const patch: any = {
         name: name || null,
         is_active,
         role: allowedRole,
-        password: password_hash, // ✅ 여기에서 리셋
+        password_hash,
+        owner_admin: scope.empId, // 비어있던 데이터도 내 소유로 정리
       };
 
-      // owner_admin은 컬럼 있을 때만 시도
-      let up = await sb
-        .from(TABLE)
-        .update({ ...patch, owner_admin: adminEmpId || null })
-        .eq("emp_id", emp_id)
-        .select("*")
-        .single();
-
-      if (up.error && isMissingOwnerAdminColumn(up.error)) {
-        up = await sb.from(TABLE).update(patch).eq("emp_id", emp_id).select("*").single();
-      }
+      const up = await sb.from(TABLE).update(patch).eq("emp_id", emp_id).select("*").single();
 
       if (up.error) {
         return NextResponse.json(
-          { ok: false, error: "ACCOUNTS_UPSERT_FAILED", detail: String(up.error?.message ?? up.error) },
+          { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: String(up.error?.message ?? up.error) },
           { status: 500 }
         );
       }
@@ -187,7 +176,64 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // 1) 신규 insert (✅ owner_admin 강제 + password_hash만 사용)
+    const row: any = {
+      emp_id,
+      name: name || null,
+      is_active,
+      role: allowedRole,
+      password_hash,
+      owner_admin: scope.empId,
+    };
+
+    const ins = await sb.from(TABLE).insert(row).select("*").single();
+
     if (ins.error) {
+      // 혹시 레이스로 중복이 터지면 위 로직처럼 다시 확인해서 차단/업데이트
+      if (isUniqueViolation(ins.error)) {
+        // 다시 조회 후 owner 확인
+        const ex2 = await sb
+          .from(TABLE)
+          .select("id, emp_id, owner_admin")
+          .eq("emp_id", emp_id)
+          .maybeSingle();
+
+        const owner2 = s(ex2?.data?.owner_admin);
+        if (owner2 && owner2 !== scope.empId) {
+          return NextResponse.json(
+            { ok: false, error: "FORBIDDEN_OTHER_OWNER", detail: `owner_admin=${owner2}` },
+            { status: 403 }
+          );
+        }
+
+        const up2 = await sb
+          .from(TABLE)
+          .update({
+            name: name || null,
+            is_active,
+            role: allowedRole,
+            password_hash,
+            owner_admin: scope.empId,
+          })
+          .eq("emp_id", emp_id)
+          .select("*")
+          .single();
+
+        if (up2.error) {
+          return NextResponse.json(
+            { ok: false, error: "ACCOUNTS_UPDATE_FAILED", detail: String(up2.error?.message ?? up2.error) },
+            { status: 500 }
+          );
+        }
+
+        return NextResponse.json({
+          ok: true,
+          item: up2.data,
+          mode: "UPDATED_EXISTING",
+          tempPassword,
+        });
+      }
+
       return NextResponse.json(
         { ok: false, error: "ACCOUNTS_INSERT_FAILED", detail: String(ins.error?.message ?? ins.error) },
         { status: 500 }
@@ -209,8 +255,16 @@ export async function POST(req: NextRequest) {
 }
 
 /* ---------------- PATCH ---------------- */
-/** 수정(이름/활성만) */
+/**
+ * ✅ 수정(이름/활성만)
+ * - 내(owner_admin=empId) 계정만 수정 가능
+ */
 export async function PATCH(req: NextRequest) {
+  const scope = getAdminEmpId(req);
+  if (!scope.ok) {
+    return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
+  }
+
   try {
     const body = await readBody(req);
     const id = body?.id;
@@ -219,19 +273,37 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
     }
 
-    const patch: any = {};
+    // ✅ 대상 소유권 체크 (남 소유면 차단)
+    const ex = await sb.from(TABLE).select("id, owner_admin").eq("id", id).maybeSingle();
+    if (ex.error) {
+      return NextResponse.json(
+        { ok: false, error: "DB_QUERY_FAILED", detail: String(ex.error?.message ?? ex.error) },
+        { status: 500 }
+      );
+    }
 
+    const owner = s(ex?.data?.owner_admin);
+    if (owner && owner !== scope.empId) {
+      return NextResponse.json(
+        { ok: false, error: "FORBIDDEN_OTHER_OWNER", detail: `owner_admin=${owner}` },
+        { status: 403 }
+      );
+    }
+
+    const patch: any = {};
     if (body?.name !== undefined) patch.name = s(body.name) || null;
 
     if (body?.is_active !== undefined || body?.isActive !== undefined) {
       const b = toBool(body?.is_active ?? body?.isActive, null);
-      // ✅ null이면 업데이트 안 함(실수로 null 들어가는 사고 방지)
       if (b !== null) patch.is_active = b;
     }
 
     if (Object.keys(patch).length === 0) {
       return NextResponse.json({ ok: false, error: "NO_FIELDS" }, { status: 400 });
     }
+
+    // ✅ owner_admin이 비어있던 레거시 데이터면 내 소유로 고정(원치 않으면 삭제 가능)
+    patch.owner_admin = scope.empId;
 
     const up = await sb.from(TABLE).update(patch).eq("id", id).select("*");
     if (up.error) {
