@@ -41,7 +41,7 @@ export async function GET(req: NextRequest) {
 
     const adminTeam = upperTeam(teamCookie || (empId === "admin_gs" ? "B" : "A"));
 
-    // ✅ DB가 이제 team 갖고 있으니: 팀 강제 + 유효 응시만
+    // ✅ 팀 강제 + 유효 응시만
     const r = await sb
       .from("exam_attempts")
       .select(
@@ -50,7 +50,7 @@ export async function GET(req: NextRequest) {
       )
       .eq("team", adminTeam)
       .not("emp_id", "is", null)
-      .neq("emp_id", "") // 빈 문자열도 제거
+      .neq("emp_id", "")
       .order("submitted_at", { ascending: false })
       .order("id", { ascending: false })
       .range(from, to);
@@ -62,9 +62,43 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const items = r.data ?? [];
-    const total = r.count ?? items.length;
+    const rows = r.data ?? [];
+    const total = r.count ?? rows.length;
 
+    // ✅ 응답 정규화(프론트 키 불일치 대비: camelCase + snake_case 둘 다 제공)
+    const items = rows.map((x: any) => {
+      const tq = Number(x?.total_questions ?? 0);
+      const tpRaw = Number(x?.total_points ?? 0);
+      const tp = tpRaw || tq; // total_points가 0이면 일단 total_questions로 대체(화면 0/0 방지)
+
+      const base = {
+        id: String(x?.id),
+        team: s(x?.team),
+        status: s(x?.status),
+        score: Number(x?.score ?? 0),
+        totalPoints: tp,
+        totalQuestions: tq,
+        wrongCount: Number(x?.wrong_count ?? 0),
+        startedAt: x?.started_at ?? null,
+        submittedAt: x?.submitted_at ?? null,
+      };
+
+      return {
+        // camelCase
+        ...base,
+        empId: s(x?.emp_id),
+
+        // snake_case (기존 프론트가 이 키를 쓰는 경우 대비)
+        emp_id: s(x?.emp_id),
+        total_points: tp,
+        total_questions: tq,
+        wrong_count: Number(x?.wrong_count ?? 0),
+        started_at: x?.started_at ?? null,
+        submitted_at: x?.submitted_at ?? null,
+      };
+    });
+
+    // ✅ CSV
     if (format.toLowerCase() === "csv") {
       const header = [
         "attempt_id",
@@ -84,15 +118,15 @@ export async function GET(req: NextRequest) {
         ...items.map((x: any) =>
           [
             toCsvCell(x?.id),
-            toCsvCell(x?.emp_id),
+            toCsvCell(x?.emp_id ?? x?.empId),
             toCsvCell(x?.team),
             toCsvCell(x?.status),
             toCsvCell(x?.score),
-            toCsvCell(x?.total_points),
-            toCsvCell(x?.wrong_count),
-            toCsvCell(x?.total_questions),
-            toCsvCell(x?.started_at),
-            toCsvCell(x?.submitted_at),
+            toCsvCell(x?.total_points ?? x?.totalPoints),
+            toCsvCell(x?.wrong_count ?? x?.wrongCount),
+            toCsvCell(x?.total_questions ?? x?.totalQuestions),
+            toCsvCell(x?.started_at ?? x?.startedAt),
+            toCsvCell(x?.submitted_at ?? x?.submittedAt),
           ].join(",")
         ),
       ].join("\n");
@@ -113,17 +147,32 @@ export async function GET(req: NextRequest) {
       total,
       filters: { adminTeam },
       items: items.map((x: any) => ({
-        id: String(x?.id),
+        // 프론트 호환용으로 둘 다 유지
+        id: x.id,
         idType: "num",
-        empId: s(x?.emp_id),
-        team: s(x?.team),
-        status: s(x?.status),
-        score: Number(x?.score ?? 0),
-        totalPoints: Number(x?.total_points ?? 0),
-        totalQuestions: Number(x?.total_questions ?? 0),
-        wrongCount: Number(x?.wrong_count ?? 0),
-        startedAt: x?.started_at ?? null,
-        submittedAt: x?.submitted_at ?? null,
+
+        empId: x.empId,
+        emp_id: x.emp_id,
+
+        team: x.team,
+        status: x.status,
+
+        score: x.score,
+
+        totalPoints: x.totalPoints,
+        total_points: x.total_points,
+
+        totalQuestions: x.totalQuestions,
+        total_questions: x.total_questions,
+
+        wrongCount: x.wrongCount,
+        wrong_count: x.wrong_count,
+
+        startedAt: x.startedAt,
+        started_at: x.started_at,
+
+        submittedAt: x.submittedAt,
+        submitted_at: x.submitted_at,
       })),
     });
   } catch (e: any) {
