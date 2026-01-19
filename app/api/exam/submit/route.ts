@@ -7,14 +7,12 @@ export const dynamic = "force-dynamic";
 function getSupabaseAdmin() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const service = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
   if (!url) return { client: null as any, error: "Missing env: NEXT_PUBLIC_SUPABASE_URL" };
   if (!service) return { client: null as any, error: "Missing env: SUPABASE_SERVICE_ROLE_KEY" };
 
   const client = createClient(url, service, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
-
   return { client, error: null as string | null };
 }
 
@@ -28,10 +26,6 @@ function n(v: any, d: number | null = null) {
 function isNumericId(x: any) {
   return /^\d+$/.test(s(x));
 }
-function isUuid(x: any) {
-  const t = s(x);
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
-}
 
 async function readBody(req: Request): Promise<any> {
   try {
@@ -39,8 +33,7 @@ async function readBody(req: Request): Promise<any> {
   } catch {
     try {
       const t = await req.text();
-      if (!t) return {};
-      return JSON.parse(t);
+      return t ? JSON.parse(t) : {};
     } catch {
       return {};
     }
@@ -70,66 +63,39 @@ function isMissingColumn(err: any) {
   return msg.includes("does not exist") || msg.includes("Could not find") || msg.includes("schema cache");
 }
 
-async function safeUpdateAttempt(client: any, attemptId: number, patch: Record<string, any>) {
+/** exam_attempts 업데이트: 컬럼 없으면 자동으로 빼면서 재시도 */
+async function safeUpdateAttempt(client: any, by: { id?: number; uuid?: string }, patch: Record<string, any>) {
   let keys = Object.keys(patch);
 
   for (let i = 0; i < 12; i++) {
     const cur: any = {};
     for (const k of keys) cur[k] = patch[k];
 
-    const r = await client.from("exam_attempts").update(cur).eq("id", attemptId);
+    let q = client.from("exam_attempts").update(cur);
+    if (by.uuid) q = q.eq("uuid", by.uuid);
+    else q = q.eq("id", by.id);
+
+    const r = await q;
     if (!r.error) return { ok: true as const };
 
     if (isMissingColumn(r.error)) {
       const msg = String(r.error?.message ?? "");
       const m = msg.match(/exam_attempts\.([a-zA-Z0-9_]+)/);
       const bad = m?.[1];
-
       if (bad && keys.includes(bad)) {
         keys = keys.filter((x) => x !== bad);
         continue;
       }
-
-      const fallback = ["wrong_count", "status", "team", "answers", "total_questions", "score", "submitted_at"];
-      const rm = fallback.find((x) => keys.includes(x));
-      if (rm) {
-        keys = keys.filter((x) => x !== rm);
-        continue;
-      }
+      // 그래도 못 찾으면 하나씩 빼기
+      const rm = keys[0];
+      keys = keys.filter((x) => x !== rm);
+      continue;
     }
 
     return { ok: false as const, error: r.error };
   }
 
   return { ok: false as const, error: "UPDATE_TRIES_EXCEEDED" as any };
-}
-
-/** ✅ attempt_answers(attempt_id uuid)을 위해 attempt uuid 찾기 */
-function pickAttemptUuid(req: NextRequest, attempt: any) {
-  // 1) 쿠키 후보들
-  const cookieCands = [
-    req.cookies.get("attempt_uuid")?.value,
-    req.cookies.get("attemptUuid")?.value,
-    req.cookies.get("attempt_id_uuid")?.value,
-    req.cookies.get("attemptIdUuid")?.value,
-    req.cookies.get("attempt_uid")?.value,
-  ].map(s).filter(Boolean);
-
-  for (const v of cookieCands) if (isUuid(v)) return s(v);
-
-  // 2) attempt row 후보들 (컬럼명이 뭐였든 최대한 흡수)
-  const rowCands = [
-    attempt?.attempt_uuid,
-    attempt?.attemptUuid,
-    attempt?.uuid,
-    attempt?.attempt_id_uuid,
-    attempt?.attemptIdUuid,
-    attempt?.uid,
-  ].map(s).filter(Boolean);
-
-  for (const v of rowCands) if (isUuid(v)) return s(v);
-
-  return "";
 }
 
 export async function POST(req: NextRequest) {
@@ -142,14 +108,26 @@ export async function POST(req: NextRequest) {
     const body = await readBody(req);
     const isAuto = !!body?.isAuto;
 
-    // ✅ 기존처럼 exam_attempts id(숫자) 기준 유지
+    // ✅ attempt 식별자: id(bigint) 또는 uuid 둘 다 받기
     const attemptIdRaw = body?.attemptId ?? body?.attempt_id ?? body?.id ?? null;
-    if (!isNumericId(attemptIdRaw)) {
-      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID", detail: { attemptIdRaw } }, { status: 400 });
-    }
-    const attemptId = Number(attemptIdRaw);
+    const attemptUuidRaw =
+      body?.attemptUuid ??
+      body?.attempt_uuid ??
+      req.cookies.get("attemptUuid")?.value ??
+      req.cookies.get("attempt_uuid")?.value ??
+      null;
 
-    // answers map 만들기
+    const attemptUuidIn = s(attemptUuidRaw);
+    const attemptIdIn = isNumericId(attemptIdRaw) ? Number(attemptIdRaw) : null;
+
+    if (!attemptUuidIn && attemptIdIn === null) {
+      return NextResponse.json(
+        { ok: false, error: "MISSING_ATTEMPT_ID", detail: { attemptIdRaw, attemptUuidRaw } },
+        { status: 400 }
+      );
+    }
+
+    // ✅ answers map
     const answersObj = body?.answers ?? body?.answerMap ?? body?.selected ?? body?.items ?? {};
     const answersMap: Record<string, number> = {};
     if (answersObj && typeof answersObj === "object" && !Array.isArray(answersObj)) {
@@ -166,41 +144,63 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "NO_ANSWERS" }, { status: 400 });
     }
 
-    // 1) attempt 조회
-    const { data: attempt, error: aErr } = await client
-      .from("exam_attempts")
-      .select("*")
-      .eq("id", attemptId)
-      .maybeSingle();
+    // 1) attempt 조회: uuid 우선, 없으면 id로
+    let attempt: any = null;
 
-    if (aErr) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: aErr }, { status: 500 });
-    if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
+    if (attemptUuidIn) {
+      const r = await client.from("exam_attempts").select("*").eq("uuid", attemptUuidIn).maybeSingle();
+      if (r.error) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: r.error }, { status: 500 });
+      attempt = r.data;
+    } else if (attemptIdIn !== null) {
+      const r = await client.from("exam_attempts").select("*").eq("id", attemptIdIn).maybeSingle();
+      if (r.error) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: r.error }, { status: 500 });
+      attempt = r.data;
+    }
 
-    // team 결정
-    const empIdCookie = s(req.cookies.get("empId")?.value);
-    const teamCookie = s(req.cookies.get("team")?.value);
-    const team = s((attempt as any)?.team) || teamCookie || (empIdCookie === "admin_gs" ? "B" : "A");
-
-    // 2) question_ids
-    const questionIds: string[] = Array.isArray((attempt as any)?.question_ids)
-      ? (attempt as any).question_ids.map((x: any) => s(x)).filter(Boolean)
-      : [];
-
-    const uniqQids = Array.from(new Set(questionIds)).filter(Boolean);
-
-    // ✅ question_id 타입 판별 (하나라도 uuid면 uuid 플로우)
-    const hasUuidQid = uniqQids.some((x) => isUuid(x));
-    const hasNumericQid = uniqQids.some((x) => isNumericId(x));
-    const qidType = hasUuidQid ? "uuid" : (hasNumericQid ? "num" : "unknown");
-
-    if (qidType === "unknown") {
+    if (!attempt) {
       return NextResponse.json(
-        { ok: false, error: "INVALID_QUESTION_IDS", detail: { sample: uniqQids.slice(0, 3) } },
-        { status: 400 }
+        { ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptIdIn, attemptUuidIn } },
+        { status: 404 }
       );
     }
 
-    // 3) questions 조회 (uuid든 num이든 questions.id와 동일하다는 가정 유지)
+    const attemptUuid = s(attempt.uuid);
+    const attemptId = n(attempt.id, null);
+
+    if (!attemptUuid) {
+      return NextResponse.json(
+        { ok: false, error: "MISSING_ATTEMPT_UUID", detail: { attemptId, attemptUuidIn } },
+        { status: 500 }
+      );
+    }
+
+    // 2) team 결정
+    const empIdCookie = s(req.cookies.get("empId")?.value);
+    const teamCookie = s(req.cookies.get("team")?.value);
+    const team = s(attempt?.team) || teamCookie || (empIdCookie === "admin_gs" ? "B" : "A");
+
+    // 3) question_ids 가져오기 (attempt.question_ids가 있으면 그걸 쓰고, 없으면 attempt_questions에서 읽기)
+    let uniqQids: string[] = [];
+
+    const questionIds: string[] = Array.isArray(attempt?.question_ids)
+      ? attempt.question_ids.map((x: any) => s(x)).filter(Boolean)
+      : [];
+
+    if (questionIds.length > 0) {
+      uniqQids = Array.from(new Set(questionIds)).filter(Boolean);
+    } else {
+      // attempt_questions 테이블이 있다면 거기서
+      const aq = await client
+        .from("attempt_questions")
+        .select("question_id")
+        .eq("attempt_uuid", attemptUuid);
+
+      if (!aq.error && Array.isArray(aq.data)) {
+        uniqQids = Array.from(new Set(aq.data.map((x: any) => s(x?.question_id)).filter(Boolean)));
+      }
+    }
+
+    // 4) questions 조회 (UUID id 기준)
     const { data: questions, error: qErr } = uniqQids.length
       ? await client.from("questions").select("*").in("id", uniqQids as any)
       : { data: [], error: null as any };
@@ -210,29 +210,27 @@ export async function POST(req: NextRequest) {
     const qById = new Map<string, any>();
     for (const q of questions ?? []) qById.set(String((q as any).id), q);
 
-    // 4) 채점 + 저장 rows 구성
+    // 5) 채점 + attempt_answers rows
     let score = 0;
     let totalPoints = 0;
     let wrongCount = 0;
 
-    const rowsToInsertExamAnswers: any[] = [];   // (bigint 테이블용)
-    const rowsToInsertAttemptAnswers: any[] = []; // (uuid 테이블용)
+    const rowsToInsert: any[] = [];
 
     for (const qid of uniqQids) {
       const q = qById.get(String(qid));
-
       const pts = n(q?.points, null);
       const point = pts === null ? 1 : (pts ?? 0);
+
       totalPoints += point;
 
       const selectedIndex = Object.prototype.hasOwnProperty.call(answersMap, qid)
         ? Number(answersMap[qid])
         : null;
 
-      const correctIndex = pickCorrectIndex(q);
-
       if (selectedIndex === null || selectedIndex === undefined) continue;
 
+      const correctIndex = pickCorrectIndex(q);
       const isCorrect =
         correctIndex !== null && Number.isFinite(Number(correctIndex))
           ? Number(selectedIndex) === Number(correctIndex)
@@ -241,62 +239,26 @@ export async function POST(req: NextRequest) {
       if (isCorrect) score += point;
       else wrongCount += 1;
 
-      if (qidType === "uuid") {
-        rowsToInsertAttemptAnswers.push({
-          // attempt_id는 아래에서 세팅
-          question_id: qid,
-          selected_index: Number(selectedIndex),
-          is_correct: isCorrect,
-          points: point,
-        });
-      } else {
-        rowsToInsertExamAnswers.push({
-          attempt_id: attemptId,
-          question_id: qid,
-          selected_index: Number(selectedIndex),
-        });
-      }
+      rowsToInsert.push({
+        attempt_id: attemptUuid,      // ✅ uuid
+        question_id: qid,             // ✅ uuid
+        selected_index: Number(selectedIndex),
+        is_correct: isCorrect,
+        points: point,
+      });
     }
 
-    // 5) 답안 저장 (qidType에 따라 테이블 다르게)
-    if (qidType === "uuid") {
-      const attemptUuid = pickAttemptUuid(req, attempt);
+    // ✅ 6) attempt_answers에 저장 (UUID 체계)
+    const { error: delErr } = await client.from("attempt_answers").delete().eq("attempt_id", attemptUuid);
+    if (delErr) return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
 
-      if (!attemptUuid) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: "MISSING_ATTEMPT_UUID",
-            detail:
-              "question_id는 UUID인데, attempt_answers.attempt_id(uuid)에 넣을 attempt uuid를 찾지 못함. (쿠키 attempt_uuid/attemptUuid 또는 exam_attempts의 uuid 컬럼 필요)",
-          },
-          { status: 500 }
-        );
-      }
-
-      // 기존 답안 삭제
-      const { error: delErr } = await client.from("attempt_answers").delete().eq("attempt_id", attemptUuid);
-      if (delErr) return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
-
-      if (rowsToInsertAttemptAnswers.length > 0) {
-        const insRows = rowsToInsertAttemptAnswers.map((r) => ({ ...r, attempt_id: attemptUuid }));
-        const { error: insErr } = await client.from("attempt_answers").insert(insRows);
-        if (insErr) return NextResponse.json({ ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr }, { status: 500 });
-      }
-    } else {
-      // 기존 exam_answers 방식 유지
-      const { error: delErr } = await client.from("exam_answers").delete().eq("attempt_id", attemptId);
-      if (delErr) return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
-
-      if (rowsToInsertExamAnswers.length > 0) {
-        const { error: insErr } = await client.from("exam_answers").insert(rowsToInsertExamAnswers);
-        if (insErr) return NextResponse.json({ ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr }, { status: 500 });
-      }
+    if (rowsToInsert.length > 0) {
+      const { error: insErr } = await client.from("attempt_answers").insert(rowsToInsert);
+      if (insErr) return NextResponse.json({ ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr }, { status: 500 });
     }
 
-    // 6) attempt 업데이트
+    // ✅ 7) exam_attempts 업데이트 (uuid로)
     const nowIso = new Date().toISOString();
-
     const patch: any = {
       submitted_at: nowIso,
       status: "SUBMITTED",
@@ -308,19 +270,22 @@ export async function POST(req: NextRequest) {
       answers: { map: answersMap },
     };
 
-    const up = await safeUpdateAttempt(client, attemptId, patch);
+    const up = await safeUpdateAttempt(client, { uuid: attemptUuid }, patch);
     if (!up.ok) return NextResponse.json({ ok: false, error: "ATTEMPT_UPDATE_FAILED", detail: up.error }, { status: 500 });
+
+    // ✅ redirect: 기존 숫자 id가 있으면 id 기반 유지, 없으면 uuid 기반
+    const redirectUrl = attemptId ? `/exam/result/${attemptId}` : `/exam/result/${attemptUuid}`;
 
     return NextResponse.json({
       ok: true,
-      attemptId,
+      attemptId: attemptId ?? null,
+      attemptUuid,
       score,
       totalPoints,
       wrongCount,
-      savedAnswers: qidType === "uuid" ? rowsToInsertAttemptAnswers.length : rowsToInsertExamAnswers.length,
+      savedAnswers: rowsToInsert.length,
       isAuto,
-      redirectUrl: `/exam/result/${attemptId}`,
-      mode: qidType === "uuid" ? "attempt_answers(uuid)" : "exam_answers(bigint)",
+      redirectUrl,
     });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: "SUBMIT_FAILED", detail: String(e?.message ?? e) }, { status: 500 });
