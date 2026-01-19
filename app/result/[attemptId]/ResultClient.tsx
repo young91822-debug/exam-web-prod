@@ -16,139 +16,60 @@ type Graded = {
 
 type ApiOk = {
   ok: true;
-  attempt?: {
+  attempt: {
     id: any;
+    uuid?: string | null;
     emp_id?: string | null;
     started_at?: any;
     submitted_at?: any;
     status?: string | null;
-    score?: number;
-    total_points?: number;
-    total_questions?: number;
-    team?: string | null;
+    score: number;
+    total_points: number;
+    total_questions: number;
+    answers_source?: string | null;
   };
-  graded?: Graded[];
-
-  // legacy/fallback
-  items?: any[];
-  questions?: any[];
-  wrongQuestions?: any[];
-  wrongQuestionIds?: any[];
-
-  score?: number;
-  totalPoints?: number;
+  graded: Graded[];
   totalQuestions?: number;
   wrongCount?: number;
-  percent?: number;
+  totalPoints?: number;
 };
 
-async function safeJson(res: Response) {
-  const ct = res.headers.get("content-type") || "";
-  const text = await res.text();
-  if (ct.includes("application/json")) {
-    try {
-      return JSON.parse(text);
-    } catch {
-      return { ok: false, error: "INVALID_JSON", raw: text };
-    }
-  }
-  return { ok: false, error: "NON_JSON", raw: text };
-}
+type ApiFail = { ok: false; error: string; detail?: any };
+type ApiResp = ApiOk | ApiFail | any;
 
 function s(v: any) {
   return String(v ?? "").trim();
 }
-
 function fmt(v: any) {
   if (!v) return "-";
   const d = new Date(v);
   return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString("ko-KR");
 }
-
 function pct(score: number, total: number) {
   if (!Number.isFinite(score) || !Number.isFinite(total) || total <= 0) return 0;
   return Math.round((score / total) * 100);
 }
-
 function cls(...xs: (string | false | null | undefined)[]) {
   return xs.filter(Boolean).join(" ");
 }
 
-/** 서버 응답이 graded든 legacy items든, Graded 형태로 통일 */
-function normalizeToGraded(json: any): Graded[] {
-  // ✅ 최신 포맷
-  if (Array.isArray(json?.graded)) {
-    return json.graded.map((g: any, idx: number) => ({
-      questionId: g?.questionId ?? g?.question_id ?? g?.id ?? idx,
-      content: String(g?.content ?? ""),
-      choices: Array.isArray(g?.choices) ? g.choices.map((x: any) => String(x ?? "")) : [],
-      correctIndex: g?.correctIndex ?? g?.correct_index ?? g?.answer_index ?? null,
-      selectedIndex: g?.selectedIndex ?? g?.selected_index ?? g?.picked ?? null,
-      isCorrect: !!g?.isCorrect,
-      points: Number(g?.points ?? 0),
-    }));
+async function safeJson(res: Response) {
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return { ok: false, error: "INVALID_JSON", raw: text };
   }
-
-  // ✅ legacy 포맷들 (items / questions / wrongQuestions 등)
-  const rawList =
-    (json?.items ?? json?.wrongQuestions ?? json?.questions ?? []) as any[];
-
-  return (rawList || []).map((x: any, idx: number) => {
-    const questionId = x?.questionId ?? x?.question_id ?? x?.id ?? idx;
-    const content = String(x?.content ?? x?.question?.content ?? "");
-    const choicesRaw = x?.choices ?? x?.question?.choices ?? [];
-    const choices = Array.isArray(choicesRaw) ? choicesRaw.map((z: any) => String(z ?? "")) : [];
-
-    const points = Number(x?.points ?? x?.question?.points ?? 0);
-
-    const correctIndex =
-      x?.correctIndex ??
-      x?.correct_index ??
-      x?.answer_index ??
-      x?.answerIndex ??
-      x?.question?.answer_index ??
-      null;
-
-    const pickedRaw =
-      x?.picked ??
-      x?.picked_index ??
-      x?.user_answer_index ??
-      x?.myAnswer ??
-      x?.selectedIndex ??
-      x?.selected_index;
-
-    const selectedIndex =
-      typeof pickedRaw === "number"
-        ? pickedRaw
-        : typeof pickedRaw === "string"
-        ? Number(pickedRaw)
-        : null;
-
-    const isCorrect =
-      typeof selectedIndex === "number" &&
-      typeof correctIndex === "number" &&
-      selectedIndex === correctIndex;
-
-    return {
-      questionId,
-      content,
-      choices,
-      correctIndex: typeof correctIndex === "number" ? correctIndex : null,
-      selectedIndex: typeof selectedIndex === "number" ? selectedIndex : null,
-      isCorrect,
-      points,
-    };
-  });
 }
 
 export default function ResultClient({ attemptId }: { attemptId: string }) {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
-  const [data, setData] = useState<any>(null);
-  const [errorMsg, setErrorMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [data, setData] = useState<ApiResp | null>(null);
 
-  // UI
-  const [tab, setTab] = useState<"wrong" | "all">("wrong");
+  // UI state
+  const [wrongOnly, setWrongOnly] = useState(true);
   const [openAll, setOpenAll] = useState(false);
   const [openMap, setOpenMap] = useState<Record<string, boolean>>({});
 
@@ -156,25 +77,24 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
     let dead = false;
 
     (async () => {
-      setLoading(true);
-      setErrorMsg("");
       try {
+        setLoading(true);
+        setErr("");
         const res = await fetch(`/api/result/${attemptId}`, { cache: "no-store" });
         const json = await safeJson(res);
 
         if (dead) return;
 
         if (!res.ok || !json?.ok) {
-          setErrorMsg(json?.error ? `${json.error}\n${JSON.stringify(json?.detail ?? json, null, 2)}` : JSON.stringify(json, null, 2));
-          setLoading(false);
-          return;
+          setErr(json?.error || `HTTP_${res.status}`);
+          setData(json);
+        } else {
+          setData(json);
         }
-
-        setData(json);
-        setLoading(false);
       } catch (e: any) {
-        if (!dead) setErrorMsg(e?.message ?? String(e));
-        setLoading(false);
+        if (!dead) setErr(String(e?.message ?? e));
+      } finally {
+        if (!dead) setLoading(false);
       }
     })();
 
@@ -183,67 +103,33 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
     };
   }, [attemptId]);
 
-  const attempt = (data as ApiOk)?.attempt ?? {};
-  const gradedAll = useMemo(() => normalizeToGraded(data), [data]);
+  const ok = (data as any)?.ok === true;
+  const attempt = ok ? (data as ApiOk).attempt : ({} as any);
+  const graded: Graded[] = ok && Array.isArray((data as ApiOk).graded) ? (data as ApiOk).graded : [];
 
-  const wrongOnly = useMemo(
-    () => gradedAll.filter((g) => g?.isCorrect === false),
-    [gradedAll]
+  const score = Number(attempt?.score ?? 0);
+  const totalPoints = Number(
+    (data as any)?.totalPoints ??
+      attempt?.total_points ??
+      graded.reduce((acc, g) => acc + Number(g?.points ?? 0), 0)
   );
 
-  const list = tab === "wrong" ? wrongOnly : gradedAll;
-
-  // 점수/요약 (서버 값 우선, 없으면 계산)
-  const totalPoints = useMemo(() => {
-    const fromServer =
-      Number((data as any)?.totalPoints) ||
-      Number((attempt as any)?.total_points) ||
-      0;
-    if (fromServer > 0) return fromServer;
-    return gradedAll.reduce((acc, g) => acc + Number(g?.points ?? 0), 0);
-  }, [data, attempt, gradedAll]);
-
-  const scorePoints = useMemo(() => {
-    const fromServer = Number((attempt as any)?.score ?? (data as any)?.score ?? 0);
-    // 서버가 원점수 내려주면 그걸 쓰고, 아니면 graded로 계산
-    if (Number.isFinite(fromServer) && fromServer > 0) return fromServer;
-    return gradedAll.reduce((acc, g) => acc + (g?.isCorrect ? Number(g?.points ?? 0) : 0), 0);
-  }, [attempt, data, gradedAll]);
-
-  const totalQuestions = useMemo(() => {
-    const fromServer =
-      Number((data as any)?.totalQuestions) ||
-      Number((attempt as any)?.total_questions) ||
-      0;
-    if (fromServer > 0) return fromServer;
-    return gradedAll.length;
-  }, [data, attempt, gradedAll.length]);
-
-  const wrongCount = useMemo(() => {
-    const fromServer = Number((data as any)?.wrongCount ?? 0);
-    if (fromServer > 0) return fromServer;
-
-    if (Array.isArray((data as any)?.wrongQuestionIds)) {
-      return (data as any).wrongQuestionIds.length;
-    }
-    return wrongOnly.length;
-  }, [data, wrongOnly.length]);
-
+  const totalQuestions = Number(attempt?.total_questions ?? graded.length ?? 0);
+  const wrongCount = Number((data as any)?.wrongCount ?? graded.filter((g) => g?.isCorrect === false).length ?? 0);
   const correctCount = Math.max(0, totalQuestions - wrongCount);
+  const percent = useMemo(() => pct(score, totalPoints), [score, totalPoints]);
 
-  const percent = useMemo(() => {
-    if (typeof (data as any)?.percent === "number") return (data as any).percent;
-    return pct(scorePoints, totalPoints);
-  }, [data, scorePoints, totalPoints]);
+  const wrongList = useMemo(() => graded.filter((g) => g?.isCorrect === false), [graded]);
+  const list = wrongOnly ? wrongList : graded;
 
+  // 기본: 오답만 보기일 때는 상위 3개 자동 펼침
   useEffect(() => {
-    // 오답 탭이면 처음 3개만 자동 펼치기
-    if (tab === "wrong" && wrongOnly.length > 0) {
-      const next: Record<string, boolean> = {};
-      for (const g of wrongOnly.slice(0, 3)) next[String(g.questionId)] = true;
-      setOpenMap((prev) => ({ ...next, ...prev }));
-    }
-  }, [tab, wrongOnly.length]);
+    if (!wrongOnly) return;
+    if (wrongList.length === 0) return;
+    const next: Record<string, boolean> = {};
+    for (const g of wrongList.slice(0, 3)) next[String(g.questionId)] = true;
+    setOpenMap((prev) => ({ ...next, ...prev }));
+  }, [wrongOnly, wrongList.length]);
 
   function toggleOne(key: string) {
     setOpenMap((m) => ({ ...m, [key]: !m[key] }));
@@ -252,21 +138,19 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
   if (loading) {
     return (
       <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
-        <div className="max-w-5xl mx-auto p-6">결과 불러오는 중…</div>
+        <div className="max-w-5xl mx-auto p-6">불러오는 중…</div>
       </div>
     );
   }
 
-  if (errorMsg) {
+  if (err) {
     return (
       <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
         <div className="max-w-3xl mx-auto p-6 space-y-3">
-          <div className="font-semibold text-rose-200">결과를 불러오지 못했습니다.</div>
-          <pre className="text-xs text-slate-300 whitespace-pre-wrap break-words border border-slate-700 rounded-xl bg-slate-900/60 p-3">
-            {errorMsg}
-          </pre>
+          <div className="font-semibold text-red-300">결과를 불러오지 못했습니다.</div>
+          <div className="text-sm text-slate-300">에러: {err}</div>
           <button
-            className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+            className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900"
             onClick={() => router.refresh()}
           >
             새로고침
@@ -275,9 +159,6 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
       </div>
     );
   }
-
-  const empId = s((attempt as any)?.emp_id);
-  const team = s((attempt as any)?.team);
 
   return (
     <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
@@ -296,12 +177,12 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
             >
               다시 시험 보기
             </a>
-            <button
+            <a
               className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
-              onClick={() => router.push("/exam")}
+              href="/"
             >
-              ← 목록
-            </button>
+              목록
+            </a>
           </div>
         </div>
 
@@ -310,19 +191,19 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
           <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
             attemptId: {attemptId}
           </span>
-          {empId ? (
+          {s(attempt?.emp_id) ? (
             <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
-              응시자: {empId}
-            </span>
-          ) : null}
-          {team ? (
-            <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
-              팀: {team}
+              응시자: {s(attempt?.emp_id)}
             </span>
           ) : null}
           <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
-            상태: {s((attempt as any)?.status) || "SUBMITTED"}
+            상태: {s(attempt?.status) || "SUBMITTED"}
           </span>
+          {s((attempt as any)?.answers_source) ? (
+            <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
+              src: {s((attempt as any)?.answers_source)}
+            </span>
+          ) : null}
         </div>
 
         {/* Summary cards */}
@@ -330,8 +211,7 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
           <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
             <div className="text-sm text-slate-300">점수</div>
             <div className="text-3xl font-extrabold mt-1">
-              {scorePoints}{" "}
-              <span className="text-slate-400 text-base font-semibold">/ {totalPoints}</span>
+              {score} <span className="text-slate-400 text-base font-semibold">/ {totalPoints}</span>
             </div>
             <div className="mt-3 h-2 rounded-full bg-slate-800 overflow-hidden">
               <div className="h-full bg-slate-200/70" style={{ width: `${percent}%` }} />
@@ -348,12 +228,12 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
 
           <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
             <div className="text-sm text-slate-300">시작</div>
-            <div className="text-lg font-semibold mt-2">{fmt((attempt as any)?.started_at)}</div>
+            <div className="text-lg font-semibold mt-2">{fmt(attempt?.started_at)}</div>
           </div>
 
           <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
             <div className="text-sm text-slate-300">제출</div>
-            <div className="text-lg font-semibold mt-2">{fmt((attempt as any)?.submitted_at)}</div>
+            <div className="text-lg font-semibold mt-2">{fmt(attempt?.submitted_at)}</div>
           </div>
         </div>
 
@@ -362,8 +242,8 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
           <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60">
             <input
               type="checkbox"
-              checked={tab === "wrong"}
-              onChange={(e) => setTab(e.target.checked ? "wrong" : "all")}
+              checked={wrongOnly}
+              onChange={(e) => setWrongOnly(e.target.checked)}
             />
             <span className="text-sm font-semibold">틀린 문제만 보기</span>
           </label>
@@ -393,14 +273,13 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
 
         {/* Questions */}
         {list.length === 0 ? (
-          <div className="text-sm text-slate-300">
-            {tab === "wrong" ? "오답이 없습니다. 잘했어요!" : "표시할 문항이 없습니다."}
-          </div>
+          <div className="text-sm text-slate-300">{wrongOnly ? "오답이 없습니다. 잘했어요!" : "표시할 문항이 없습니다."}</div>
         ) : (
           <div className="space-y-4">
             {list.map((g, idx) => {
               const key = String(g.questionId ?? idx);
               const opened = !!openMap[key];
+
               const selected = g.selectedIndex;
               const correct = g.correctIndex;
               const isCorrect = !!g.isCorrect;
@@ -419,7 +298,6 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
                         {correct === null || correct === undefined ? "-" : correct + 1}
                       </div>
                     </div>
-
                     <div
                       className={cls(
                         "shrink-0 px-3 py-1 rounded-full text-xs font-extrabold border",
@@ -460,9 +338,7 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
                         );
                       })}
 
-                      <div className="text-xs text-slate-400 mt-2">
-                        배점: {Number.isFinite(Number(g.points)) ? g.points : 0}점
-                      </div>
+                      <div className="text-xs text-slate-400 mt-2">배점: {Number.isFinite(Number(g.points)) ? g.points : 0}점</div>
                     </div>
                   )}
                 </div>
