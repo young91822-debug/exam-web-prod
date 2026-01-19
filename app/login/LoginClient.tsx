@@ -19,7 +19,8 @@ function friendlyError(code: string) {
   if (c.includes("INVALID")) return "아이디 또는 비밀번호가 올바르지 않아요.";
   if (c.includes("DISABLED") || c.includes("INACTIVE")) return "비활성화된 계정이에요. 관리자에게 문의해 주세요.";
   if (c.includes("LOCK")) return "잠긴 계정이에요. 관리자에게 문의해 주세요.";
-  if (c.includes("SERVER") || c.includes("FATAL") || c.includes("FAILED")) return "서버 오류가 발생했어요. 잠시 후 다시 시도해 주세요.";
+  if (c.includes("SERVER") || c.includes("FATAL") || c.includes("FAILED"))
+    return "서버 오류가 발생했어요. 잠시 후 다시 시도해 주세요.";
   return `로그인 실패: ${code}`;
 }
 
@@ -47,7 +48,6 @@ export default function LoginClient() {
 
   const [id, setId] = useState("");
   const [pw, setPw] = useState("");
-  const [showPw, setShowPw] = useState(false);
 
   const [msg, setMsg] = useState<string>("");
   const [loading, setLoading] = useState(false);
@@ -78,6 +78,7 @@ export default function LoginClient() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ id: loginId, pw: loginPw, next }),
         cache: "no-store",
+        credentials: "include",
       });
 
       const text = await res.text();
@@ -99,6 +100,7 @@ export default function LoginClient() {
       if (!data.ok) {
         const err = s((data as any)?.error) || "LOGIN_FAILED";
         setMsg(friendlyError(err));
+        pwRef.current?.focus();
         return;
       }
 
@@ -187,11 +189,7 @@ export default function LoginClient() {
             </div>
           </div>
 
-          <div
-            className="h-11 w-11 rounded-2xl border border-white/10 bg-white/5 grid place-items-center"
-            aria-hidden
-            title="Exam"
-          >
+          <div className="h-11 w-11 rounded-2xl border border-white/10 bg-white/5 grid place-items-center" aria-hidden title="Exam">
             <span className="text-lg">📝</span>
           </div>
         </div>
@@ -214,34 +212,20 @@ export default function LoginClient() {
           <div>
             <label className="block text-xs text-white/80 mb-2">비밀번호</label>
 
-            <div className="relative">
-              <input
-                ref={pwRef}
-                style={inputBase}
-                className="smooth focusGlow w-full h-[46px] rounded-[14px] border border-white/10 bg-white/5 px-3 pr-16 text-white placeholder-white/40"
-                placeholder="비밀번호"
-                value={pw}
-                onChange={(e) => setPw(e.target.value)}
-                type={showPw ? "text" : "password"}
-                autoComplete="current-password"
-              />
-
-              <button
-                type="button"
-                onClick={() => setShowPw((v) => !v)}
-                className="smooth hoverLift absolute right-2 top-1/2 -translate-y-1/2 h-9 px-3 rounded-xl border border-white/10 bg-white/5 text-xs text-white/80 hover:bg-white/10"
-                aria-label={showPw ? "비밀번호 숨기기" : "비밀번호 보기"}
-              >
-                {showPw ? "숨김" : "보기"}
-              </button>
-            </div>
+            {/* ✅ 보기 버튼 제거 + input 1개만 유지 */}
+            <input
+              ref={pwRef}
+              style={inputBase}
+              className="smooth focusGlow w-full h-[46px] rounded-[14px] border border-white/10 bg-white/5 px-3 text-white placeholder-white/40"
+              placeholder="비밀번호"
+              value={pw}
+              onChange={(e) => setPw(e.target.value)}
+              type="password"
+              autoComplete="current-password"
+            />
           </div>
 
-          {msg ? (
-            <div className="rounded-2xl border border-rose-300/20 bg-rose-500/10 px-3 py-2 text-sm text-rose-100">
-              {msg}
-            </div>
-          ) : null}
+          {msg ? <div className="rounded-2xl border border-rose-300/20 bg-rose-500/10 px-3 py-2 text-sm text-rose-100">{msg}</div> : null}
 
           <button type="submit" disabled={!canSubmit} style={buttonStyle} className="smooth hoverLift">
             {loading ? (
