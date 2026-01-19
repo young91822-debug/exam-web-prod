@@ -43,17 +43,30 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
-export async function GET(_req: NextRequest, context: { params: Promise<{ attemptId: string }> }) {
+function isInvalidSyntaxForType(err: any, typeName: "bigint" | "uuid") {
+  const msg = String(err?.message ?? "");
+  // Postgres: invalid input syntax for type bigint/uuid
+  return msg.includes("invalid input syntax for type") && msg.includes(typeName);
+}
+
+export async function GET(
+  _req: NextRequest,
+  context: { params: Promise<{ attemptId: string }> }
+) {
   try {
     const { attemptId: raw } = await context.params;
     const attemptIdStr = s(raw);
 
-    if (!attemptIdStr) return NextResponse.json({ ok: false, error: "MISSING_ATTEMPT_ID" }, { status: 400 });
-    if (!isNumericIdStr(attemptIdStr)) return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
+    if (!attemptIdStr) {
+      return NextResponse.json({ ok: false, error: "MISSING_ATTEMPT_ID" }, { status: 400 });
+    }
+    if (!isNumericIdStr(attemptIdStr)) {
+      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
+    }
 
     const attemptId = Number(attemptIdStr);
 
-    // 1) attempt (uuid 포함)
+    // 1) attempt
     const { data: attempt, error: e1 } = await sb
       .from("exam_attempts")
       .select("*")
@@ -64,42 +77,73 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
     if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
 
     const attemptUuid = s((attempt as any)?.uuid);
+
     const qids: string[] = Array.isArray((attempt as any)?.question_ids)
       ? (attempt as any).question_ids.map((x: any) => s(x)).filter(Boolean)
       : [];
 
     const uniqQids = Array.from(new Set(qids)).filter(Boolean);
 
-    // 2) answers: attempt_answers(uuid) 우선
+    // 2) answers: 기본은 attempt_id = 숫자(attemptId)로 조회 (현재 네 DB가 이 케이스)
     const ansMap = new Map<string, number>();
     let answersSource = "none";
 
-    if (isUUIDStr(attemptUuid)) {
+    // (A) bigint attempt_id로 시도
+    {
       const { data: aRows, error: aErr } = await sb
+        .from("attempt_answers")
+        .select("question_id, selected_index")
+        .eq("attempt_id", attemptId);
+
+      if (aErr) {
+        // 혹시 attempt_id가 uuid 타입인 환경이면 숫자 조회가 22P02(uuid)로 터질 수 있음 -> (B)로 재시도
+        if (!isInvalidSyntaxForType(aErr, "uuid")) {
+          return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: aErr }, { status: 500 });
+        }
+      } else {
+        for (const a of aRows ?? []) {
+          const qid = s((a as any)?.question_id);
+          const sel = (a as any)?.selected_index;
+          if (!qid) continue;
+          if (sel === null || sel === undefined) continue;
+          ansMap.set(qid, Number(sel));
+        }
+        if (ansMap.size > 0) answersSource = "attempt_answers(bigint)";
+      }
+    }
+
+    // (B) fallback: attempt_id가 uuid 타입인 옛 환경 대비 (uuid가 유효할 때만)
+    if (ansMap.size === 0 && isUUIDStr(attemptUuid)) {
+      const { data: aRows2, error: aErr2 } = await sb
         .from("attempt_answers")
         .select("question_id, selected_index")
         .eq("attempt_id", attemptUuid);
 
-      if (aErr) return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: aErr }, { status: 500 });
-
-      for (const a of aRows ?? []) {
-        const qid = s((a as any)?.question_id);
-        const sel = (a as any)?.selected_index;
-        if (!isUUIDStr(qid)) continue;
-        if (sel === null || sel === undefined) continue;
-        ansMap.set(qid, Number(sel));
+      if (aErr2) {
+        // 반대로 bigint 타입인데 uuid로 조회하면 22P02(bigint)로 터질 수 있는데, 이건 그냥 무시하고 JSON fallback로 간다
+        if (!isInvalidSyntaxForType(aErr2, "bigint")) {
+          return NextResponse.json({ ok: false, error: "ANSWERS_QUERY_FAILED", detail: aErr2 }, { status: 500 });
+        }
+      } else {
+        for (const a of aRows2 ?? []) {
+          const qid = s((a as any)?.question_id);
+          const sel = (a as any)?.selected_index;
+          if (!qid) continue;
+          if (sel === null || sel === undefined) continue;
+          ansMap.set(qid, Number(sel));
+        }
+        if (ansMap.size > 0) answersSource = "attempt_answers(uuid)";
       }
-      if (ansMap.size > 0) answersSource = "attempt_answers(uuid)";
     }
 
-    // 3) fallback: attempt.answers(JSON)
+    // (C) fallback: attempt.answers(JSON)
     if (ansMap.size === 0 && (attempt as any)?.answers && typeof (attempt as any).answers === "object") {
       const rawA = (attempt as any).answers?.map ?? (attempt as any).answers;
       if (rawA && typeof rawA === "object") {
         for (const [k, v] of Object.entries(rawA)) {
           const qid = s(k);
           const sel = n(v, null);
-          if (!isUUIDStr(qid)) continue;
+          if (!qid) continue;
           if (sel === null) continue;
           ansMap.set(qid, Number(sel));
         }
@@ -107,7 +151,7 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
       }
     }
 
-    // 4) questions
+    // 3) questions
     const { data: questions, error: eQ } = uniqQids.length
       ? await sb.from("questions").select("*").in("id", uniqQids as any)
       : { data: [], error: null as any };
@@ -117,7 +161,7 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
     const qById = new Map<string, any>();
     for (const q of questions ?? []) qById.set(s((q as any)?.id), q);
 
-    // 5) graded + 점수
+    // 4) grading
     let score = 0;
     let totalPoints = 0;
 
@@ -174,6 +218,9 @@ export async function GET(_req: NextRequest, context: { params: Promise<{ attemp
       totalPoints,
     });
   } catch (err: any) {
-    return NextResponse.json({ ok: false, error: "UNEXPECTED_ERROR", detail: String(err?.message ?? err) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: "UNEXPECTED_ERROR", detail: String(err?.message ?? err) },
+      { status: 500 }
+    );
   }
 }
