@@ -94,7 +94,8 @@ function parseCSV(text: string) {
       if (ch === "\r" && text[i + 1] === "\n") i++;
       row.push(cur);
       cur = "";
-      if (row.length > 1 || (row.length === 1 && row[0].trim() !== "")) rows.push(row);
+      if (row.length > 1 || (row.length === 1 && row[0].trim() !== ""))
+        rows.push(row);
       row = [];
       continue;
     }
@@ -103,7 +104,8 @@ function parseCSV(text: string) {
   }
 
   row.push(cur);
-  if (row.length > 1 || (row.length === 1 && row[0].trim() !== "")) rows.push(row);
+  if (row.length > 1 || (row.length === 1 && row[0].trim() !== ""))
+    rows.push(row);
   return rows;
 }
 
@@ -293,7 +295,11 @@ export default function QuestionsAdminPage() {
       }
 
       if (!res.ok || !json?.ok) {
-        const msg = json?.detail || json?.error || (raw ? raw.slice(0, 300) : "") || `HTTP_${res.status}`;
+        const msg =
+          json?.detail ||
+          json?.error ||
+          (raw ? raw.slice(0, 300) : "") ||
+          `HTTP_${res.status}`;
         setErr(`CLEAR_FAILED: ${msg}`);
         return;
       }
@@ -335,7 +341,9 @@ export default function QuestionsAdminPage() {
       }
 
       if (!res.ok || !json?.ok) {
-        setErr(`UPLOAD_FAILED: ${json?.detail || json?.error || raw?.slice(0, 300) || res.status}`);
+        setErr(
+          `UPLOAD_FAILED: ${json?.detail || json?.error || raw?.slice(0, 300) || res.status}`
+        );
         return;
       }
 
@@ -347,20 +355,29 @@ export default function QuestionsAdminPage() {
   }
 
   return (
+    // ✅ 배경은 AdminLayout에서 통일하므로 여기서 배경/색상 강제 금지
     <div
       style={{
         minHeight: "100vh",
-        padding: 24,
         fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
-        background: "#f7f8fb",
-        color: "#111827",
+        color: "inherit",
       }}
     >
       <div style={{ maxWidth: 1300, margin: "0 auto" }}>
         {/* Header */}
-        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-end",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+          }}
+        >
           <div>
-            <div style={{ fontSize: 26, fontWeight: 950, letterSpacing: -0.3 }}>시험문항 관리</div>
+            <div style={{ fontSize: 26, fontWeight: 950, letterSpacing: -0.3, color: "#e5e7eb" }}>
+              시험문항 관리
+            </div>
             <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
               <Chip label={`총 ${total}건`} />
               <Chip label={`현재 ${items.length}건`} />
@@ -401,11 +418,12 @@ export default function QuestionsAdminPage() {
               marginTop: 14,
               padding: 12,
               borderRadius: 14,
-              border: "1px solid #fecaca",
-              background: "#fff1f2",
+              border: "1px solid rgba(254, 202, 202, 0.8)",
+              background: "rgba(255, 241, 242, 0.95)",
               color: "#9f1239",
-              fontWeight: 800,
+              fontWeight: 900,
               whiteSpace: "pre-wrap",
+              boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
             }}
           >
             {err}
@@ -417,10 +435,11 @@ export default function QuestionsAdminPage() {
           style={{
             marginTop: 16,
             borderRadius: 18,
-            border: "1px solid #e5e7eb",
-            background: "white",
+            border: "1px solid rgba(255,255,255,0.10)",
+            background: "rgba(255,255,255,0.98)",
             overflow: "hidden",
-            boxShadow: "0 18px 60px rgba(17,24,39,0.08)",
+            boxShadow: "0 18px 60px rgba(0,0,0,0.35)",
+            backdropFilter: "blur(6px)",
           }}
         >
           <div style={{ overflowX: "auto" }}>
@@ -530,7 +549,7 @@ export default function QuestionsAdminPage() {
               이전
             </button>
 
-            <span style={{ fontSize: 13, color: "#6b7280", fontWeight: 800 }}>
+            <span style={{ fontSize: 13, color: "#6b7280", fontWeight: 900 }}>
               {page} / {totalPages}
             </span>
 
@@ -565,12 +584,13 @@ function Chip({ label }: { label: string }) {
         alignItems: "center",
         padding: "6px 10px",
         borderRadius: 999,
-        border: "1px solid #e5e7eb",
-        background: "white",
-        color: "#111827",
+        border: "1px solid rgba(255,255,255,0.14)",
+        background: "rgba(255,255,255,0.08)",
+        color: "#e5e7eb",
         fontSize: 12,
-        fontWeight: 900,
-        boxShadow: "0 1px 0 rgba(0,0,0,0.02)",
+        fontWeight: 950,
+        boxShadow: "0 1px 0 rgba(0,0,0,0.18)",
+        backdropFilter: "blur(6px)",
       }}
     >
       {label}
@@ -662,22 +682,24 @@ function btn(variant: "primary" | "danger" | "ghost", disabled: boolean): React.
     gap: 8,
     padding: "10px 12px",
     borderRadius: 12,
-    border: "1px solid #e5e7eb",
-    background: "white",
+    border: "1px solid rgba(255,255,255,0.16)",
+    background: "rgba(255,255,255,0.08)",
     cursor: disabled ? "not-allowed" : "pointer",
     opacity: disabled ? 0.6 : 1,
     fontWeight: 950,
     fontSize: 13,
     userSelect: "none",
+    color: "#e5e7eb",
+    backdropFilter: "blur(6px)",
   };
 
   if (variant === "primary") {
-    return { ...base, border: "1px solid #c7d2fe", background: "#eef2ff", color: "#1e3a8a" };
+    return { ...base, border: "1px solid rgba(199, 210, 254, 0.35)", background: "rgba(238, 242, 255, 0.14)" };
   }
   if (variant === "danger") {
-    return { ...base, border: "1px solid #fecaca", background: "#fff1f2", color: "#9f1239" };
+    return { ...base, border: "1px solid rgba(254, 202, 202, 0.45)", background: "rgba(255, 241, 242, 0.18)" };
   }
-  return { ...base, background: "white", color: "#111827" };
+  return base;
 }
 
 function miniBtn(): React.CSSProperties {
@@ -689,6 +711,7 @@ function miniBtn(): React.CSSProperties {
     cursor: "pointer",
     fontWeight: 950,
     fontSize: 13,
+    color: "#111827",
   };
 }
 
@@ -702,5 +725,6 @@ function pagerBtn(disabled: boolean): React.CSSProperties {
     opacity: disabled ? 0.55 : 1,
     fontWeight: 950,
     fontSize: 13,
+    color: "#111827",
   };
 }
