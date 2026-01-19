@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+/* Tailwind v4 기본 레이어 */
+@layer base {
+  html, body {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+  }
+}
