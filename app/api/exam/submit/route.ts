@@ -99,7 +99,6 @@ export async function POST(req: NextRequest) {
     const body = await readBody(req);
     const isAuto = !!body?.isAuto;
 
-    // ✅ attemptId(숫자)
     const attemptIdRaw = body?.attemptId ?? body?.attempt_id ?? body?.id ?? null;
     if (!isNumericId(attemptIdRaw)) {
       return NextResponse.json(
@@ -109,7 +108,6 @@ export async function POST(req: NextRequest) {
     }
     const attemptId = Number(attemptIdRaw);
 
-    // ✅ answers map
     const answersObj = body?.answers ?? body?.answerMap ?? body?.selected ?? body?.items ?? {};
     const answersMap: Record<string, number> = {};
     if (answersObj && typeof answersObj === "object" && !Array.isArray(answersObj)) {
@@ -126,7 +124,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "NO_ANSWERS" }, { status: 400 });
     }
 
-    // 1) attempt 조회
     const { data: attempt, error: aErr } = await sb
       .from("exam_attempts")
       .select("*")
@@ -136,7 +133,6 @@ export async function POST(req: NextRequest) {
     if (aErr) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: aErr }, { status: 500 });
     if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
 
-    // 2) attemptUuid는 "로그/보조" 용도로만 유지(선택)
     let attemptUuid =
       s(body?.attemptUuid ?? body?.attempt_uuid ?? "") ||
       s(req.cookies.get("attemptUuid")?.value) ||
@@ -146,23 +142,20 @@ export async function POST(req: NextRequest) {
       attemptUuid = crypto.randomUUID();
       const { error: uErr } = await sb.from("exam_attempts").update({ uuid: attemptUuid }).eq("id", attemptId);
       if (uErr) {
-        // uuid 컬럼 없을 수도 있으니 무시하고 진행
+        // ignore
       }
     }
 
-    // 3) team 결정
     const empIdCookie = s(req.cookies.get("empId")?.value);
     const teamCookie = s(req.cookies.get("team")?.value);
     const team = s((attempt as any)?.team) || teamCookie || (empIdCookie === "admin_gs" ? "B" : "A");
 
-    // 4) question_ids
     const questionIds: string[] = Array.isArray((attempt as any)?.question_ids)
       ? (attempt as any).question_ids.map((x: any) => s(x)).filter(Boolean)
       : [];
 
     const uniqQids = Array.from(new Set(questionIds)).filter(Boolean);
 
-    // 5) questions 조회
     const { data: questions, error: qErr } = uniqQids.length
       ? await sb.from("questions").select("*").in("id", uniqQids as any)
       : { data: [], error: null as any };
@@ -172,7 +165,6 @@ export async function POST(req: NextRequest) {
     const qById = new Map<string, any>();
     for (const q of questions ?? []) qById.set(String((q as any).id), q);
 
-    // 6) 채점 + rows
     let score = 0;
     let totalPoints = 0;
     let wrongCount = 0;
@@ -197,7 +189,6 @@ export async function POST(req: NextRequest) {
       if (isCorrect) score += point;
       else wrongCount += 1;
 
-      // ✅✅✅ 핵심: attempt_answers.attempt_id = 숫자 attemptId
       rowsToInsert.push({
         attempt_id: attemptId,
         question_id: qid,
@@ -207,7 +198,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 7) 저장 (숫자 attemptId)
     const { error: delErr } = await sb.from("attempt_answers").delete().eq("attempt_id", attemptId);
     if (delErr) return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
 
@@ -221,7 +211,6 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 8) attempt 업데이트
     const nowIso = new Date().toISOString();
     const patch: any = {
       submitted_at: nowIso,
@@ -246,7 +235,8 @@ export async function POST(req: NextRequest) {
       wrongCount,
       savedAnswers: rowsToInsert.length,
       isAuto,
-      redirectUrl: `/exam/result/${attemptId}`,
+      // ✅ 여기만 바꿈: 결과는 /result/:id
+      redirectUrl: `/result/${attemptId}`,
     });
   } catch (e: any) {
     return NextResponse.json(

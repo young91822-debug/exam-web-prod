@@ -32,6 +32,11 @@ function getCookie(cookieHeader: string, name: string) {
   return "";
 }
 
+function isMissingColumnMsg(msg: string, col: string) {
+  const low = msg.toLowerCase();
+  return (low.includes(col.toLowerCase()) && low.includes("does not exist")) || msg.includes(`Could not find the '${col}' column`);
+}
+
 /**
  * ✅ accounts 스키마가 환경마다 달라도 동작하게:
  * - username / is_active 없어도 OK
@@ -39,11 +44,9 @@ function getCookie(cookieHeader: string, name: string) {
  */
 async function getAccountSafe(empId: string) {
   const tries = [
-    // 최신(있으면)
     { cols: "emp_id,team,username,is_active,role" },
     { cols: "emp_id,team,username,role" },
     { cols: "emp_id,team,is_active,role" },
-    // 최소(지금 네 DB에 있을 법한)
     { cols: "emp_id,team,password" },
     { cols: "emp_id,team" },
   ];
@@ -56,10 +59,9 @@ async function getAccountSafe(empId: string) {
       .maybeSingle();
 
     if (!res.error) return { data: res.data, error: null };
+
     const msg = String(res.error?.message || res.error);
-    // 컬럼 없음이면 다음 조합으로 재시도
     if (msg.includes("does not exist") || msg.includes("column")) continue;
-    // 그 외 에러는 바로 반환
     return { data: null, error: res.error };
   }
   return { data: null, error: null };
@@ -83,12 +85,10 @@ async function requireAdminTeam(req: Request) {
     };
   }
 
-  // accounts에 관리자 row가 없어도(최악) 화면이 죽지 않게 기본 A로
-  const team = String((data as any)?.team ?? "").trim() || "A";
+  // accounts에 관리자 row가 없어도 기본 A
+  const team = String((data as any)?.team ?? "").trim() || (empId === "admin_gs" ? "B" : "A");
 
-  // is_active 없으면 그냥 활성으로 간주
-  const isActiveVal =
-    (data as any)?.is_active ?? (data as any)?.active ?? (data as any)?.enabled ?? null;
+  const isActiveVal = (data as any)?.is_active ?? (data as any)?.active ?? (data as any)?.enabled ?? null;
   if (isActiveVal === false) return { ok: false as const, status: 403, error: "ACCOUNT_DISABLED" };
 
   return { ok: true as const, team, empId };
@@ -123,10 +123,7 @@ export async function GET(req: Request) {
   try {
     const auth = await requireAdminTeam(req);
     if (!auth.ok) {
-      return NextResponse.json(
-        { ok: false, error: auth.error, detail: (auth as any).detail },
-        { status: auth.status }
-      );
+      return NextResponse.json({ ok: false, error: auth.error, detail: (auth as any).detail }, { status: auth.status });
     }
 
     const url = new URL(req.url);
@@ -137,29 +134,54 @@ export async function GET(req: Request) {
     const from = (page - 1) * pageSize;
     const to = from + pageSize - 1;
 
-    // 1) 총 개수 (내 팀만)
-    let countQuery = sb.from(TABLE).select(COL_ID, { count: "exact", head: true }).eq(COL_TEAM, auth.team);
+    // 1) 총 개수 (내 팀만) - team 컬럼 없을 수도 있어 fallback
+    let countQuery = sb.from(TABLE).select(COL_ID, { count: "exact", head: true });
+    try {
+      countQuery = countQuery.eq(COL_TEAM, auth.team);
+    } catch {}
     if (!includeOff) countQuery = applyActiveOnlyFilter(countQuery);
 
-    const { count, error: countErr } = await countQuery;
-    if (countErr) {
+    let countRes = await countQuery;
+    if (countRes.error) {
+      const msg = String(countRes.error?.message || countRes.error);
+      // team 컬럼 없으면 team 필터 제거하고 재시도
+      if (isMissingColumnMsg(msg, COL_TEAM)) {
+        let cq2 = sb.from(TABLE).select(COL_ID, { count: "exact", head: true });
+        if (!includeOff) cq2 = applyActiveOnlyFilter(cq2);
+        countRes = await cq2;
+      }
+    }
+
+    if (countRes.error) {
       return NextResponse.json(
-        { ok: false, error: "QUESTIONS_COUNT_FAILED", detail: String(countErr.message || countErr) },
+        { ok: false, error: "QUESTIONS_COUNT_FAILED", detail: String(countRes.error.message || countRes.error) },
         { status: 500 }
       );
     }
 
-    // 2) 리스트 (내 팀만)
+    // 2) 리스트 (내 팀만) - team 컬럼 없을 수도 있어 fallback
     const selectCols = [COL_ID, COL_CONTENT, COL_POINTS, COL_ACTIVE].join(",");
 
-    let listQuery = sb.from(TABLE).select(selectCols).eq(COL_TEAM, auth.team);
+    let listQuery = sb.from(TABLE).select(selectCols);
+    try {
+      listQuery = listQuery.eq(COL_TEAM, auth.team);
+    } catch {}
     if (!includeOff) listQuery = applyActiveOnlyFilter(listQuery);
 
-    const { data, error } = await listQuery.order(COL_ID, { ascending: false }).range(from, to);
+    let listRes = await listQuery.order(COL_ID, { ascending: false }).range(from, to);
 
-    if (error) {
+    if (listRes.error) {
+      const msg = String(listRes.error?.message || listRes.error);
+      if (isMissingColumnMsg(msg, COL_TEAM)) {
+        let lq2 = sb.from(TABLE).select(selectCols);
+        if (!includeOff) lq2 = applyActiveOnlyFilter(lq2);
+        listRes = await lq2.order(COL_ID, { ascending: false }).range(from, to);
+      }
+    }
+
+    if (listRes.error) {
       return NextResponse.json(
-        { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String(error.message || error) },
+        { ok: false, error: "QUESTIONS_QUERY_FAILED", detail: String(listRes.error.message || listRes.error) },
         { status: 500 }
       );
     }
@@ -170,15 +192,12 @@ export async function GET(req: Request) {
       page,
       pageSize,
       includeOff,
-      total: count ?? 0,
-      items: data ?? [],
-      marker: "ADMIN_QUESTIONS_LIST_TEAM_v2_SCHEMA_SAFE",
+      total: countRes.count ?? 0,
+      items: listRes.data ?? [],
+      marker: "ADMIN_QUESTIONS_LIST_TEAM_v3_WITH_DELETE_ALL",
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "QUESTIONS_API_ERROR", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "QUESTIONS_API_ERROR", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }
 
@@ -186,10 +205,7 @@ export async function POST(req: Request) {
   try {
     const auth = await requireAdminTeam(req);
     if (!auth.ok) {
-      return NextResponse.json(
-        { ok: false, error: auth.error, detail: (auth as any).detail },
-        { status: auth.status }
-      );
+      return NextResponse.json({ ok: false, error: auth.error, detail: (auth as any).detail }, { status: auth.status });
     }
 
     const body = await readBody(req);
@@ -197,9 +213,7 @@ export async function POST(req: Request) {
     const points = Number(body.points);
     const is_active = body.is_active === false ? false : true;
 
-    const choices = Array.isArray(body.choices)
-      ? body.choices.map((x: any) => s(x)).filter((x: string) => x !== "")
-      : [];
+    const choices = Array.isArray(body.choices) ? body.choices.map((x: any) => s(x)).filter((x: string) => x !== "") : [];
 
     if (!content) return NextResponse.json({ ok: false, error: "MISSING_CONTENT" }, { status: 400 });
     if (choices.length < 2) return NextResponse.json({ ok: false, error: "MISSING_CHOICES" }, { status: 400 });
@@ -220,18 +234,12 @@ export async function POST(req: Request) {
 
     const { data, error } = await sb.from(TABLE).insert(insertRow).select("id, content, points, is_active").maybeSingle();
     if (error) {
-      return NextResponse.json(
-        { ok: false, error: "QUESTION_INSERT_FAILED", detail: String(error.message || error) },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "QUESTION_INSERT_FAILED", detail: String(error.message || error) }, { status: 500 });
     }
 
-    return NextResponse.json({ ok: true, team: auth.team, item: data, marker: "ADMIN_QUESTIONS_CREATE_TEAM_v2_SCHEMA_SAFE" });
+    return NextResponse.json({ ok: true, team: auth.team, item: data, marker: "ADMIN_QUESTIONS_CREATE_TEAM_v3" });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "QUESTION_CREATE_FATAL", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "QUESTION_CREATE_FATAL", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }
 
@@ -239,10 +247,7 @@ export async function PATCH(req: Request) {
   try {
     const auth = await requireAdminTeam(req);
     if (!auth.ok) {
-      return NextResponse.json(
-        { ok: false, error: auth.error, detail: (auth as any).detail },
-        { status: auth.status }
-      );
+      return NextResponse.json({ ok: false, error: auth.error, detail: (auth as any).detail }, { status: auth.status });
     }
 
     const body = await readBody(req);
@@ -260,13 +265,16 @@ export async function PATCH(req: Request) {
     if (body.is_active !== undefined) updateRow.is_active = body.is_active === false ? false : true;
 
     if (body.choices !== undefined) {
-      const choices = Array.isArray(body.choices)
-        ? body.choices.map((x: any) => s(x)).filter((x: string) => x !== "")
-        : [];
+      const choices = Array.isArray(body.choices) ? body.choices.map((x: any) => s(x)).filter((x: string) => x !== "") : [];
       updateRow.choices = choices;
     }
 
-    if (body.correct_index !== undefined || body.answer_index !== undefined || body.answerIndex !== undefined || body.correctIndex !== undefined) {
+    if (
+      body.correct_index !== undefined ||
+      body.answer_index !== undefined ||
+      body.answerIndex !== undefined ||
+      body.correctIndex !== undefined
+    ) {
       const idxRaw = body.correct_index ?? body.answer_index ?? body.answerIndex ?? body.correctIndex;
       const idxNum = idxRaw === undefined || idxRaw === null || idxRaw === "" ? null : Number(idxRaw);
       const idx = Number.isFinite(idxNum) ? Math.trunc(idxNum) : null;
@@ -278,30 +286,23 @@ export async function PATCH(req: Request) {
       return NextResponse.json({ ok: false, error: "NO_FIELDS" }, { status: 400 });
     }
 
-    const { data, error } = await sb
-      .from(TABLE)
-      .update(updateRow)
-      .eq("id", id)
-      .eq(COL_TEAM, auth.team)
-      .select("id, content, points, is_active")
-      .maybeSingle();
-
-    if (error) {
-      return NextResponse.json(
-        { ok: false, error: "QUESTION_UPDATE_FAILED", detail: String(error.message || error) },
-        { status: 500 }
-      );
-    }
-    if (!data) {
-      return NextResponse.json({ ok: false, error: "NOT_FOUND_OR_NOT_MY_TEAM" }, { status: 404 });
+    // team 컬럼 없을 수도 있어서 2단계로 시도
+    let r = await sb.from(TABLE).update(updateRow).eq("id", id).eq(COL_TEAM, auth.team).select("id, content, points, is_active").maybeSingle();
+    if (r.error) {
+      const msg = String(r.error?.message || r.error);
+      if (isMissingColumnMsg(msg, COL_TEAM)) {
+        r = await sb.from(TABLE).update(updateRow).eq("id", id).select("id, content, points, is_active").maybeSingle();
+      }
     }
 
-    return NextResponse.json({ ok: true, team: auth.team, item: data, marker: "ADMIN_QUESTIONS_UPDATE_TEAM_v2_SCHEMA_SAFE" });
+    if (r.error) {
+      return NextResponse.json({ ok: false, error: "QUESTION_UPDATE_FAILED", detail: String(r.error.message || r.error) }, { status: 500 });
+    }
+    if (!r.data) return NextResponse.json({ ok: false, error: "NOT_FOUND" }, { status: 404 });
+
+    return NextResponse.json({ ok: true, team: auth.team, item: r.data, marker: "ADMIN_QUESTIONS_UPDATE_TEAM_v3" });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "QUESTION_UPDATE_FATAL", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "QUESTION_UPDATE_FATAL", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }
 
@@ -309,37 +310,66 @@ export async function DELETE(req: Request) {
   try {
     const auth = await requireAdminTeam(req);
     if (!auth.ok) {
-      return NextResponse.json(
-        { ok: false, error: auth.error, detail: (auth as any).detail },
-        { status: auth.status }
-      );
+      return NextResponse.json({ ok: false, error: auth.error, detail: (auth as any).detail }, { status: auth.status });
     }
 
     const url = new URL(req.url);
+
+    // ✅✅✅ 전체삭제: /api/admin/questions?all=1 (&hard=1)
+    const all = boolParam(url.searchParams.get("all"), false);
+    const hard = boolParam(url.searchParams.get("hard"), false);
+
+    if (all) {
+      // 1) team 컬럼 있는 경우: 내 팀만
+      if (!hard) {
+        // 비활성화 전체
+        let r = await sb.from(TABLE).update({ is_active: false }).eq(COL_TEAM, auth.team);
+        if (r.error) {
+          const msg = String(r.error?.message || r.error);
+          if (isMissingColumnMsg(msg, COL_TEAM)) {
+            // team 컬럼 없으면 전부 비활성화(최후수단)
+            r = await sb.from(TABLE).update({ is_active: false });
+          }
+        }
+        if (r.error) {
+          return NextResponse.json({ ok: false, error: "DELETE_ALL_FAILED", detail: String(r.error.message || r.error) }, { status: 500 });
+        }
+        return NextResponse.json({ ok: true, mode: "soft", team: auth.team, marker: "ADMIN_QUESTIONS_DELETE_ALL_v3" });
+      } else {
+        // 실제 삭제 전체
+        let r = await sb.from(TABLE).delete().eq(COL_TEAM, auth.team);
+        if (r.error) {
+          const msg = String(r.error?.message || r.error);
+          if (isMissingColumnMsg(msg, COL_TEAM)) {
+            r = await sb.from(TABLE).delete();
+          }
+        }
+        if (r.error) {
+          return NextResponse.json({ ok: false, error: "HARD_DELETE_ALL_FAILED", detail: String(r.error.message || r.error) }, { status: 500 });
+        }
+        return NextResponse.json({ ok: true, mode: "hard", team: auth.team, marker: "ADMIN_QUESTIONS_HARD_DELETE_ALL_v3" });
+      }
+    }
+
+    // ✅ 단일 삭제(비활성화)
     const id = url.searchParams.get("id");
     if (!id) return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
 
-    const { data, error } = await sb
-      .from(TABLE)
-      .update({ is_active: false })
-      .eq("id", id)
-      .eq(COL_TEAM, auth.team)
-      .select("id, is_active")
-      .maybeSingle();
-
-    if (error) {
-      return NextResponse.json(
-        { ok: false, error: "QUESTION_DELETE_FAILED", detail: String(error.message || error) },
-        { status: 500 }
-      );
+    let r = await sb.from(TABLE).update({ is_active: false }).eq("id", id).eq(COL_TEAM, auth.team).select("id, is_active").maybeSingle();
+    if (r.error) {
+      const msg = String(r.error?.message || r.error);
+      if (isMissingColumnMsg(msg, COL_TEAM)) {
+        r = await sb.from(TABLE).update({ is_active: false }).eq("id", id).select("id, is_active").maybeSingle();
+      }
     }
-    if (!data) return NextResponse.json({ ok: false, error: "NOT_FOUND_OR_NOT_MY_TEAM" }, { status: 404 });
 
-    return NextResponse.json({ ok: true, team: auth.team, item: data, marker: "ADMIN_QUESTIONS_DELETE_TEAM_v2_SCHEMA_SAFE" });
+    if (r.error) {
+      return NextResponse.json({ ok: false, error: "QUESTION_DELETE_FAILED", detail: String(r.error.message || r.error) }, { status: 500 });
+    }
+    if (!r.data) return NextResponse.json({ ok: false, error: "NOT_FOUND" }, { status: 404 });
+
+    return NextResponse.json({ ok: true, team: auth.team, item: r.data, marker: "ADMIN_QUESTIONS_DELETE_ONE_v3" });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "QUESTION_DELETE_FATAL", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "QUESTION_DELETE_FATAL", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }

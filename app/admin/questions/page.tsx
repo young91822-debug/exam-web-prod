@@ -94,8 +94,7 @@ function parseCSV(text: string) {
       if (ch === "\r" && text[i + 1] === "\n") i++;
       row.push(cur);
       cur = "";
-      if (row.length > 1 || (row.length === 1 && row[0].trim() !== ""))
-        rows.push(row);
+      if (row.length > 1 || (row.length === 1 && row[0].trim() !== "")) rows.push(row);
       row = [];
       continue;
     }
@@ -104,8 +103,7 @@ function parseCSV(text: string) {
   }
 
   row.push(cur);
-  if (row.length > 1 || (row.length === 1 && row[0].trim() !== ""))
-    rows.push(row);
+  if (row.length > 1 || (row.length === 1 && row[0].trim() !== "")) rows.push(row);
   return rows;
 }
 
@@ -247,7 +245,10 @@ export default function QuestionsAdminPage() {
     setLoading(true);
     try {
       const url = `/api/admin/questions?page=${p}&pageSize=${PAGE_SIZE}&includeOff=1`;
-      const res = await fetch(url, { cache: "no-store" });
+      const res = await fetch(url, {
+        cache: "no-store",
+        credentials: "include", // ✅ 쿠키 포함
+      });
       const json: ListRes = await res.json().catch(() => ({ ok: false } as any));
 
       if (!res.ok || !json?.ok) {
@@ -274,16 +275,18 @@ export default function QuestionsAdminPage() {
     router.push(`/admin/questions?page=${next}`);
   }
 
+  // ✅✅✅ 여기만 핵심 수정: /clear POST -> /questions DELETE?all=1
   async function onClearAll() {
-    if (!confirm("정말 전체 문항을 삭제할까요?")) return;
+    if (!confirm("정말 전체 문항을 삭제(비활성화)할까요?")) return;
 
     setErr("");
     setLoading(true);
 
     try {
-      const res = await fetch("/api/admin/questions/clear", {
-        method: "POST",
+      const res = await fetch("/api/admin/questions?all=1", {
+        method: "DELETE",
         cache: "no-store",
+        credentials: "include", // ✅ 쿠키 포함
       });
 
       const raw = await res.text();
@@ -305,6 +308,7 @@ export default function QuestionsAdminPage() {
       }
 
       router.push(`/admin/questions?page=1`);
+      router.refresh(); // ✅ 캐시/서버컴포넌트 갱신 보강
       await fetchList(1);
     } catch (e: any) {
       setErr(`CLEAR_FAILED: ${String(e?.message ?? e)}`);
@@ -330,6 +334,7 @@ export default function QuestionsAdminPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ rows }),
         cache: "no-store",
+        credentials: "include", // ✅ 쿠키 포함
       });
 
       const raw = await res.text();
@@ -341,13 +346,12 @@ export default function QuestionsAdminPage() {
       }
 
       if (!res.ok || !json?.ok) {
-        setErr(
-          `UPLOAD_FAILED: ${json?.detail || json?.error || raw?.slice(0, 300) || res.status}`
-        );
+        setErr(`UPLOAD_FAILED: ${json?.detail || json?.error || raw?.slice(0, 300) || res.status}`);
         return;
       }
 
       router.push(`/admin/questions?page=1`);
+      router.refresh(); // ✅ 업로드 후 목록 갱신 확실히
       await fetchList(1);
     } finally {
       setLoading(false);
@@ -355,7 +359,6 @@ export default function QuestionsAdminPage() {
   }
 
   return (
-    // ✅ 배경은 AdminLayout에서 통일하므로 여기서 배경/색상 강제 금지
     <div
       style={{
         minHeight: "100vh",
@@ -365,15 +368,7 @@ export default function QuestionsAdminPage() {
     >
       <div style={{ maxWidth: 1300, margin: "0 auto" }}>
         {/* Header */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "flex-end",
-            justifyContent: "space-between",
-            gap: 12,
-            flexWrap: "wrap",
-          }}
-        >
+        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
           <div>
             <div style={{ fontSize: 26, fontWeight: 950, letterSpacing: -0.3, color: "#e5e7eb" }}>
               시험문항 관리
@@ -445,14 +440,7 @@ export default function QuestionsAdminPage() {
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0, minWidth: 980 }}>
               <thead>
-                <tr
-                  style={{
-                    background: "#fbfbfd",
-                    position: "sticky",
-                    top: 0,
-                    zIndex: 1,
-                  }}
-                >
+                <tr style={{ background: "#fbfbfd", position: "sticky", top: 0, zIndex: 1 }}>
                   <Th w={160}>ID</Th>
                   <Th>문항</Th>
                   <Th w={90} center>
@@ -480,12 +468,7 @@ export default function QuestionsAdminPage() {
                     const on = q.is_active !== false;
 
                     return (
-                      <tr
-                        key={id}
-                        style={{
-                          borderTop: "1px solid #f3f4f6",
-                        }}
-                      >
+                      <tr key={id} style={{ borderTop: "1px solid #f3f4f6" }}>
                         <Td mono title={id}>
                           {shortId(id)}
                         </Td>

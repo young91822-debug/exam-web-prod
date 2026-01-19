@@ -24,6 +24,7 @@ type SubmitResp =
       correctCount?: number;
       wrongQuestionIds?: string[];
       debug?: any;
+      redirectUrl?: string; // ✅ 서버가 내려주는 리다이렉트 URL(있으면 사용)
     }
   | { ok: false; error: string; detail?: any };
 
@@ -93,19 +94,17 @@ export default function ExamClient() {
         const res = await fetch("/api/exam/start", {
           method: "POST",
           cache: "no-store",
-          credentials: "include", // ✅ 쿠키 강제 포함
+          credentials: "include",
         });
 
         const json: StartResp = await res.json().catch(() => ({} as any));
         const errCode = (json as any)?.error || "";
 
-        // ✅ 세션 없으면 로그인으로
         if (res.status === 401) {
           router.replace("/login?next=/exam");
           return;
         }
 
-        // ✅ 관리자 차단이면 관리자 페이지로
         if (res.status === 403 && errCode === "ADMIN_CANNOT_TAKE_EXAM") {
           router.replace("/admin");
           return;
@@ -179,7 +178,7 @@ export default function ExamClient() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
-        credentials: "include", // ✅ 쿠키 포함
+        credentials: "include",
         body: JSON.stringify({ attemptId, answers, isAuto }),
       });
 
@@ -196,8 +195,12 @@ export default function ExamClient() {
         throw new Error(detail ? `${msg}\n${safeText(detail)}` : msg);
       }
 
+      // ✅ 결과 페이지 경로 통일: /result/:id
       const id = String((json as any).attemptId ?? attemptId);
-      router.push(`/exam/result/${id}`);
+      const redirectUrl = String((json as any).redirectUrl ?? "").trim();
+
+      // 서버가 URL 내려주면 그걸 우선, 아니면 /result/:id
+      router.push(redirectUrl || `/result/${id}`);
     } catch (e: any) {
       submittingRef.current = false;
       setErrText(String(e?.message ?? e));
@@ -208,7 +211,6 @@ export default function ExamClient() {
   const total = questions.length || 0;
   const progress = total > 0 ? Math.round((answeredCount / total) * 100) : 0;
 
-  // --- UI styles ---
   const pageStyle: React.CSSProperties = {
     minHeight: "100vh",
     padding: 24,
@@ -290,14 +292,7 @@ export default function ExamClient() {
             </div>
           </div>
 
-          <div
-            style={{
-              display: "grid",
-              gap: 6,
-              justifyItems: "end",
-              minWidth: 220,
-            }}
-          >
+          <div style={{ display: "grid", gap: 6, justifyItems: "end", minWidth: 220 }}>
             <div style={{ fontSize: 12, color: "rgba(255,255,255,0.65)" }}>
               진행도: <b style={{ color: "white" }}>{answeredCount}</b> / <b style={{ color: "white" }}>{total}</b> ({progress}%)
             </div>
@@ -460,14 +455,7 @@ export default function ExamClient() {
         </div>
 
         {/* Sticky Submit */}
-        <div
-          style={{
-            position: "sticky",
-            bottom: 14,
-            marginTop: 16,
-            paddingTop: 8,
-          }}
-        >
+        <div style={{ position: "sticky", bottom: 14, marginTop: 16, paddingTop: 8 }}>
           <div
             style={{
               ...cardStyle,
