@@ -1,4 +1,4 @@
-// app/exam/result/[attemptId]/page.tsx
+// app/result/[attemptId]/page.tsx
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
@@ -54,7 +54,7 @@ function cls(...xs: (string | false | null | undefined)[]) {
   return xs.filter(Boolean).join(" ");
 }
 
-export default function ExamResultPage() {
+export default function ResultPage() {
   const router = useRouter();
   const params = useParams();
   const attemptId = s((params as any)?.attemptId);
@@ -119,12 +119,9 @@ export default function ExamResultPage() {
   const list = tab === "wrong" ? wrongOnly : graded;
 
   useEffect(() => {
-    // 기본: 오답 탭이면 오답 항목은 펼쳐두는 게 편함
     if (tab === "wrong" && wrongOnly.length > 0) {
       const next: Record<string, boolean> = {};
-      for (const g of wrongOnly.slice(0, 3)) {
-        next[String(g.questionId)] = true; // 처음 3개 정도만 자동 오픈
-      }
+      for (const g of wrongOnly.slice(0, 3)) next[String(g.questionId)] = true;
       setOpenMap((prev) => ({ ...next, ...prev }));
     }
   }, [tab, wrongOnly.length]);
@@ -133,180 +130,171 @@ export default function ExamResultPage() {
     setOpenMap((m) => ({ ...m, [key]: !m[key] }));
   }
 
-  if (loading) return <div className="p-6">불러오는 중…</div>;
+  if (loading) {
+    return (
+      <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+        <div className="max-w-5xl mx-auto p-6">불러오는 중…</div>
+      </div>
+    );
+  }
 
   if (err) {
     return (
-      <div className="p-6 max-w-3xl mx-auto space-y-3">
-        <div className="text-red-600 font-semibold">결과를 불러오지 못했습니다.</div>
-        <div className="text-sm text-gray-600">에러: {err}</div>
-        <button className="px-3 py-2 rounded border" onClick={() => router.refresh()}>
-          새로고침
-        </button>
+      <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+        <div className="max-w-3xl mx-auto p-6 space-y-3">
+          <div className="font-semibold text-red-300">결과를 불러오지 못했습니다.</div>
+          <div className="text-sm text-slate-300">에러: {err}</div>
+          <button
+            className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900"
+            onClick={() => router.refresh()}
+          >
+            새로고침
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="p-6 max-w-4xl mx-auto space-y-6">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-bold">시험 결과</h1>
-          <div className="text-sm text-gray-500">제출이 완료되었습니다.</div>
-        </div>
-        <div className="flex gap-2">
-          <a className="px-3 py-2 rounded-lg border text-sm bg-white hover:bg-gray-50" href="/exam">
-            다시 시험 보기
-          </a>
-        </div>
-      </div>
+    <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+      <div className="max-w-5xl mx-auto p-6 space-y-6">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h1 className="text-3xl font-extrabold tracking-tight">결과 상세</h1>
+            <div className="text-sm text-slate-300 mt-1">제출이 완료되었습니다.</div>
+          </div>
 
-      {/* Summary */}
-      <div className="border rounded-2xl p-5 bg-white shadow-sm space-y-4">
-        <div className="flex items-center justify-between">
-          <div className="text-lg font-semibold">요약</div>
-          <div className="text-sm text-gray-500">{percent}%</div>
+          <div className="flex gap-2">
+            <a
+              className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+              href="/exam"
+            >
+              다시 시험 보기
+            </a>
+          </div>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <div className="rounded-xl border p-3">
-            <div className="text-xs text-gray-500">점수</div>
-            <div className="text-lg font-bold">
-              {score} <span className="text-gray-400 font-medium">/ {totalPoints}</span>
+        {/* meta pills */}
+        <div className="flex flex-wrap gap-2">
+          <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
+            attemptId: {attemptId}
+          </span>
+          {s((attempt as any)?.emp_id) ? (
+            <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
+              응시자: {s((attempt as any)?.emp_id)}
+            </span>
+          ) : null}
+          <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
+            상태: {s((attempt as any)?.status) || "SUBMITTED"}
+          </span>
+        </div>
+
+        {/* Summary cards */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
+            <div className="text-sm text-slate-300">점수</div>
+            <div className="text-3xl font-extrabold mt-1">
+              {score} <span className="text-slate-400 text-base font-semibold">/ {totalPoints}</span>
+            </div>
+            <div className="mt-3 h-2 rounded-full bg-slate-800 overflow-hidden">
+              <div className="h-full bg-slate-200/70" style={{ width: `${percent}%` }} />
             </div>
           </div>
 
-          <div className="rounded-xl border p-3">
-            <div className="text-xs text-gray-500">정답</div>
-            <div className="text-lg font-bold">
-              {correctCount} <span className="text-gray-400 font-medium">/ {totalQuestions}</span>
+          <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
+            <div className="text-sm text-slate-300">정답률</div>
+            <div className="text-3xl font-extrabold mt-1">{percent}%</div>
+            <div className="text-sm text-slate-300 mt-2">
+              정답 {correctCount} / {totalQuestions} · 오답 {wrongCount}
             </div>
           </div>
 
-          <div className="rounded-xl border p-3">
-            <div className="text-xs text-gray-500">오답</div>
-            <div className="text-lg font-bold">{wrongCount}</div>
+          <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
+            <div className="text-sm text-slate-300">시작</div>
+            <div className="text-lg font-semibold mt-2">{fmt((attempt as any)?.started_at)}</div>
           </div>
 
-          <div className="rounded-xl border p-3">
-            <div className="text-xs text-gray-500">상태</div>
-            <div className="text-lg font-bold">{s((attempt as any)?.status) || "SUBMITTED"}</div>
+          <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
+            <div className="text-sm text-slate-300">제출</div>
+            <div className="text-lg font-semibold mt-2">{fmt((attempt as any)?.submitted_at)}</div>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
-          <div className="rounded-xl border p-3">
-            <div className="text-xs text-gray-500">응시 시작</div>
-            <div className="font-medium">{fmt((attempt as any)?.started_at)}</div>
+        {/* Controls */}
+        <div className="flex items-center justify-between gap-3">
+          <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60">
+            <input
+              type="checkbox"
+              checked={tab === "wrong"}
+              onChange={(e) => setTab(e.target.checked ? "wrong" : "all")}
+            />
+            <span className="text-sm font-semibold">틀린 문제만 보기</span>
+          </label>
+
+          <div className="flex items-center gap-2">
+            <button
+              className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+              onClick={() => {
+                const next = !openAll;
+                setOpenAll(next);
+                const m: Record<string, boolean> = {};
+                for (const g of list) m[String(g.questionId)] = next;
+                setOpenMap((prev) => ({ ...prev, ...m }));
+              }}
+            >
+              {openAll ? "모두 접기" : "모두 펼치기"}
+            </button>
+
+            <button
+              className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+              onClick={() => window.print()}
+            >
+              인쇄
+            </button>
           </div>
-          <div className="rounded-xl border p-3">
-            <div className="text-xs text-gray-500">제출 시각</div>
-            <div className="font-medium">{fmt((attempt as any)?.submitted_at)}</div>
-          </div>
-        </div>
-      </div>
-
-      {/* Tabs + controls */}
-      <div className="flex items-center justify-between gap-3">
-        <div className="inline-flex rounded-xl border bg-white p-1">
-          <button
-            className={cls(
-              "px-3 py-2 text-sm rounded-lg",
-              tab === "wrong" ? "bg-black text-white" : "text-gray-700 hover:bg-gray-50"
-            )}
-            onClick={() => setTab("wrong")}
-          >
-            오답만 ({wrongOnly.length})
-          </button>
-          <button
-            className={cls(
-              "px-3 py-2 text-sm rounded-lg",
-              tab === "all" ? "bg-black text-white" : "text-gray-700 hover:bg-gray-50"
-            )}
-            onClick={() => setTab("all")}
-          >
-            전체 ({graded.length})
-          </button>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            className="px-3 py-2 rounded-lg border text-sm bg-white hover:bg-gray-50"
-            onClick={() => {
-              // 전체 펼치기/접기
-              const next = !openAll;
-              setOpenAll(next);
-              const m: Record<string, boolean> = {};
-              for (const g of list) m[String(g.questionId)] = next;
-              setOpenMap((prev) => ({ ...prev, ...m }));
-            }}
-          >
-            {openAll ? "모두 접기" : "모두 펼치기"}
-          </button>
-          <button className="px-3 py-2 rounded-lg border text-sm bg-white hover:bg-gray-50" onClick={() => window.print()}>
-            인쇄
-          </button>
-        </div>
-      </div>
+        {/* Questions */}
+        {list.length === 0 ? (
+          <div className="text-sm text-slate-300">{tab === "wrong" ? "오답이 없습니다. 잘했어요!" : "표시할 문항이 없습니다."}</div>
+        ) : (
+          <div className="space-y-4">
+            {list.map((g, idx) => {
+              const key = String(g.questionId ?? idx);
+              const opened = !!openMap[key];
+              const selected = g.selectedIndex;
+              const correct = g.correctIndex;
+              const isCorrect = !!g.isCorrect;
 
-      {/* Questions */}
-      {list.length === 0 ? (
-        <div className="text-sm text-gray-600">
-          {tab === "wrong" ? "오답이 없습니다. 잘했어요!" : "표시할 문항이 없습니다."}
-        </div>
-      ) : (
-        <div className="space-y-3">
-          {list.map((g, idx) => {
-            const key = String(g.questionId ?? idx);
-            const opened = !!openMap[key];
-            const selected = g.selectedIndex;
-            const correct = g.correctIndex;
-
-            const isCorrect = !!g.isCorrect;
-
-            return (
-              <div key={key} className="border rounded-2xl bg-white shadow-sm overflow-hidden">
-                <button
-                  className="w-full text-left px-4 py-4 hover:bg-gray-50 flex items-start justify-between gap-3"
-                  onClick={() => toggleOne(key)}
-                >
-                  <div className="min-w-0">
-                    <div className="text-sm text-gray-500">Q{tab === "all" ? graded.findIndex((x) => String(x.questionId) === key) + 1 : idx + 1}</div>
-                    <div className="font-semibold leading-snug break-words">{g.content}</div>
-                  </div>
-                  <div
-                    className={cls(
-                      "shrink-0 px-3 py-1 rounded-full text-xs font-bold border",
-                      isCorrect
-                        ? "bg-green-50 text-green-700 border-green-200"
-                        : "bg-red-50 text-red-700 border-red-200"
-                    )}
+              return (
+                <div key={key} className="rounded-2xl border border-slate-700 bg-slate-900/60 overflow-hidden">
+                  <button
+                    className="w-full text-left px-4 py-4 hover:bg-slate-900 flex items-start justify-between gap-3"
+                    onClick={() => toggleOne(key)}
                   >
-                    {isCorrect ? "정답" : "오답"}
-                  </div>
-                </button>
-
-                {opened && (
-                  <div className="px-4 pb-4 space-y-3">
-                    {/* 내 선택 / 정답 */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
-                      <div className="rounded-xl border p-3">
-                        <div className="text-xs text-gray-500">내 선택</div>
-                        <div className="font-semibold">
-                          {selected === null || selected === undefined ? "-" : `${selected + 1}번`}
-                        </div>
-                      </div>
-                      <div className="rounded-xl border p-3">
-                        <div className="text-xs text-gray-500">정답</div>
-                        <div className="font-semibold">
-                          {correct === null || correct === undefined ? "-" : `${correct + 1}번`}
-                        </div>
+                    <div className="min-w-0">
+                      <div className="text-xs text-slate-400">Q{idx + 1}</div>
+                      <div className="font-semibold leading-snug break-words">{g.content}</div>
+                      <div className="text-xs text-slate-400 mt-2">
+                        선택: {selected === null || selected === undefined ? "-" : selected + 1} / 정답:{" "}
+                        {correct === null || correct === undefined ? "-" : correct + 1}
                       </div>
                     </div>
+                    <div
+                      className={cls(
+                        "shrink-0 px-3 py-1 rounded-full text-xs font-extrabold border",
+                        isCorrect
+                          ? "bg-emerald-900/40 text-emerald-200 border-emerald-700/60"
+                          : "bg-rose-900/40 text-rose-200 border-rose-700/60"
+                      )}
+                    >
+                      {isCorrect ? "정답" : "오답"}
+                    </div>
+                  </button>
 
-                    {/* 보기 리스트 */}
-                    <div className="space-y-2">
+                  {opened && (
+                    <div className="px-4 pb-4 space-y-2">
                       {(g.choices ?? []).map((c, i) => {
                         const mine = selected === i;
                         const ans = correct === i;
@@ -316,37 +304,32 @@ export default function ExamResultPage() {
                             key={i}
                             className={cls(
                               "rounded-xl border px-3 py-2 text-sm flex items-start gap-2",
-                              ans ? "border-green-300 bg-green-50" : "border-gray-200",
-                              mine && !ans ? "border-blue-300 bg-blue-50" : "",
-                              mine && ans ? "border-green-400 bg-green-50" : ""
+                              "border-slate-700 bg-slate-950/30",
+                              ans ? "border-emerald-700/60 bg-emerald-900/20" : "",
+                              mine && !ans ? "border-amber-700/60 bg-amber-900/20" : ""
                             )}
                           >
-                            <div className="shrink-0 w-6 text-gray-500 font-semibold">{i + 1}.</div>
+                            <div className="shrink-0 w-6 text-slate-400 font-semibold">{i + 1}.</div>
                             <div className="min-w-0 break-words">
                               <div>{c}</div>
-                              <div className="mt-1 text-xs text-gray-500">
+                              <div className="mt-1 text-xs text-slate-400">
                                 {ans ? "정답" : ""}
-                                {mine ? (ans ? (ans ? " · 내 선택" : "내 선택") : " · 내 선택") : ""}
+                                {mine ? (ans ? " · 내 선택" : " · 내 선택") : ""}
                               </div>
                             </div>
                           </div>
                         );
                       })}
-                    </div>
 
-                    {/* 점수(있으면) */}
-                    <div className="text-xs text-gray-500">
-                      배점: {Number.isFinite(Number(g.points)) ? g.points : 0}점
+                      <div className="text-xs text-slate-400 mt-2">배점: {Number.isFinite(Number(g.points)) ? g.points : 0}점</div>
                     </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      <div className="text-xs text-gray-400">attemptId: {attemptId}</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
