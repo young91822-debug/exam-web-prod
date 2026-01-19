@@ -28,6 +28,10 @@ function n(v: any, d: number | null = null) {
 function isNumericId(x: any) {
   return /^\d+$/.test(s(x));
 }
+function isUuid(x: any) {
+  const t = s(x);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(t);
+}
 
 async function readBody(req: Request): Promise<any> {
   try {
@@ -86,8 +90,6 @@ async function safeUpdateAttempt(client: any, attemptId: number, patch: Record<s
         continue;
       }
 
-      // ✅ fallback에서 total_points를 먼저 빼버리면 또 25/0 같은 값 나옴
-      // 그래서 total_points는 fallback에서 제외
       const fallback = ["wrong_count", "status", "team", "answers", "total_questions", "score", "submitted_at"];
       const rm = fallback.find((x) => keys.includes(x));
       if (rm) {
@@ -102,6 +104,34 @@ async function safeUpdateAttempt(client: any, attemptId: number, patch: Record<s
   return { ok: false as const, error: "UPDATE_TRIES_EXCEEDED" as any };
 }
 
+/** ✅ attempt_answers(attempt_id uuid)을 위해 attempt uuid 찾기 */
+function pickAttemptUuid(req: NextRequest, attempt: any) {
+  // 1) 쿠키 후보들
+  const cookieCands = [
+    req.cookies.get("attempt_uuid")?.value,
+    req.cookies.get("attemptUuid")?.value,
+    req.cookies.get("attempt_id_uuid")?.value,
+    req.cookies.get("attemptIdUuid")?.value,
+    req.cookies.get("attempt_uid")?.value,
+  ].map(s).filter(Boolean);
+
+  for (const v of cookieCands) if (isUuid(v)) return s(v);
+
+  // 2) attempt row 후보들 (컬럼명이 뭐였든 최대한 흡수)
+  const rowCands = [
+    attempt?.attempt_uuid,
+    attempt?.attemptUuid,
+    attempt?.uuid,
+    attempt?.attempt_id_uuid,
+    attempt?.attemptIdUuid,
+    attempt?.uid,
+  ].map(s).filter(Boolean);
+
+  for (const v of rowCands) if (isUuid(v)) return s(v);
+
+  return "";
+}
+
 export async function POST(req: NextRequest) {
   const { client, error } = getSupabaseAdmin();
   if (error) {
@@ -112,12 +142,14 @@ export async function POST(req: NextRequest) {
     const body = await readBody(req);
     const isAuto = !!body?.isAuto;
 
+    // ✅ 기존처럼 exam_attempts id(숫자) 기준 유지
     const attemptIdRaw = body?.attemptId ?? body?.attempt_id ?? body?.id ?? null;
     if (!isNumericId(attemptIdRaw)) {
       return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID", detail: { attemptIdRaw } }, { status: 400 });
     }
     const attemptId = Number(attemptIdRaw);
 
+    // answers map 만들기
     const answersObj = body?.answers ?? body?.answerMap ?? body?.selected ?? body?.items ?? {};
     const answersMap: Record<string, number> = {};
     if (answersObj && typeof answersObj === "object" && !Array.isArray(answersObj)) {
@@ -156,7 +188,19 @@ export async function POST(req: NextRequest) {
 
     const uniqQids = Array.from(new Set(questionIds)).filter(Boolean);
 
-    // 3) questions 조회
+    // ✅ question_id 타입 판별 (하나라도 uuid면 uuid 플로우)
+    const hasUuidQid = uniqQids.some((x) => isUuid(x));
+    const hasNumericQid = uniqQids.some((x) => isNumericId(x));
+    const qidType = hasUuidQid ? "uuid" : (hasNumericQid ? "num" : "unknown");
+
+    if (qidType === "unknown") {
+      return NextResponse.json(
+        { ok: false, error: "INVALID_QUESTION_IDS", detail: { sample: uniqQids.slice(0, 3) } },
+        { status: 400 }
+      );
+    }
+
+    // 3) questions 조회 (uuid든 num이든 questions.id와 동일하다는 가정 유지)
     const { data: questions, error: qErr } = uniqQids.length
       ? await client.from("questions").select("*").in("id", uniqQids as any)
       : { data: [], error: null as any };
@@ -171,14 +215,14 @@ export async function POST(req: NextRequest) {
     let totalPoints = 0;
     let wrongCount = 0;
 
-    const rowsToInsert: any[] = [];
+    const rowsToInsertExamAnswers: any[] = [];   // (bigint 테이블용)
+    const rowsToInsertAttemptAnswers: any[] = []; // (uuid 테이블용)
 
     for (const qid of uniqQids) {
       const q = qById.get(String(qid));
-      // ✅ points 없으면 1점 기본
+
       const pts = n(q?.points, null);
       const point = pts === null ? 1 : (pts ?? 0);
-
       totalPoints += point;
 
       const selectedIndex = Object.prototype.hasOwnProperty.call(answersMap, qid)
@@ -194,26 +238,60 @@ export async function POST(req: NextRequest) {
           ? Number(selectedIndex) === Number(correctIndex)
           : false;
 
-      if (isCorrect) {
-        score += point;
-      } else {
-        wrongCount += 1;
-      }
+      if (isCorrect) score += point;
+      else wrongCount += 1;
 
-      rowsToInsert.push({
-        attempt_id: attemptId,
-        question_id: qid,
-        selected_index: Number(selectedIndex),
-      });
+      if (qidType === "uuid") {
+        rowsToInsertAttemptAnswers.push({
+          // attempt_id는 아래에서 세팅
+          question_id: qid,
+          selected_index: Number(selectedIndex),
+          is_correct: isCorrect,
+          points: point,
+        });
+      } else {
+        rowsToInsertExamAnswers.push({
+          attempt_id: attemptId,
+          question_id: qid,
+          selected_index: Number(selectedIndex),
+        });
+      }
     }
 
-    // 5) 답안 테이블 저장: exam_answers 사용(너 현재 구조 유지)
-    const { error: delErr } = await client.from("exam_answers").delete().eq("attempt_id", attemptId);
-    if (delErr) return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
+    // 5) 답안 저장 (qidType에 따라 테이블 다르게)
+    if (qidType === "uuid") {
+      const attemptUuid = pickAttemptUuid(req, attempt);
 
-    if (rowsToInsert.length > 0) {
-      const { error: insErr } = await client.from("exam_answers").insert(rowsToInsert);
-      if (insErr) return NextResponse.json({ ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr }, { status: 500 });
+      if (!attemptUuid) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "MISSING_ATTEMPT_UUID",
+            detail:
+              "question_id는 UUID인데, attempt_answers.attempt_id(uuid)에 넣을 attempt uuid를 찾지 못함. (쿠키 attempt_uuid/attemptUuid 또는 exam_attempts의 uuid 컬럼 필요)",
+          },
+          { status: 500 }
+        );
+      }
+
+      // 기존 답안 삭제
+      const { error: delErr } = await client.from("attempt_answers").delete().eq("attempt_id", attemptUuid);
+      if (delErr) return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
+
+      if (rowsToInsertAttemptAnswers.length > 0) {
+        const insRows = rowsToInsertAttemptAnswers.map((r) => ({ ...r, attempt_id: attemptUuid }));
+        const { error: insErr } = await client.from("attempt_answers").insert(insRows);
+        if (insErr) return NextResponse.json({ ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr }, { status: 500 });
+      }
+    } else {
+      // 기존 exam_answers 방식 유지
+      const { error: delErr } = await client.from("exam_answers").delete().eq("attempt_id", attemptId);
+      if (delErr) return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
+
+      if (rowsToInsertExamAnswers.length > 0) {
+        const { error: insErr } = await client.from("exam_answers").insert(rowsToInsertExamAnswers);
+        if (insErr) return NextResponse.json({ ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr }, { status: 500 });
+      }
     }
 
     // 6) attempt 업데이트
@@ -225,9 +303,9 @@ export async function POST(req: NextRequest) {
       team,
       score,
       total_points: totalPoints,
-      total_questions: uniqQids.length, // ✅ 문항수는 무조건 이 값
+      total_questions: uniqQids.length,
       wrong_count: wrongCount,
-      answers: { map: answersMap }, // ✅ 관리자 상세에서 fallback으로도 사용
+      answers: { map: answersMap },
     };
 
     const up = await safeUpdateAttempt(client, attemptId, patch);
@@ -239,9 +317,10 @@ export async function POST(req: NextRequest) {
       score,
       totalPoints,
       wrongCount,
-      savedAnswers: rowsToInsert.length,
+      savedAnswers: qidType === "uuid" ? rowsToInsertAttemptAnswers.length : rowsToInsertExamAnswers.length,
       isAuto,
       redirectUrl: `/exam/result/${attemptId}`,
+      mode: qidType === "uuid" ? "attempt_answers(uuid)" : "exam_answers(bigint)",
     });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: "SUBMIT_FAILED", detail: String(e?.message ?? e) }, { status: 500 });
