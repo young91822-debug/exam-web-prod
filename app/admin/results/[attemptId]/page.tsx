@@ -54,6 +54,44 @@ function clamp(x: number, a: number, b: number) {
   return Math.max(a, Math.min(b, x));
 }
 
+/* ---------------- UI atoms (glass dark) ---------------- */
+
+const COLORS = {
+  bg1: "#0b1220",
+  bg2: "#05070c",
+  panel: "rgba(255,255,255,0.08)",
+  panel2: "rgba(255,255,255,0.06)",
+  border: "rgba(255,255,255,0.12)",
+  border2: "rgba(255,255,255,0.10)",
+  text: "rgba(255,255,255,0.92)",
+  textDim: "rgba(255,255,255,0.70)",
+  textMute: "rgba(255,255,255,0.55)",
+};
+
+function Glass({
+  children,
+  style,
+}: {
+  children: React.ReactNode;
+  style?: React.CSSProperties;
+}) {
+  return (
+    <div
+      style={{
+        background: COLORS.panel,
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: 18,
+        backdropFilter: "blur(10px)",
+        WebkitBackdropFilter: "blur(10px)",
+        boxShadow: "0 12px 30px rgba(0,0,0,0.25)",
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 function Badge({
   tone = "gray",
   children,
@@ -64,47 +102,54 @@ function Badge({
   const base: React.CSSProperties = {
     display: "inline-flex",
     alignItems: "center",
-    padding: "4px 10px",
+    padding: "6px 10px",
     borderRadius: 999,
     fontSize: 12,
     fontWeight: 900,
-    border: "1px solid",
+    border: `1px solid ${COLORS.border2}`,
+    background: COLORS.panel2,
+    color: COLORS.text,
     whiteSpace: "nowrap",
   };
 
   const toneStyle =
     tone === "green"
-      ? { background: "#ecfdf5", color: "#065f46", borderColor: "#a7f3d0" }
+      ? { borderColor: "rgba(52,211,153,0.35)", background: "rgba(16,185,129,0.12)" }
       : tone === "red"
-      ? { background: "#fff1f2", color: "#9f1239", borderColor: "#fecdd3" }
+      ? { borderColor: "rgba(244,63,94,0.35)", background: "rgba(244,63,94,0.12)" }
       : tone === "blue"
-      ? { background: "#eff6ff", color: "#1d4ed8", borderColor: "#bfdbfe" }
+      ? { borderColor: "rgba(59,130,246,0.35)", background: "rgba(59,130,246,0.12)" }
       : tone === "amber"
-      ? { background: "#fffbeb", color: "#92400e", borderColor: "#fde68a" }
-      : { background: "#f3f4f6", color: "#111827", borderColor: "#e5e7eb" };
+      ? { borderColor: "rgba(245,158,11,0.35)", background: "rgba(245,158,11,0.12)" }
+      : {};
 
   return <span style={{ ...base, ...toneStyle }}>{children}</span>;
 }
 
-function Card({
+function Button({
   children,
-  style,
+  onClick,
 }: {
   children: React.ReactNode;
-  style?: React.CSSProperties;
+  onClick?: () => void;
 }) {
   return (
-    <div
+    <button
+      onClick={onClick}
       style={{
-        background: "white",
-        border: "1px solid #e5e7eb",
-        borderRadius: 18,
-        boxShadow: "0 1px 0 rgba(0,0,0,0.03)",
-        ...style,
+        padding: "10px 14px",
+        borderRadius: 14,
+        border: `1px solid ${COLORS.border}`,
+        background: "rgba(255,255,255,0.08)",
+        color: COLORS.text,
+        fontWeight: 950,
+        cursor: "pointer",
+        backdropFilter: "blur(8px)",
+        WebkitBackdropFilter: "blur(8px)",
       }}
     >
       {children}
-    </div>
+    </button>
   );
 }
 
@@ -118,17 +163,13 @@ function StatCard({
   sub?: React.ReactNode;
 }) {
   return (
-    <Card style={{ padding: 16 }}>
-      <div style={{ fontSize: 12, opacity: 0.65, fontWeight: 900 }}>{label}</div>
-      <div style={{ marginTop: 6, fontSize: 20, fontWeight: 950, letterSpacing: "-0.2px" }}>
+    <Glass style={{ padding: 16 }}>
+      <div style={{ fontSize: 12, color: COLORS.textMute, fontWeight: 900 }}>{label}</div>
+      <div style={{ marginTop: 6, fontSize: 20, fontWeight: 950, color: COLORS.text }}>
         {value}
       </div>
-      {sub ? (
-        <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75, fontWeight: 800 }}>
-          {sub}
-        </div>
-      ) : null}
-    </Card>
+      {sub ? <div style={{ marginTop: 10 }}>{sub}</div> : null}
+    </Glass>
   );
 }
 
@@ -140,8 +181,8 @@ function ProgressBar({ value }: { value: number }) {
         width: "100%",
         height: 10,
         borderRadius: 999,
-        background: "#f3f4f6",
-        border: "1px solid #e5e7eb",
+        background: "rgba(255,255,255,0.10)",
+        border: `1px solid ${COLORS.border2}`,
         overflow: "hidden",
       }}
     >
@@ -149,8 +190,7 @@ function ProgressBar({ value }: { value: number }) {
         style={{
           width: `${v}%`,
           height: "100%",
-          background: "#111827",
-          opacity: 0.85,
+          background: "rgba(255,255,255,0.75)",
         }}
       />
     </div>
@@ -171,8 +211,6 @@ export default function AdminResultDetailPage() {
 
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<DetailResp | null>(null);
-
-  // UI state
   const [onlyWrong, setOnlyWrong] = useState(true);
 
   useEffect(() => {
@@ -193,15 +231,15 @@ export default function AdminResultDetailPage() {
 
   if (loading) {
     return (
-      <div style={{ padding: 24, maxWidth: 1180, margin: "0 auto", fontFamily: "system-ui" }}>
-        <div style={{ fontSize: 16, fontWeight: 900 }}>로딩중...</div>
+      <div style={{ padding: 24, color: COLORS.text, fontFamily: "system-ui" }}>
+        로딩중...
       </div>
     );
   }
 
   if (!data || (data as any).ok !== true) {
     return (
-      <div style={{ padding: 24, maxWidth: 1180, margin: "0 auto", fontFamily: "system-ui" }}>
+      <div style={{ padding: 24, fontFamily: "system-ui", color: COLORS.text }}>
         <div style={{ fontSize: 18, fontWeight: 950, marginBottom: 12 }}>에러</div>
         <pre
           style={{
@@ -215,20 +253,9 @@ export default function AdminResultDetailPage() {
         >
           {JSON.stringify(data, null, 2)}
         </pre>
-        <button
-          onClick={() => router.push("/admin/results")}
-          style={{
-            marginTop: 14,
-            padding: "10px 14px",
-            borderRadius: 12,
-            border: "1px solid #e5e7eb",
-            background: "white",
-            fontWeight: 950,
-            cursor: "pointer",
-          }}
-        >
-          ← 목록으로
-        </button>
+        <div style={{ marginTop: 14 }}>
+          <Button onClick={() => router.push("/admin/results")}>← 목록으로</Button>
+        </div>
       </div>
     );
   }
@@ -236,7 +263,6 @@ export default function AdminResultDetailPage() {
   const ok = data as Extract<DetailResp, { ok: true }>;
   const a = ok.attempt ?? {};
 
-  // ✅ attempt snake/camel 둘 다 대응
   const attempt = {
     id: a.id ?? a.attemptId ?? a.attempt_id ?? "-",
     emp_id: a.emp_id ?? a.empId ?? null,
@@ -252,11 +278,9 @@ export default function AdminResultDetailPage() {
     correct_count: n(a.correct_count ?? a.correctCount, 0),
   };
 
-  // ✅ wrongItems 우선
   const wrongFromApi: WrongItem[] = Array.isArray(ok.wrongItems) ? ok.wrongItems : [];
   const graded: GradedItem[] = Array.isArray((ok as any).graded) ? (ok as any).graded : [];
 
-  // ✅ 틀린 문항(graded 기반)
   const wrongFromGraded: WrongItem[] = graded
     .filter((g) => {
       if (g.selectedIndex === null || g.selectedIndex === undefined) return false;
@@ -276,7 +300,6 @@ export default function AdminResultDetailPage() {
   const wrong: WrongItem[] = wrongFromApi.length ? wrongFromApi : wrongFromGraded;
   const wrongCount = wrong.length;
 
-  // ✅ 전체 문항(보여줄 소스)
   const allItems: Array<{
     key: string;
     content: string;
@@ -284,13 +307,11 @@ export default function AdminResultDetailPage() {
     selectedIndex: number | null;
     correctIndex: number | null;
     isWrong: boolean;
-  }> = (() => {
-    if (graded.length) {
-      return graded.map((g, idx) => {
+  }> = graded.length
+    ? graded.map((g, idx) => {
         const sel = g.selectedIndex ?? null;
         const cor = g.correctIndex ?? null;
-        const isWrong =
-          sel !== null && cor !== null ? Number(sel) !== Number(cor) : false;
+        const isWrong = sel !== null && cor !== null ? Number(sel) !== Number(cor) : false;
         return {
           key: `${g.questionId ?? "q"}-${idx}`,
           content: g.content ?? "",
@@ -299,22 +320,18 @@ export default function AdminResultDetailPage() {
           correctIndex: cor,
           isWrong,
         };
-      });
-    }
-    // graded가 없으면 wrong만이라도 보여줌
-    return wrong.map((w, idx) => ({
-      key: `${w.questionId ?? "q"}-${idx}`,
-      content: w.content ?? "",
-      choices: Array.isArray(w.choices) ? w.choices : [],
-      selectedIndex: w.selectedIndex ?? null,
-      correctIndex: w.correctIndex ?? null,
-      isWrong: true,
-    }));
-  })();
+      })
+    : wrong.map((w, idx) => ({
+        key: `${w.questionId ?? "q"}-${idx}`,
+        content: w.content ?? "",
+        choices: Array.isArray(w.choices) ? w.choices : [],
+        selectedIndex: w.selectedIndex ?? null,
+        correctIndex: w.correctIndex ?? null,
+        isWrong: true,
+      }));
 
   const viewItems = onlyWrong ? allItems.filter((x) => x.isWrong) : allItems;
 
-  // 점수/퍼센트
   const totalPts = attempt.total_points || 100;
   const scorePct = totalPts > 0 ? Math.round((attempt.score / totalPts) * 100) : 0;
 
@@ -322,7 +339,6 @@ export default function AdminResultDetailPage() {
   const correctQ = attempt.correct_count || (totalQ ? totalQ - wrongCount : 0);
   const accPct = totalQ > 0 ? Math.round((correctQ / totalQ) * 100) : 0;
 
-  // 상태 배지 톤
   const statusTone =
     String(attempt.status || "").toUpperCase() === "SUBMITTED" ? "blue" : "gray";
 
@@ -330,9 +346,11 @@ export default function AdminResultDetailPage() {
     <div
       style={{
         minHeight: "100vh",
-        background: "#f6f7fb",
-        padding: 24,
         fontFamily: "system-ui",
+        color: COLORS.text,
+        background:
+          "radial-gradient(1200px 600px at 20% 10%, rgba(255,255,255,0.18), transparent 60%), radial-gradient(900px 500px at 70% 20%, rgba(99,102,241,0.18), transparent 60%), linear-gradient(135deg, #0b1220 0%, #05070c 70%)",
+        padding: 28,
       }}
     >
       <div style={{ maxWidth: 1180, margin: "0 auto" }}>
@@ -350,7 +368,7 @@ export default function AdminResultDetailPage() {
             <div style={{ fontSize: 24, fontWeight: 950, letterSpacing: "-0.3px" }}>
               결과 상세
             </div>
-            <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
               <Badge tone="gray">attemptId: {attempt.id}</Badge>
               <Badge tone="gray">응시자: {attempt.emp_id ?? "-"}</Badge>
               <Badge tone="gray">팀: {attempt.team ?? "-"}</Badge>
@@ -359,19 +377,13 @@ export default function AdminResultDetailPage() {
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <label
+            <Glass
               style={{
+                padding: "10px 12px",
+                borderRadius: 16,
                 display: "flex",
                 alignItems: "center",
                 gap: 10,
-                padding: "10px 12px",
-                borderRadius: 14,
-                background: "white",
-                border: "1px solid #e5e7eb",
-                boxShadow: "0 1px 0 rgba(0,0,0,0.03)",
-                fontWeight: 900,
-                cursor: "pointer",
-                userSelect: "none",
               }}
             >
               <input
@@ -380,22 +392,12 @@ export default function AdminResultDetailPage() {
                 onChange={(e) => setOnlyWrong(e.target.checked)}
                 style={{ width: 16, height: 16 }}
               />
-              틀린 문제만 보기
-            </label>
+              <div style={{ fontWeight: 950, color: COLORS.text }}>
+                틀린 문제만 보기
+              </div>
+            </Glass>
 
-            <button
-              onClick={() => router.push("/admin/results")}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 14,
-                border: "1px solid #e5e7eb",
-                background: "white",
-                fontWeight: 950,
-                cursor: "pointer",
-              }}
-            >
-              ← 목록
-            </button>
+            <Button onClick={() => router.push("/admin/results")}>← 목록</Button>
           </div>
         </div>
 
@@ -415,7 +417,7 @@ export default function AdminResultDetailPage() {
                 <span>
                   {attempt.score} / {totalPts}
                 </span>
-                <span style={{ fontSize: 14, opacity: 0.7, fontWeight: 900 }}>
+                <span style={{ fontSize: 14, color: COLORS.textDim, fontWeight: 900 }}>
                   ({scorePct}점)
                 </span>
               </div>
@@ -426,7 +428,7 @@ export default function AdminResultDetailPage() {
             label="정답률"
             value={`${accPct}%`}
             sub={
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", color: COLORS.textDim, fontWeight: 900, fontSize: 12 }}>
                 <span>정답 {correctQ} / {totalQ}</span>
                 <span>오답 {wrongCount}</span>
               </div>
@@ -442,17 +444,17 @@ export default function AdminResultDetailPage() {
             <div style={{ fontSize: 16, fontWeight: 950 }}>
               {onlyWrong ? "틀린 문제" : "문항 전체"}
             </div>
-            <div style={{ fontSize: 12, opacity: 0.7, fontWeight: 900 }}>
+            <div style={{ fontSize: 12, color: COLORS.textMute, fontWeight: 900 }}>
               표시: {viewItems.length}개
             </div>
           </div>
 
           {viewItems.length === 0 ? (
-            <Card style={{ padding: 16, background: "#fafafa", borderStyle: "dashed" }}>
-              <div style={{ fontWeight: 900, color: "#374151" }}>
+            <Glass style={{ padding: 16, background: "rgba(255,255,255,0.06)" }}>
+              <div style={{ fontWeight: 900, color: COLORS.textDim }}>
                 오답이 없거나(만점), 답안/정답 비교 데이터(graded)가 비어있어요.
               </div>
-            </Card>
+            </Glass>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {viewItems.map((item, idx) => {
@@ -461,9 +463,9 @@ export default function AdminResultDetailPage() {
                 const cor = item.correctIndex;
 
                 return (
-                  <Card key={item.key} style={{ padding: 16 }}>
+                  <Glass key={item.key} style={{ padding: 16 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                      <div style={{ fontWeight: 950, fontSize: 15, letterSpacing: "-0.2px" }}>
+                      <div style={{ fontWeight: 950, fontSize: 15 }}>
                         Q{idx + 1}. {item.content}
                       </div>
                       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -485,16 +487,16 @@ export default function AdminResultDetailPage() {
                           const isSelected = sel === i;
 
                           const bg = isCorrect
-                            ? "#ecfdf5"
+                            ? "rgba(16,185,129,0.12)"
                             : isSelected
-                            ? "#fff7ed"
-                            : "#ffffff";
+                            ? "rgba(245,158,11,0.12)"
+                            : "rgba(255,255,255,0.05)";
 
                           const border = isCorrect
-                            ? "#a7f3d0"
+                            ? "rgba(52,211,153,0.35)"
                             : isSelected
-                            ? "#fed7aa"
-                            : "#e5e7eb";
+                            ? "rgba(245,158,11,0.35)"
+                            : "rgba(255,255,255,0.10)";
 
                           return (
                             <div
@@ -505,11 +507,10 @@ export default function AdminResultDetailPage() {
                                 borderRadius: 14,
                                 border: `1px solid ${border}`,
                                 background: bg,
-                                boxShadow: "0 1px 0 rgba(0,0,0,0.02)",
                               }}
                             >
                               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                                <div style={{ fontWeight: 900 }}>
+                                <div style={{ fontWeight: 900, color: COLORS.text }}>
                                   <span style={{ opacity: 0.65, marginRight: 8 }}>{i + 1}.</span>
                                   {c}
                                 </div>
@@ -525,20 +526,22 @@ export default function AdminResultDetailPage() {
                         })}
                       </div>
                     ) : (
-                      <div style={{ marginTop: 12, opacity: 0.75, fontWeight: 800 }}>
+                      <div style={{ marginTop: 12, color: COLORS.textDim, fontWeight: 800 }}>
                         보기 데이터가 없는 유형(주관식 등)일 수 있어요.
                       </div>
                     )}
 
-                    <div style={{ marginTop: 12, fontSize: 12, opacity: 0.75, fontWeight: 900 }}>
+                    <div style={{ marginTop: 12, fontSize: 12, color: COLORS.textMute, fontWeight: 900 }}>
                       선택: {sel == null ? "-" : sel + 1} / 정답: {cor == null ? "-" : cor + 1}
                     </div>
-                  </Card>
+                  </Glass>
                 );
               })}
             </div>
           )}
         </div>
+
+        <div style={{ height: 40 }} />
       </div>
     </div>
   );
