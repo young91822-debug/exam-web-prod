@@ -18,7 +18,16 @@ type ApiItem = {
 };
 
 type ApiResp =
-  | { ok: true; page: number; pageSize: number; total?: number; items: ApiItem[]; mode?: string; filters?: any; selectExpr?: string }
+  | {
+      ok: true;
+      page: number;
+      pageSize: number;
+      total?: number;
+      items: ApiItem[];
+      mode?: string;
+      filters?: any;
+      selectExpr?: string;
+    }
   | { ok: false; error: string; detail?: any };
 
 type Row = {
@@ -36,11 +45,13 @@ type Row = {
   ownerAdmin?: string | null;
 };
 
+/* ---------------- utils ---------------- */
+
 function fmt(v: any) {
   if (!v) return "-";
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) return String(v);
-  return d.toLocaleString();
+  return d.toLocaleString("ko-KR", { hour12: true });
 }
 
 function toNum(v: any, d = 0) {
@@ -58,7 +69,7 @@ function normalize(a: ApiItem): Row {
 
   const totalQuestions = toNum(a.total_questions, 0);
 
-  // total_points 없으면 "문항수"로 fallback (너가 원래 하던 방식 유지)
+  // total_points 없으면 "문항수"로 fallback (기존 방식 유지)
   const totalPoints = Number.isFinite(Number(a.total_points))
     ? toNum(a.total_points, totalQuestions)
     : totalQuestions;
@@ -79,6 +90,96 @@ function normalize(a: ApiItem): Row {
   };
 }
 
+/* ---------------- UI helpers ---------------- */
+
+const C = {
+  bgA: "#0b1220",
+  bgB: "#05070c",
+  glass: "rgba(255,255,255,0.08)",
+  glass2: "rgba(255,255,255,0.06)",
+  border: "rgba(255,255,255,0.12)",
+  border2: "rgba(255,255,255,0.10)",
+  text: "rgba(255,255,255,0.92)",
+  dim: "rgba(255,255,255,0.72)",
+  mute: "rgba(255,255,255,0.55)",
+};
+
+function Glass({
+  children,
+  style,
+}: {
+  children: React.ReactNode;
+  style?: React.CSSProperties;
+}) {
+  return (
+    <div
+      style={{
+        background: C.glass,
+        border: `1px solid ${C.border}`,
+        borderRadius: 18,
+        backdropFilter: "blur(10px)",
+        WebkitBackdropFilter: "blur(10px)",
+        boxShadow: "0 14px 42px rgba(0,0,0,0.28)",
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Pill({
+  children,
+  tone = "gray",
+}: {
+  children: React.ReactNode;
+  tone?: "gray" | "blue" | "green" | "red" | "amber";
+}) {
+  const base: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "6px 10px",
+    borderRadius: 999,
+    fontSize: 12,
+    fontWeight: 900,
+    color: C.text,
+    border: `1px solid ${C.border2}`,
+    background: C.glass2,
+    whiteSpace: "nowrap",
+  };
+
+  const toneStyle =
+    tone === "blue"
+      ? { borderColor: "rgba(59,130,246,0.35)", background: "rgba(59,130,246,0.12)" }
+      : tone === "green"
+      ? { borderColor: "rgba(16,185,129,0.35)", background: "rgba(16,185,129,0.12)" }
+      : tone === "red"
+      ? { borderColor: "rgba(244,63,94,0.35)", background: "rgba(244,63,94,0.12)" }
+      : tone === "amber"
+      ? { borderColor: "rgba(245,158,11,0.35)", background: "rgba(245,158,11,0.12)" }
+      : {};
+
+  return <span style={{ ...base, ...toneStyle }}>{children}</span>;
+}
+
+function btnStyle(compact = false, primary = false): React.CSSProperties {
+  return {
+    padding: compact ? "8px 10px" : "10px 12px",
+    borderRadius: 14,
+    border: `1px solid ${primary ? "rgba(255,255,255,0.20)" : C.border}`,
+    background: primary ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.08)",
+    color: C.text,
+    cursor: "pointer",
+    fontWeight: 950,
+    backdropFilter: "blur(8px)",
+    WebkitBackdropFilter: "blur(8px)",
+    transition: "transform 0.12s ease, background 0.12s ease",
+  };
+}
+
+/* ---------------- page ---------------- */
+
 export default function AdminResultsPage() {
   const router = useRouter();
   const sp = useSearchParams();
@@ -86,11 +187,14 @@ export default function AdminResultsPage() {
   const page = useMemo(() => Number(sp.get("page") ?? 1) || 1, [sp]);
   const pageSize = 50;
 
-  const apiUrl = useMemo(() => `/api/admin/results?page=${page}&pageSize=${pageSize}`, [page]);
+  const apiUrl = useMemo(
+    () => `/api/admin/results?page=${page}&pageSize=${pageSize}`,
+    [page]
+  );
 
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<ApiResp | null>(null);
-  const [tick, setTick] = useState(0); // 새로고침 트리거
+  const [tick, setTick] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -116,166 +220,202 @@ export default function AdminResultsPage() {
   const ok = (data as any)?.ok === true;
   const modeText = ok && (data as any)?.mode ? String((data as any).mode) : "";
   const teamText = ok && (data as any)?.filters?.team ? String((data as any).filters.team) : "";
-  const ownerText = ok && (data as any)?.filters?.owner_admin ? String((data as any).filters.owner_admin) : "";
+  const ownerText =
+    ok && (data as any)?.filters?.owner_admin ? String((data as any).filters.owner_admin) : "";
+
+  const items: ApiItem[] = ok ? (data as any).items ?? [] : [];
+  const rows = items.map(normalize);
 
   return (
     <div
       style={{
         minHeight: "100vh",
-        padding: 18,
+        padding: 22,
+        // ✅ 눈부신 왼쪽 상단 스팟 제거(강도 낮춤 + 위치 약간 이동)
         background:
-          "radial-gradient(1200px 650px at 18% 10%, rgba(60, 130, 255, 0.25) 0%, rgba(10, 16, 32, 1) 50%, rgba(6, 8, 15, 1) 100%)",
-        color: "#eaf0ff",
+          "radial-gradient(1100px 620px at  20%  8%, rgba(255,255,255,0.10), transparent 62%)," +
+          "radial-gradient(900px 520px at  70% 16%, rgba(99,102,241,0.14), transparent 60%)," +
+          "linear-gradient(135deg, #0b1220 0%, #05070c 70%)",
+        color: C.text,
         fontFamily: "system-ui",
       }}
     >
       <div style={{ width: "100%", maxWidth: 1400, margin: "0 auto" }}>
-        {/* ✅ 헤더 + 버튼 */}
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-end" }}>
+        {/* Header */}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 14,
+            alignItems: "flex-end",
+            marginBottom: 14,
+          }}
+        >
           <div>
-            <div style={{ fontSize: 22, fontWeight: 950 }}>응시현황</div>
-
-            <div style={{ marginTop: 8, opacity: 0.72, fontSize: 12 }}>
-              apiUrl: <span style={{ fontFamily: "monospace" }}>{apiUrl}</span>
+            <div style={{ fontSize: 24, fontWeight: 950, letterSpacing: "-0.3px" }}>
+              응시현황
             </div>
 
-            <div style={{ marginTop: 4, opacity: 0.72, fontSize: 12 }}>
-              {modeText ? `mode: ${modeText}` : ""}
-              {teamText ? ` / team: ${teamText}` : ""}
-              {ownerText ? ` / owner_admin: ${ownerText}` : ""}
+            <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <Pill tone="gray">
+                apiUrl: <span style={{ fontFamily: "monospace", opacity: 0.9 }}>{apiUrl}</span>
+              </Pill>
+              {modeText ? <Pill tone="blue">mode: {modeText}</Pill> : null}
+              {teamText ? <Pill tone="amber">team: {teamText}</Pill> : null}
+              {ownerText ? <Pill tone="gray">owner: {ownerText}</Pill> : null}
+              {ok ? <Pill tone="green">rows: {rows.length}</Pill> : null}
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {/* ✅ CSV 다운로드 (export 라우트 말고, results에 format=csv로) */}
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <button
               onClick={() => {
-                // 팀/권한 필터는 서버가 쿠키로 알아서 적용. 넉넉히 500개.
                 window.location.href = `/api/admin/results?page=1&pageSize=500&format=csv`;
               }}
-              style={btnStyle()}
+              style={btnStyle(false, true)}
             >
               CSV 다운로드
             </button>
 
-            <button
-              onClick={() => setTick((x) => x + 1)}
-              style={btnStyle()}
-            >
+            <button onClick={() => setTick((x) => x + 1)} style={btnStyle()}>
               새로고침
             </button>
           </div>
         </div>
 
-        {/* 상태 */}
-        {loading && <div style={{ padding: 16, opacity: 0.9 }}>로딩중...</div>}
+        {/* Content */}
+        {loading && (
+          <Glass style={{ padding: 16 }}>
+            <div style={{ fontWeight: 900, color: C.dim }}>로딩중...</div>
+          </Glass>
+        )}
 
         {!loading && (!data || (data as any).ok !== true) && (
-          <div
+          <Glass
             style={{
-              marginTop: 14,
               padding: 16,
-              borderRadius: 14,
-              border: "1px solid rgba(255,120,150,0.35)",
-              background: "rgba(255,120,150,0.10)",
-              color: "#ffb3c7",
-              whiteSpace: "pre-wrap",
+              borderColor: "rgba(244,63,94,0.35)",
+              background: "rgba(244,63,94,0.10)",
             }}
           >
-            에러: {JSON.stringify(data, null, 2)}
-          </div>
+            <div style={{ fontWeight: 950, marginBottom: 8 }}>에러</div>
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", color: C.text }}>
+              {JSON.stringify(data, null, 2)}
+            </pre>
+          </Glass>
         )}
 
         {!loading && ok && (
           <>
-            {/* ✅ 테이블 */}
-            <div
-              style={{
-                marginTop: 14,
-                border: "1px solid rgba(255,255,255,0.12)",
-                borderRadius: 16,
-                overflowX: "auto",
-                overflowY: "hidden",
-                background: "rgba(255,255,255,0.04)",
-                boxShadow: "0 12px 40px rgba(0,0,0,0.25)",
-              }}
-            >
-              <div style={{ minWidth: GRID_MIN_WIDTH }}>
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "140px 140px 160px 220px 220px 90px 150px 90px",
-                    fontWeight: 900,
-                    background: "rgba(255,255,255,0.06)",
-                    padding: 12,
-                    borderBottom: "1px solid rgba(255,255,255,0.10)",
-                  }}
-                >
-                  <div>attemptId</div>
-                  <div>응시자ID</div>
-                  <div>점수</div>
-                  <div>시작</div>
-                  <div>제출</div>
-                  <div>문항수</div>
-                  <div>상태</div>
-                  <div style={{ whiteSpace: "nowrap" }}>상세</div>
-                </div>
+            {/* Table */}
+            <Glass style={{ overflow: "hidden" }}>
+              <div
+                style={{
+                  overflowX: "auto",
+                  overflowY: "hidden",
+                }}
+              >
+                <div style={{ minWidth: GRID_MIN_WIDTH }}>
+                  {/* Sticky header */}
+                  <div
+                    style={{
+                      position: "sticky",
+                      top: 0,
+                      zIndex: 2,
+                      display: "grid",
+                      gridTemplateColumns: "140px 140px 160px 220px 220px 90px 170px 90px",
+                      fontWeight: 950,
+                      letterSpacing: "0.2px",
+                      background: "rgba(255,255,255,0.10)",
+                      padding: 12,
+                      borderBottom: `1px solid ${C.border2}`,
+                    }}
+                  >
+                    <div>attemptId</div>
+                    <div>응시자ID</div>
+                    <div>점수</div>
+                    <div>시작</div>
+                    <div>제출</div>
+                    <div>문항수</div>
+                    <div>상태</div>
+                    <div style={{ whiteSpace: "nowrap" }}>상세</div>
+                  </div>
 
-                {(data as any).items.map((raw: ApiItem) => {
-                  const r = normalize(raw);
+                  {rows.map((r, idx) => {
+                    const statusUp = String(r.status ?? "").toUpperCase();
+                    const statusTone =
+                      statusUp === "SUBMITTED" ? "blue" : statusUp ? "gray" : "gray";
 
-                  return (
-                    <div
-                      key={`${r.idType}:${r.id}`}
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "140px 140px 160px 220px 220px 90px 150px 90px",
-                        padding: 12,
-                        borderTop: "1px solid rgba(255,255,255,0.08)",
-                        alignItems: "center",
-                      }}
-                    >
-                      <div style={{ fontFamily: "monospace", fontSize: 12, opacity: 0.95 }}>
-                        {r.idType === "uuid" ? r.id.slice(0, 8) + "..." : r.id}
+                    return (
+                      <div
+                        key={`${r.idType}:${r.id}`}
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "140px 140px 160px 220px 220px 90px 170px 90px",
+                          padding: 12,
+                          borderTop: `1px solid ${idx === 0 ? "transparent" : "rgba(255,255,255,0.08)"}`,
+                          alignItems: "center",
+                          background: idx % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent",
+                          transition: "background 0.12s ease",
+                        }}
+                        onMouseEnter={(e) => {
+                          (e.currentTarget as any).style.background = "rgba(255,255,255,0.06)";
+                        }}
+                        onMouseLeave={(e) => {
+                          (e.currentTarget as any).style.background =
+                            idx % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent";
+                        }}
+                      >
+                        <div style={{ fontFamily: "monospace", fontSize: 12, color: C.dim }}>
+                          {r.idType === "uuid" ? r.id.slice(0, 8) + "..." : r.id}
+                        </div>
+
+                        <div style={{ fontWeight: 950 }}>{r.empId}</div>
+
+                        <div style={{ color: C.text }}>
+                          <span style={{ fontWeight: 950 }}>{r.score}</span>
+                          <span style={{ color: C.dim }}> / {r.totalPoints}</span>
+                          {r.wrongCount ? (
+                            <span style={{ marginLeft: 8, fontSize: 12, color: C.mute, fontWeight: 900 }}>
+                              (오답 {r.wrongCount})
+                            </span>
+                          ) : null}
+                        </div>
+
+                        <div style={{ color: C.dim }}>{fmt(r.startedAt)}</div>
+                        <div style={{ color: C.dim }}>{fmt(r.submittedAt)}</div>
+
+                        <div style={{ fontWeight: 950 }}>{r.totalQuestions || "-"}</div>
+
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                          <Pill tone={statusTone as any}>{r.status ?? "-"}</Pill>
+                          {r.team ? <Pill tone="amber">팀 {r.team}</Pill> : null}
+                          {r.ownerAdmin ? <Pill tone="gray">{r.ownerAdmin}</Pill> : null}
+                        </div>
+
+                        <div style={{ whiteSpace: "nowrap" }}>
+                          <button
+                            onClick={() => router.push(`/admin/results/${encodeURIComponent(r.id)}`)}
+                            style={btnStyle(true, true)}
+                          >
+                            보기
+                          </button>
+                        </div>
                       </div>
+                    );
+                  })}
 
-                      <div style={{ fontWeight: 800 }}>{r.empId}</div>
-
-                      <div>
-                        <b>{r.score}</b> / {r.totalPoints}
-                        {r.wrongCount ? (
-                          <span style={{ marginLeft: 8, fontSize: 12, opacity: 0.8 }}>
-                            (오답 {r.wrongCount})
-                          </span>
-                        ) : null}
-                      </div>
-
-                      <div style={{ opacity: 0.9 }}>{fmt(r.startedAt)}</div>
-                      <div style={{ opacity: 0.9 }}>{fmt(r.submittedAt)}</div>
-                      <div style={{ fontWeight: 800 }}>{r.totalQuestions || "-"}</div>
-
-                      <div style={{ fontSize: 12, opacity: 0.85 }}>
-                        {r.status ?? "-"}
-                        {r.team ? ` (팀 ${r.team})` : ""}
-                        {r.ownerAdmin ? ` / ${r.ownerAdmin}` : ""}
-                      </div>
-
-                      <div style={{ whiteSpace: "nowrap" }}>
-                        <button
-                          onClick={() => router.push(`/admin/results/${encodeURIComponent(r.id)}`)}
-                          style={btnStyle(true)}
-                        >
-                          보기
-                        </button>
-                      </div>
+                  {rows.length === 0 ? (
+                    <div style={{ padding: 16, color: C.dim, fontWeight: 900 }}>
+                      데이터가 없습니다.
                     </div>
-                  );
-                })}
+                  ) : null}
+                </div>
               </div>
-            </div>
+            </Glass>
 
-            {/* 페이징 */}
-            <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+            {/* Paging */}
+            <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
               <button
                 onClick={() => router.push(`/admin/results?page=${Math.max(1, page - 1)}`)}
                 style={btnStyle()}
@@ -288,23 +428,15 @@ export default function AdminResultsPage() {
               >
                 다음
               </button>
+
+              <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+                <Pill tone="gray">page: {page}</Pill>
+                <Pill tone="gray">pageSize: {pageSize}</Pill>
+              </div>
             </div>
           </>
         )}
       </div>
     </div>
   );
-}
-
-function btnStyle(compact = false): React.CSSProperties {
-  return {
-    padding: compact ? "7px 10px" : "10px 12px",
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.18)",
-    background: "rgba(255,255,255,0.08)",
-    color: "#eaf0ff",
-    cursor: "pointer",
-    fontWeight: 900,
-    backdropFilter: "blur(6px)",
-  };
 }
