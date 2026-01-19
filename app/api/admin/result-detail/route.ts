@@ -12,7 +12,6 @@ function n(v: any, d: number | null = null) {
   return Number.isFinite(x) ? x : d;
 }
 
-/** cookie 파싱 (Request 환경) */
 function getCookie(req: Request, name: string) {
   const raw = req.headers.get("cookie") || "";
   const parts = raw.split(";").map((x) => x.trim());
@@ -24,7 +23,6 @@ function getCookie(req: Request, name: string) {
   return "";
 }
 
-/** query param을 대소문자 무시하고 가져오기 */
 function getParamCI(u: URL, ...keys: string[]) {
   const want = new Set(keys.map((k) => k.toLowerCase()));
   for (const [k, v] of u.searchParams.entries()) {
@@ -40,30 +38,11 @@ function isUuid(x: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);
 }
 
-function isMissingColumn(err: any, col?: string) {
-  const msg = String(err?.message ?? err ?? "");
-  const low = msg.toLowerCase();
-  if (!col) {
-    return msg.includes("does not exist") || msg.includes("Could not find") || msg.includes("schema cache");
-  }
-  return (
-    (low.includes("does not exist") && low.includes(col.toLowerCase())) ||
-    msg.includes(`Could not find the '${col}' column`)
-  );
-}
-
 function upperTeam(v: any) {
   const t = s(v).toUpperCase();
   return t === "B" ? "B" : "A";
 }
 
-/**
- * ✅ 관리자 소유/팀 가드
- * 우선순위:
- * 1) owner_admin 값이 있으면 무조건 owner_admin === adminEmpId
- * 2) 없으면 attempt.team 이 adminTeam과 같아야 함
- * 3) attempt.team도 없으면 안전하게 adminTeam 기준으로만 허용(레거시 null 대응)
- */
 function authorizeAdminForAttempt(adminEmpId: string, adminTeam: "A" | "B", attempt: any) {
   const owner = s(attempt?.owner_admin);
   if (owner) return owner === adminEmpId;
@@ -71,7 +50,7 @@ function authorizeAdminForAttempt(adminEmpId: string, adminTeam: "A" | "B", atte
   const attemptTeamRaw = s(attempt?.team);
   if (attemptTeamRaw) return upperTeam(attemptTeamRaw) === adminTeam;
 
-  // 레거시 데이터(team null): adminTeam 기준으로만 허용 (교차노출 방지)
+  // 레거시(team null)는 안전하게 허용(이걸 막고 싶으면 false로 바꾸면 됨)
   return true;
 }
 
@@ -116,62 +95,75 @@ function pickCorrectIndex(q: any): number | null {
   return null;
 }
 
-/** attempt.answers에서 map/ids 추출 */
-function parseAttemptAnswers(attempt: any): { map: Record<string, number>; questionIds: string[] } {
+function parseAttemptAnswersMap(attempt: any): Record<string, number> {
   let a: any = attempt?.answers;
-
   if (typeof a === "string") {
-    try {
-      a = JSON.parse(a);
-    } catch {
-      a = null;
-    }
+    try { a = JSON.parse(a); } catch { a = null; }
   }
-
   const mapObj =
     (a?.map && typeof a.map === "object" ? a.map : null) ??
     (a && typeof a === "object" ? a : null) ??
     {};
-
   const map: Record<string, number> = {};
   for (const [k, v] of Object.entries(mapObj)) {
     const idx = n(v, null);
     if (k && idx !== null) map[String(k).trim()] = idx;
   }
-
-  const qidsRaw = a?.questionIds ?? a?.question_ids ?? a?.questions ?? null;
-
-  let questionIds: string[] = [];
-  if (Array.isArray(qidsRaw)) {
-    questionIds = qidsRaw
-      .map((x: any) => s(typeof x === "object" ? x?.id ?? x?.question_id ?? x?.qid : x))
-      .filter(Boolean);
-  } else if (typeof qidsRaw === "string") {
-    questionIds = qidsRaw.split(",").map((x) => s(x)).filter(Boolean);
-  }
-
-  questionIds = Array.from(new Set(questionIds));
-  return { map, questionIds };
+  return map;
 }
 
-/** legacy(exam_attempts)에서 graded 만들기: question_ids + answers(map) 기반 */
-async function buildLegacyDetailFromExamAttempts(attempt: any) {
+/** ✅ 핵심: exam_answers에서 답안 읽기 */
+async function readAnswersFromExamAnswers(attemptId: number) {
+  const { data, error } = await supabaseAdmin
+    .from("exam_answers")
+    .select("question_id, selected_index")
+    .eq("attempt_id", attemptId);
+
+  if (error) return { ok: false as const, error };
+  const map: Record<string, number> = {};
+  for (const r of data ?? []) {
+    const qid = s((r as any).question_id);
+    const idx = n((r as any).selected_index, null);
+    if (!qid || idx === null) continue;
+    map[qid] = Number(idx);
+  }
+  return { ok: true as const, map, count: Object.keys(map).length };
+}
+
+async function buildDetail(attempt: any) {
+  // question_ids
   let questionIds: string[] = Array.isArray(attempt?.question_ids)
     ? attempt.question_ids.map((x: any) => s(x)).filter(Boolean)
     : [];
 
-  const parsed = parseAttemptAnswers(attempt);
+  // ✅ 1순위: exam_answers에서 답안 읽기
+  const attemptIdNum = n(attempt?.id, null);
+  let selectedMap: Record<string, number> = {};
+  let answerSource: "exam_answers" | "attempt.answers" = "attempt.answers";
+  let examAnswersCount = 0;
 
-  if (questionIds.length === 0) questionIds = parsed.questionIds;
-  if (questionIds.length === 0) questionIds = Object.keys(parsed.map || {}).map((k) => s(k)).filter(Boolean);
+  if (attemptIdNum) {
+    const r = await readAnswersFromExamAnswers(attemptIdNum);
+    if (r.ok && r.count > 0) {
+      selectedMap = r.map;
+      examAnswersCount = r.count;
+      answerSource = "exam_answers";
+    }
+  }
 
-  const selectedByQid = new Map<string, number>();
-  for (const [qid, idx] of Object.entries(parsed.map)) selectedByQid.set(String(qid).trim(), Number(idx));
+  // ✅ 2순위 fallback: exam_attempts.answers(map)
+  if (Object.keys(selectedMap).length === 0) {
+    selectedMap = parseAttemptAnswersMap(attempt);
+  }
+
+  if (questionIds.length === 0) questionIds = Object.keys(selectedMap);
+
+  questionIds = Array.from(new Set(questionIds)).filter(Boolean);
 
   const { data: questions, error: qErr } = await supabaseAdmin
     .from("questions")
     .select("*")
-    .in("id", questionIds.length ? questionIds : ["__never__"]);
+    .in("id", questionIds.length ? (questionIds as any) : ["__never__"]);
 
   if (qErr) {
     return { ok: false as const, error: "QUESTIONS_QUERY_FAILED", detail: qErr };
@@ -183,12 +175,14 @@ async function buildLegacyDetailFromExamAttempts(attempt: any) {
   const graded = questionIds.map((qid) => {
     const q = qById.get(String(qid)) ?? {};
     const key = String(qid).trim();
-    const selectedIndex = selectedByQid.has(key) ? selectedByQid.get(key)! : null;
+
+    const selectedIndex = Object.prototype.hasOwnProperty.call(selectedMap, key) ? Number(selectedMap[key]) : null;
     const correctIndex = pickCorrectIndex(q);
 
     const status = selectedIndex == null ? "unsubmitted" : "submitted";
-    const isCorrect =
-      status === "submitted" && correctIndex != null ? Number(selectedIndex) === Number(correctIndex) : false;
+    const isCorrect = status === "submitted" && correctIndex != null
+      ? Number(selectedIndex) === Number(correctIndex)
+      : false;
 
     return {
       questionId: q?.id ?? qid,
@@ -207,15 +201,15 @@ async function buildLegacyDetailFromExamAttempts(attempt: any) {
     graded,
     meta: {
       idType: "num",
-      source: "exam_attempts",
-      attemptId: attempt?.id,
+      source: "exam_attempts + questions",
+      answersSource: answerSource,
+      examAnswersCount,
       questionIdsCount: questionIds.length,
-      mapKeysCount: Object.keys(parsed.map).length,
+      mapKeysCount: Object.keys(selectedMap).length,
     },
   };
 }
 
-/** UUID attempt를 legacy(exam_attempts)로 매칭: started_at 기준(±2분) */
 async function resolveLegacyByStartedAt(attemptUuidRow: any) {
   const startedAt = attemptUuidRow?.started_at ?? attemptUuidRow?.startedAt ?? null;
   if (!startedAt) return { ok: false as const, error: "UUID_ATTEMPT_NO_STARTED_AT" };
@@ -238,11 +232,7 @@ async function resolveLegacyByStartedAt(attemptUuidRow: any) {
   if (error) return { ok: false as const, error: "LEGACY_MATCH_QUERY_FAILED", detail: error };
   if (!rows || rows.length === 0) return { ok: false as const, error: "LEGACY_MATCH_NOT_FOUND", detail: { t0, t1 } };
 
-  const best =
-    rows.find((r: any) => !!r?.emp_id) ??
-    rows.find((r: any) => r?.score != null && r?.total_points != null) ??
-    rows[0];
-
+  const best = rows.find((r: any) => !!r?.emp_id) ?? rows[0];
   return { ok: true as const, attempt: best, candidates: rows.map((r: any) => r?.id) };
 }
 
@@ -256,7 +246,6 @@ export async function GET(req: Request) {
       return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401 });
     }
 
-    // ✅ adminTeam 확정(쿠키 우선, 없으면 empId로 추론)
     const adminTeam = upperTeam(teamCookie || (adminEmpId === "admin_gs" ? "B" : "A")) as "A" | "B";
 
     const u = new URL(req.url);
@@ -271,9 +260,7 @@ export async function GET(req: Request) {
       );
     }
 
-    // =========================
-    // 1) UUID attempt
-    // =========================
+    // 1) UUID attempt -> attempts 테이블 -> exam_attempts 매칭
     if (isUuid(attemptKey)) {
       const { data: uuidAttempt, error: aErr } = await supabaseAdmin
         .from("attempts")
@@ -285,37 +272,24 @@ export async function GET(req: Request) {
       if (!uuidAttempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND" }, { status: 404 });
 
       const resolved = await resolveLegacyByStartedAt(uuidAttempt);
-      if (!resolved.ok) {
-        return NextResponse.json({ ok: false, error: "LEGACY_MATCH_FAILED", detail: resolved }, { status: 404 });
-      }
+      if (!resolved.ok) return NextResponse.json({ ok: false, error: "LEGACY_MATCH_FAILED", detail: resolved }, { status: 404 });
 
       if (!authorizeAdminForAttempt(adminEmpId, adminTeam, resolved.attempt)) {
         return NextResponse.json({ ok: false, error: "FORBIDDEN" }, { status: 403 });
       }
 
-      const legacyDetail = await buildLegacyDetailFromExamAttempts(resolved.attempt);
-      if (!legacyDetail.ok) {
-        return NextResponse.json({ ok: false, error: legacyDetail.error, detail: legacyDetail.detail }, { status: 500 });
-      }
+      const d = await buildDetail(resolved.attempt);
+      if (!d.ok) return NextResponse.json({ ok: false, error: d.error, detail: d.detail }, { status: 500 });
 
       return NextResponse.json({
         ok: true,
-        attempt: legacyDetail.attempt,
-        graded: legacyDetail.graded,
-        meta: {
-          ...legacyDetail.meta,
-          idType: "uuid->num",
-          source: "attempts + exam_attempts",
-          originalUuid: attemptKey,
-          adminTeam,
-          legacyCandidates: resolved.candidates,
-        },
+        attempt: d.attempt,
+        graded: d.graded,
+        meta: { ...d.meta, idType: "uuid->num", originalUuid: attemptKey, adminTeam, legacyCandidates: resolved.candidates },
       });
     }
 
-    // =========================
-    // 2) numeric attempt (legacy)
-    // =========================
+    // 2) numeric attempt
     if (!isNumericId(attemptKey)) {
       return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
@@ -325,34 +299,20 @@ export async function GET(req: Request) {
       return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID" }, { status: 400 });
     }
 
-    // ✅ 우선 id로 조회(팀/owner 판단은 authorize에서)
-    let r1 = await supabaseAdmin.from("exam_attempts").select("*").eq("id", attemptId).maybeSingle();
+    const r = await supabaseAdmin.from("exam_attempts").select("*").eq("id", attemptId).maybeSingle();
+    if (r.error) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: r.error }, { status: 500 });
 
-    // owner_admin 컬럼 없어서 터진 케이스 방어(드물지만)
-    if (r1.error && isMissingColumn(r1.error, "owner_admin")) {
-      r1 = await supabaseAdmin.from("exam_attempts").select("*").eq("id", attemptId).maybeSingle();
-    }
-
-    if (r1.error) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: r1.error }, { status: 500 });
-
-    const attempt = r1.data;
+    const attempt = r.data;
     if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
 
     if (!authorizeAdminForAttempt(adminEmpId, adminTeam, attempt)) {
       return NextResponse.json({ ok: false, error: "FORBIDDEN", detail: { adminTeam } }, { status: 403 });
     }
 
-    const legacyDetail = await buildLegacyDetailFromExamAttempts(attempt);
-    if (!legacyDetail.ok) {
-      return NextResponse.json({ ok: false, error: legacyDetail.error, detail: legacyDetail.detail }, { status: 500 });
-    }
+    const d = await buildDetail(attempt);
+    if (!d.ok) return NextResponse.json({ ok: false, error: d.error, detail: d.detail }, { status: 500 });
 
-    return NextResponse.json({
-      ok: true,
-      attempt: legacyDetail.attempt,
-      graded: legacyDetail.graded,
-      meta: { ...legacyDetail.meta, adminTeam },
-    });
+    return NextResponse.json({ ok: true, attempt: d.attempt, graded: d.graded, meta: { ...d.meta, adminTeam } });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: "RESULT_DETAIL_UNHANDLED", detail: String(e?.message ?? e) },

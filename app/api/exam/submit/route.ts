@@ -69,7 +69,6 @@ function isMissingColumn(err: any) {
 async function safeUpdateAttempt(client: any, attemptId: number, patch: Record<string, any>) {
   let keys = Object.keys(patch);
 
-  // 최대 12번 정도 컬럼 제거하며 재시도
   for (let i = 0; i < 12; i++) {
     const cur: any = {};
     for (const k of keys) cur[k] = patch[k];
@@ -87,8 +86,9 @@ async function safeUpdateAttempt(client: any, attemptId: number, patch: Record<s
         continue;
       }
 
-      // 못뽑으면 흔한 후보부터 제거
-      const fallback = ["total_points", "correct_count", "wrong_count", "status", "team", "answers"];
+      // ✅ fallback에서 total_points를 먼저 빼버리면 또 25/0 같은 값 나옴
+      // 그래서 total_points는 fallback에서 제외
+      const fallback = ["wrong_count", "status", "team", "answers", "total_questions", "score", "submitted_at"];
       const rm = fallback.find((x) => keys.includes(x));
       if (rm) {
         keys = keys.filter((x) => x !== rm);
@@ -98,16 +98,14 @@ async function safeUpdateAttempt(client: any, attemptId: number, patch: Record<s
 
     return { ok: false as const, error: r.error };
   }
+
   return { ok: false as const, error: "UPDATE_TRIES_EXCEEDED" as any };
 }
 
 export async function POST(req: NextRequest) {
   const { client, error } = getSupabaseAdmin();
   if (error) {
-    return NextResponse.json(
-      { ok: false, error: "SUPABASE_ADMIN_INIT_FAILED", detail: error },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "SUPABASE_ADMIN_INIT_FAILED", detail: error }, { status: 500 });
   }
 
   try {
@@ -116,20 +114,11 @@ export async function POST(req: NextRequest) {
 
     const attemptIdRaw = body?.attemptId ?? body?.attempt_id ?? body?.id ?? null;
     if (!isNumericId(attemptIdRaw)) {
-      return NextResponse.json(
-        { ok: false, error: "INVALID_ATTEMPT_ID", detail: { attemptIdRaw } },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "INVALID_ATTEMPT_ID", detail: { attemptIdRaw } }, { status: 400 });
     }
     const attemptId = Number(attemptIdRaw);
 
-    const answersObj =
-      body?.answers ??
-      body?.answerMap ??
-      body?.selected ??
-      body?.items ??
-      {};
-
+    const answersObj = body?.answers ?? body?.answerMap ?? body?.selected ?? body?.items ?? {};
     const answersMap: Record<string, number> = {};
     if (answersObj && typeof answersObj === "object" && !Array.isArray(answersObj)) {
       for (const [k, v] of Object.entries(answersObj)) {
@@ -155,12 +144,12 @@ export async function POST(req: NextRequest) {
     if (aErr) return NextResponse.json({ ok: false, error: "ATTEMPT_QUERY_FAILED", detail: aErr }, { status: 500 });
     if (!attempt) return NextResponse.json({ ok: false, error: "ATTEMPT_NOT_FOUND", detail: { attemptId } }, { status: 404 });
 
-    // ✅ team 결정
+    // team 결정
     const empIdCookie = s(req.cookies.get("empId")?.value);
     const teamCookie = s(req.cookies.get("team")?.value);
     const team = s((attempt as any)?.team) || teamCookie || (empIdCookie === "admin_gs" ? "B" : "A");
 
-    // 2) qids
+    // 2) question_ids
     const questionIds: string[] = Array.isArray((attempt as any)?.question_ids)
       ? (attempt as any).question_ids.map((x: any) => s(x)).filter(Boolean)
       : [];
@@ -177,18 +166,20 @@ export async function POST(req: NextRequest) {
     const qById = new Map<string, any>();
     for (const q of questions ?? []) qById.set(String((q as any).id), q);
 
-    // 4) 채점 + 통계
+    // 4) 채점 + 저장 rows 구성
     let score = 0;
     let totalPoints = 0;
-    let correctCount = 0;
     let wrongCount = 0;
 
     const rowsToInsert: any[] = [];
 
     for (const qid of uniqQids) {
       const q = qById.get(String(qid));
-      const pts = n(q?.points, 0) ?? 0;
-      totalPoints += pts;
+      // ✅ points 없으면 1점 기본
+      const pts = n(q?.points, null);
+      const point = pts === null ? 1 : (pts ?? 0);
+
+      totalPoints += point;
 
       const selectedIndex = Object.prototype.hasOwnProperty.call(answersMap, qid)
         ? Number(answersMap[qid])
@@ -196,7 +187,6 @@ export async function POST(req: NextRequest) {
 
       const correctIndex = pickCorrectIndex(q);
 
-      // 미응답은 rowsToInsert에 안 넣어도 됨
       if (selectedIndex === null || selectedIndex === undefined) continue;
 
       const isCorrect =
@@ -205,8 +195,7 @@ export async function POST(req: NextRequest) {
           : false;
 
       if (isCorrect) {
-        score += pts;
-        correctCount += 1;
+        score += point;
       } else {
         wrongCount += 1;
       }
@@ -218,7 +207,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 5) 답안 테이블 저장(기존 유지)
+    // 5) 답안 테이블 저장: exam_answers 사용(너 현재 구조 유지)
     const { error: delErr } = await client.from("exam_answers").delete().eq("attempt_id", attemptId);
     if (delErr) return NextResponse.json({ ok: false, error: "ANSWERS_DELETE_FAILED", detail: delErr }, { status: 500 });
 
@@ -227,18 +216,18 @@ export async function POST(req: NextRequest) {
       if (insErr) return NextResponse.json({ ok: false, error: "ANSWERS_INSERT_FAILED", detail: insErr }, { status: 500 });
     }
 
-    // ✅ 핵심: exam_attempts.answers에도 map 저장 (관리자 상세가 이걸로 채점/오답 생성함)
+    // 6) attempt 업데이트
     const nowIso = new Date().toISOString();
 
     const patch: any = {
       submitted_at: nowIso,
       status: "SUBMITTED",
-      score,
       team,
-      answers: { map: answersMap }, // ✅ 이거 없어서 오답이 안 나왔던 거
+      score,
       total_points: totalPoints,
-      correct_count: correctCount,
+      total_questions: uniqQids.length, // ✅ 문항수는 무조건 이 값
       wrong_count: wrongCount,
+      answers: { map: answersMap }, // ✅ 관리자 상세에서 fallback으로도 사용
     };
 
     const up = await safeUpdateAttempt(client, attemptId, patch);
@@ -249,16 +238,12 @@ export async function POST(req: NextRequest) {
       attemptId,
       score,
       totalPoints,
-      correctCount,
       wrongCount,
       savedAnswers: rowsToInsert.length,
       isAuto,
       redirectUrl: `/exam/result/${attemptId}`,
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: "SUBMIT_FAILED", detail: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "SUBMIT_FAILED", detail: String(e?.message ?? e) }, { status: 500 });
   }
 }
