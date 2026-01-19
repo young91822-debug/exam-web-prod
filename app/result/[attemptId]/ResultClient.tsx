@@ -1,15 +1,45 @@
 // app/result/[attemptId]/ResultClient.tsx
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 
-type Item = {
-  id: number;
+type Graded = {
+  questionId: any;
   content: string;
   choices: string[];
+  correctIndex: number | null;
+  selectedIndex: number | null;
+  isCorrect: boolean;
   points: number;
-  answer_index: number;
-  picked?: number;
+};
+
+type ApiOk = {
+  ok: true;
+  attempt?: {
+    id: any;
+    emp_id?: string | null;
+    started_at?: any;
+    submitted_at?: any;
+    status?: string | null;
+    score?: number;
+    total_points?: number;
+    total_questions?: number;
+    team?: string | null;
+  };
+  graded?: Graded[];
+
+  // legacy/fallback
+  items?: any[];
+  questions?: any[];
+  wrongQuestions?: any[];
+  wrongQuestionIds?: any[];
+
+  score?: number;
+  totalPoints?: number;
+  totalQuestions?: number;
+  wrongCount?: number;
+  percent?: number;
 };
 
 async function safeJson(res: Response) {
@@ -25,12 +55,106 @@ async function safeJson(res: Response) {
   return { ok: false, error: "NON_JSON", raw: text };
 }
 
+function s(v: any) {
+  return String(v ?? "").trim();
+}
+
+function fmt(v: any) {
+  if (!v) return "-";
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString("ko-KR");
+}
+
+function pct(score: number, total: number) {
+  if (!Number.isFinite(score) || !Number.isFinite(total) || total <= 0) return 0;
+  return Math.round((score / total) * 100);
+}
+
+function cls(...xs: (string | false | null | undefined)[]) {
+  return xs.filter(Boolean).join(" ");
+}
+
+/** 서버 응답이 graded든 legacy items든, Graded 형태로 통일 */
+function normalizeToGraded(json: any): Graded[] {
+  // ✅ 최신 포맷
+  if (Array.isArray(json?.graded)) {
+    return json.graded.map((g: any, idx: number) => ({
+      questionId: g?.questionId ?? g?.question_id ?? g?.id ?? idx,
+      content: String(g?.content ?? ""),
+      choices: Array.isArray(g?.choices) ? g.choices.map((x: any) => String(x ?? "")) : [],
+      correctIndex: g?.correctIndex ?? g?.correct_index ?? g?.answer_index ?? null,
+      selectedIndex: g?.selectedIndex ?? g?.selected_index ?? g?.picked ?? null,
+      isCorrect: !!g?.isCorrect,
+      points: Number(g?.points ?? 0),
+    }));
+  }
+
+  // ✅ legacy 포맷들 (items / questions / wrongQuestions 등)
+  const rawList =
+    (json?.items ?? json?.wrongQuestions ?? json?.questions ?? []) as any[];
+
+  return (rawList || []).map((x: any, idx: number) => {
+    const questionId = x?.questionId ?? x?.question_id ?? x?.id ?? idx;
+    const content = String(x?.content ?? x?.question?.content ?? "");
+    const choicesRaw = x?.choices ?? x?.question?.choices ?? [];
+    const choices = Array.isArray(choicesRaw) ? choicesRaw.map((z: any) => String(z ?? "")) : [];
+
+    const points = Number(x?.points ?? x?.question?.points ?? 0);
+
+    const correctIndex =
+      x?.correctIndex ??
+      x?.correct_index ??
+      x?.answer_index ??
+      x?.answerIndex ??
+      x?.question?.answer_index ??
+      null;
+
+    const pickedRaw =
+      x?.picked ??
+      x?.picked_index ??
+      x?.user_answer_index ??
+      x?.myAnswer ??
+      x?.selectedIndex ??
+      x?.selected_index;
+
+    const selectedIndex =
+      typeof pickedRaw === "number"
+        ? pickedRaw
+        : typeof pickedRaw === "string"
+        ? Number(pickedRaw)
+        : null;
+
+    const isCorrect =
+      typeof selectedIndex === "number" &&
+      typeof correctIndex === "number" &&
+      selectedIndex === correctIndex;
+
+    return {
+      questionId,
+      content,
+      choices,
+      correctIndex: typeof correctIndex === "number" ? correctIndex : null,
+      selectedIndex: typeof selectedIndex === "number" ? selectedIndex : null,
+      isCorrect,
+      points,
+    };
+  });
+}
+
 export default function ResultClient({ attemptId }: { attemptId: string }) {
+  const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<any>(null);
   const [errorMsg, setErrorMsg] = useState("");
 
+  // UI
+  const [tab, setTab] = useState<"wrong" | "all">("wrong");
+  const [openAll, setOpenAll] = useState(false);
+  const [openMap, setOpenMap] = useState<Record<string, boolean>>({});
+
   useEffect(() => {
+    let dead = false;
+
     (async () => {
       setLoading(true);
       setErrorMsg("");
@@ -38,8 +162,10 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
         const res = await fetch(`/api/result/${attemptId}`, { cache: "no-store" });
         const json = await safeJson(res);
 
+        if (dead) return;
+
         if (!res.ok || !json?.ok) {
-          setErrorMsg(JSON.stringify(json, null, 2));
+          setErrorMsg(json?.error ? `${json.error}\n${JSON.stringify(json?.detail ?? json, null, 2)}` : JSON.stringify(json, null, 2));
           setLoading(false);
           return;
         }
@@ -47,150 +173,303 @@ export default function ResultClient({ attemptId }: { attemptId: string }) {
         setData(json);
         setLoading(false);
       } catch (e: any) {
-        setErrorMsg(e?.message ?? String(e));
+        if (!dead) setErrorMsg(e?.message ?? String(e));
         setLoading(false);
       }
     })();
+
+    return () => {
+      dead = true;
+    };
   }, [attemptId]);
 
-  const items: Item[] = useMemo(() => {
-    const rawList = (data?.items ?? data?.wrongQuestions ?? data?.questions ?? []) as any[];
-    return (rawList || []).map((x: any, idx: number) => {
-      const id = Number(x?.id ?? x?.questionId ?? x?.question_id ?? x?.question?.id ?? idx);
-      const content = String(x?.content ?? x?.question?.content ?? "");
-      const choices = (x?.choices ?? x?.question?.choices ?? []) as string[];
-      const points = Number(x?.points ?? x?.question?.points ?? 0);
-      const answer_index = Number(x?.answer_index ?? x?.answerIndex ?? x?.question?.answer_index ?? 0);
+  const attempt = (data as ApiOk)?.attempt ?? {};
+  const gradedAll = useMemo(() => normalizeToGraded(data), [data]);
 
-      const pickedRaw =
-        x?.picked ??
-        x?.picked_index ??
-        x?.user_answer_index ??
-        x?.myAnswer ??
-        x?.selectedIndex;
+  const wrongOnly = useMemo(
+    () => gradedAll.filter((g) => g?.isCorrect === false),
+    [gradedAll]
+  );
 
-      const picked =
-        typeof pickedRaw === "number"
-          ? pickedRaw
-          : typeof pickedRaw === "string"
-          ? Number(pickedRaw)
-          : undefined;
+  const list = tab === "wrong" ? wrongOnly : gradedAll;
 
-      return { id, content, choices, points, answer_index, picked };
-    });
-  }, [data]);
+  // 점수/요약 (서버 값 우선, 없으면 계산)
+  const totalPoints = useMemo(() => {
+    const fromServer =
+      Number((data as any)?.totalPoints) ||
+      Number((attempt as any)?.total_points) ||
+      0;
+    if (fromServer > 0) return fromServer;
+    return gradedAll.reduce((acc, g) => acc + Number(g?.points ?? 0), 0);
+  }, [data, attempt, gradedAll]);
 
-  // ✅ 점수는 "퍼센트(0~100)"만 표시
-  const percent = useMemo(() => {
-    // 서버가 percent 주면 우선 사용
-    if (typeof data?.percent === "number") return data.percent;
+  const scorePoints = useMemo(() => {
+    const fromServer = Number((attempt as any)?.score ?? (data as any)?.score ?? 0);
+    // 서버가 원점수 내려주면 그걸 쓰고, 아니면 graded로 계산
+    if (Number.isFinite(fromServer) && fromServer > 0) return fromServer;
+    return gradedAll.reduce((acc, g) => acc + (g?.isCorrect ? Number(g?.points ?? 0) : 0), 0);
+  }, [attempt, data, gradedAll]);
 
-    // 서버가 score(원점수)를 주는 경우를 대비해 계산 (안 오면 0)
-    const scorePoints =
-      typeof data?.scorePoints === "number"
-        ? data.scorePoints
-        : typeof data?.score === "number"
-        ? data.score
-        : 0;
+  const totalQuestions = useMemo(() => {
+    const fromServer =
+      Number((data as any)?.totalQuestions) ||
+      Number((attempt as any)?.total_questions) ||
+      0;
+    if (fromServer > 0) return fromServer;
+    return gradedAll.length;
+  }, [data, attempt, gradedAll.length]);
 
-    const totalPoints =
-      typeof data?.totalPoints === "number"
-        ? data.totalPoints
-        : items.reduce((s, q) => s + (Number(q.points) || 0), 0);
-
-    if (totalPoints <= 0) return 0;
-    return Math.round((scorePoints / totalPoints) * 100);
-  }, [data?.percent, data?.scorePoints, data?.score, data?.totalPoints, items]);
-
-  // ✅ 틀린 문항 개수: 서버가 wrongQuestionIds를 주면 그걸 사용(가장 정확)
   const wrongCount = useMemo(() => {
-    if (Array.isArray(data?.wrongQuestionIds)) return data.wrongQuestionIds.length;
+    const fromServer = Number((data as any)?.wrongCount ?? 0);
+    if (fromServer > 0) return fromServer;
 
-    // fallback: picked가 있는 것만 비교
-    return items.filter((q) => typeof q.picked === "number" && q.picked !== q.answer_index).length;
-  }, [data?.wrongQuestionIds, items]);
+    if (Array.isArray((data as any)?.wrongQuestionIds)) {
+      return (data as any).wrongQuestionIds.length;
+    }
+    return wrongOnly.length;
+  }, [data, wrongOnly.length]);
 
-  if (loading) return <div style={{ padding: 24, fontFamily: "system-ui" }}>결과 불러오는 중...</div>;
+  const correctCount = Math.max(0, totalQuestions - wrongCount);
 
-  if (errorMsg) {
+  const percent = useMemo(() => {
+    if (typeof (data as any)?.percent === "number") return (data as any).percent;
+    return pct(scorePoints, totalPoints);
+  }, [data, scorePoints, totalPoints]);
+
+  useEffect(() => {
+    // 오답 탭이면 처음 3개만 자동 펼치기
+    if (tab === "wrong" && wrongOnly.length > 0) {
+      const next: Record<string, boolean> = {};
+      for (const g of wrongOnly.slice(0, 3)) next[String(g.questionId)] = true;
+      setOpenMap((prev) => ({ ...next, ...prev }));
+    }
+  }, [tab, wrongOnly.length]);
+
+  function toggleOne(key: string) {
+    setOpenMap((m) => ({ ...m, [key]: !m[key] }));
+  }
+
+  if (loading) {
     return (
-      <div style={{ padding: 24, fontFamily: "system-ui", whiteSpace: "pre-wrap", color: "crimson" }}>
-        {errorMsg}
+      <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+        <div className="max-w-5xl mx-auto p-6">결과 불러오는 중…</div>
       </div>
     );
   }
 
-  return (
-    <div style={{ padding: 24, fontFamily: "system-ui" }}>
-      <h1 style={{ fontSize: 22, fontWeight: 800, marginBottom: 10 }}>시험</h1>
-
-      <div style={{ marginBottom: 12, color: "#555" }}>
-        attemptId: <b>{attemptId}</b> / 문항수: <b>{items.length}</b>
+  if (errorMsg) {
+    return (
+      <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+        <div className="max-w-3xl mx-auto p-6 space-y-3">
+          <div className="font-semibold text-rose-200">결과를 불러오지 못했습니다.</div>
+          <pre className="text-xs text-slate-300 whitespace-pre-wrap break-words border border-slate-700 rounded-xl bg-slate-900/60 p-3">
+            {errorMsg}
+          </pre>
+          <button
+            className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+            onClick={() => router.refresh()}
+          >
+            새로고침
+          </button>
+        </div>
       </div>
+    );
+  }
 
-      <div style={{ border: "2px solid #111", borderRadius: 14, padding: 14, marginBottom: 14 }}>
-        <div style={{ fontSize: 18, fontWeight: 900 }}>
-          점수: <span style={{ fontSize: 22 }}>{percent}</span>
-          <span style={{ fontWeight: 700, color: "#666" }}> / 100</span>
+  const empId = s((attempt as any)?.emp_id);
+  const team = s((attempt as any)?.team);
+
+  return (
+    <div className="min-h-[100dvh] bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+      <div className="max-w-5xl mx-auto p-6 space-y-6">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h1 className="text-3xl font-extrabold tracking-tight">결과 상세</h1>
+            <div className="text-sm text-slate-300 mt-1">제출이 완료되었습니다.</div>
+          </div>
+
+          <div className="flex gap-2">
+            <a
+              className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+              href="/exam"
+            >
+              다시 시험 보기
+            </a>
+            <button
+              className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+              onClick={() => router.push("/exam")}
+            >
+              ← 목록
+            </button>
+          </div>
         </div>
 
-        <div style={{ marginTop: 6, fontWeight: 800 }}>틀린 문항 ({wrongCount}개)</div>
-      </div>
+        {/* meta pills */}
+        <div className="flex flex-wrap gap-2">
+          <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
+            attemptId: {attemptId}
+          </span>
+          {empId ? (
+            <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
+              응시자: {empId}
+            </span>
+          ) : null}
+          {team ? (
+            <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
+              팀: {team}
+            </span>
+          ) : null}
+          <span className="px-3 py-1 rounded-full bg-slate-900/60 border border-slate-700 text-xs">
+            상태: {s((attempt as any)?.status) || "SUBMITTED"}
+          </span>
+        </div>
 
-      <div style={{ display: "grid", gap: 14 }}>
-        {items.map((q, idx) => {
-          const my = typeof q.picked === "number" ? q.picked : -1;
+        {/* Summary cards */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
+            <div className="text-sm text-slate-300">점수</div>
+            <div className="text-3xl font-extrabold mt-1">
+              {scorePoints}{" "}
+              <span className="text-slate-400 text-base font-semibold">/ {totalPoints}</span>
+            </div>
+            <div className="mt-3 h-2 rounded-full bg-slate-800 overflow-hidden">
+              <div className="h-full bg-slate-200/70" style={{ width: `${percent}%` }} />
+            </div>
+          </div>
 
-          return (
-            <div key={`q-${q.id}-${idx}`} style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14 }}>
-              <div style={{ fontWeight: 800, marginBottom: 10 }}>
-                {idx + 1}. {q.content} <span style={{ color: "#888", fontWeight: 700 }}>({q.points}점)</span>
-              </div>
+          <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
+            <div className="text-sm text-slate-300">정답률</div>
+            <div className="text-3xl font-extrabold mt-1">{percent}%</div>
+            <div className="text-sm text-slate-300 mt-2">
+              정답 {correctCount} / {totalQuestions} · 오답 {wrongCount}
+            </div>
+          </div>
 
-              <div style={{ display: "grid", gap: 8 }}>
-                {q.choices.map((c, i) => {
-                  const isCorrect = i === q.answer_index;
-                  const isMine = i === my;
+          <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
+            <div className="text-sm text-slate-300">시작</div>
+            <div className="text-lg font-semibold mt-2">{fmt((attempt as any)?.started_at)}</div>
+          </div>
 
-                  let bg = "#fff";
-                  let left = "•";
-                  let label = "";
+          <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4">
+            <div className="text-sm text-slate-300">제출</div>
+            <div className="text-lg font-semibold mt-2">{fmt((attempt as any)?.submitted_at)}</div>
+          </div>
+        </div>
 
-                  if (isCorrect) {
-                    bg = "#eaffea";
-                    left = "✅";
-                    label = " (정답)";
-                  } else if (isMine) {
-                    bg = "#ffecec";
-                    left = "❌";
-                    label = " (내 답)";
-                  }
+        {/* Controls */}
+        <div className="flex items-center justify-between gap-3">
+          <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60">
+            <input
+              type="checkbox"
+              checked={tab === "wrong"}
+              onChange={(e) => setTab(e.target.checked ? "wrong" : "all")}
+            />
+            <span className="text-sm font-semibold">틀린 문제만 보기</span>
+          </label>
 
-                  return (
-                    <div
-                      key={`choice-${q.id}-${i}`}
-                      style={{
-                        padding: "8px 10px",
-                        borderRadius: 10,
-                        border: "1px solid #eee",
-                        background: bg,
-                        display: "flex",
-                        gap: 10,
-                        alignItems: "center",
-                      }}
-                    >
-                      <span style={{ width: 22, textAlign: "center" }}>{left}</span>
-                      <div style={{ flex: 1 }}>
-                        {c}
-                        {label && <b>{label}</b>}
+          <div className="flex items-center gap-2">
+            <button
+              className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+              onClick={() => {
+                const next = !openAll;
+                setOpenAll(next);
+                const m: Record<string, boolean> = {};
+                for (const g of list) m[String(g.questionId)] = next;
+                setOpenMap((prev) => ({ ...prev, ...m }));
+              }}
+            >
+              {openAll ? "모두 접기" : "모두 펼치기"}
+            </button>
+
+            <button
+              className="px-3 py-2 rounded-xl border border-slate-700 bg-slate-900/60 hover:bg-slate-900 text-sm"
+              onClick={() => window.print()}
+            >
+              인쇄
+            </button>
+          </div>
+        </div>
+
+        {/* Questions */}
+        {list.length === 0 ? (
+          <div className="text-sm text-slate-300">
+            {tab === "wrong" ? "오답이 없습니다. 잘했어요!" : "표시할 문항이 없습니다."}
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {list.map((g, idx) => {
+              const key = String(g.questionId ?? idx);
+              const opened = !!openMap[key];
+              const selected = g.selectedIndex;
+              const correct = g.correctIndex;
+              const isCorrect = !!g.isCorrect;
+
+              return (
+                <div key={key} className="rounded-2xl border border-slate-700 bg-slate-900/60 overflow-hidden">
+                  <button
+                    className="w-full text-left px-4 py-4 hover:bg-slate-900 flex items-start justify-between gap-3"
+                    onClick={() => toggleOne(key)}
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs text-slate-400">Q{idx + 1}</div>
+                      <div className="font-semibold leading-snug break-words">{g.content}</div>
+                      <div className="text-xs text-slate-400 mt-2">
+                        선택: {selected === null || selected === undefined ? "-" : selected + 1} / 정답:{" "}
+                        {correct === null || correct === undefined ? "-" : correct + 1}
                       </div>
                     </div>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
+
+                    <div
+                      className={cls(
+                        "shrink-0 px-3 py-1 rounded-full text-xs font-extrabold border",
+                        isCorrect
+                          ? "bg-emerald-900/40 text-emerald-200 border-emerald-700/60"
+                          : "bg-rose-900/40 text-rose-200 border-rose-700/60"
+                      )}
+                    >
+                      {isCorrect ? "정답" : "오답"}
+                    </div>
+                  </button>
+
+                  {opened && (
+                    <div className="px-4 pb-4 space-y-2">
+                      {(g.choices ?? []).map((c, i) => {
+                        const mine = selected === i;
+                        const ans = correct === i;
+
+                        return (
+                          <div
+                            key={i}
+                            className={cls(
+                              "rounded-xl border px-3 py-2 text-sm flex items-start gap-2",
+                              "border-slate-700 bg-slate-950/30",
+                              ans ? "border-emerald-700/60 bg-emerald-900/20" : "",
+                              mine && !ans ? "border-amber-700/60 bg-amber-900/20" : ""
+                            )}
+                          >
+                            <div className="shrink-0 w-6 text-slate-400 font-semibold">{i + 1}.</div>
+                            <div className="min-w-0 break-words">
+                              <div>{c}</div>
+                              <div className="mt-1 text-xs text-slate-400">
+                                {ans ? "정답" : ""}
+                                {mine ? " · 내 선택" : ""}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                      <div className="text-xs text-slate-400 mt-2">
+                        배점: {Number.isFinite(Number(g.points)) ? g.points : 0}점
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );
