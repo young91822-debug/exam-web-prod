@@ -48,27 +48,19 @@ async function readBody(req: Request) {
 /** ✅ 스코프: 쿠키 empId가 곧 owner_admin */
 function getAdminEmpId(req: NextRequest) {
   const empId = s(req.cookies.get("empId")?.value || req.cookies.get("emp_id")?.value);
-  const role = s(req.cookies.get("role")?.value);
-
   if (!empId) return { ok: false as const, error: "UNAUTHORIZED" };
-  // 필요하면 role 체크 켜기
-  // if (role !== "admin") return { ok: false as const, error: "FORBIDDEN" };
-
-  return { ok: true as const, empId, role };
+  return { ok: true as const, empId };
 }
 
 /* ---------------- GET ---------------- */
-/** ✅ 목록: "내가 만든(owner_admin=empId)" 계정만 */
 export async function GET(req: NextRequest) {
   const scope = getAdminEmpId(req);
-  if (!scope.ok) {
-    return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
-  }
+  if (!scope.ok) return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
 
   try {
     const { data, error } = await sb
       .from(TABLE)
-      .select("id, emp_id, name, is_active, created_at, team, role, owner_admin")
+      .select("id, emp_id, username, name, is_active, created_at, team, role, owner_admin")
       .eq("owner_admin", scope.empId)
       .order("created_at", { ascending: false });
 
@@ -79,7 +71,6 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // ✅ 프론트 호환: items + rows 둘 다 제공
     return NextResponse.json({ ok: true, items: data ?? [], rows: data ?? [] });
   } catch (e: any) {
     return NextResponse.json(
@@ -90,18 +81,9 @@ export async function GET(req: NextRequest) {
 }
 
 /* ---------------- POST ---------------- */
-/**
- * ✅ 생성(혹은 내 소유 계정이면 업데이트)
- * - emp_id가 이미 존재:
- *   - owner_admin이 나와 다르면: 403 (절대 못 건드림)
- *   - owner_admin이 나면: 업데이트 + 비번 1234 리셋
- * - 신규면: insert + owner_admin=empId 강제
- */
 export async function POST(req: NextRequest) {
   const scope = getAdminEmpId(req);
-  if (!scope.ok) {
-    return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
-  }
+  if (!scope.ok) return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
 
   try {
     const body = await readBody(req);
@@ -117,17 +99,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "MISSING_EMP_ID" }, { status: 400 });
     }
 
-    // ✅ 임시 비번
+    // ✅ username NOT NULL 대응: emp_id를 그대로 username으로 사용
+    const username = emp_id;
+
     const tempPassword = "1234";
     const password_hash = makePasswordHash(tempPassword);
 
-    // 0) emp_id 존재 + 소유자 확인
-    const ex = await sb
-      .from(TABLE)
-      .select("id, emp_id, owner_admin")
-      .eq("emp_id", emp_id)
-      .maybeSingle();
-
+    // 0) emp_id 존재 확인
+    const ex = await sb.from(TABLE).select("id, emp_id, owner_admin").eq("emp_id", emp_id).maybeSingle();
     if (ex.error) {
       return NextResponse.json(
         { ok: false, error: "DB_QUERY_FAILED", detail: String(ex.error?.message ?? ex.error) },
@@ -135,10 +114,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ✅ 이미 존재하면: 다른 owner면 403 / 내 소유면 업데이트(+비번리셋)
     if (ex.data) {
       const owner = s(ex.data.owner_admin);
 
-      // ✅ 다른 owner_admin이면 수정/생성 금지
       if (owner && owner !== scope.empId) {
         return NextResponse.json(
           { ok: false, error: "FORBIDDEN_OTHER_OWNER", detail: `owner_admin=${owner}` },
@@ -146,14 +125,14 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      // ✅ 내 소유(or owner 비어있음) -> 업데이트 + 비번 리셋 + owner_admin 정리
       const { data, error } = await sb
         .from(TABLE)
         .update({
+          username, // ✅ 필수
           name: name || null,
           is_active,
           role: allowedRole,
-          password_hash,
+          password_hash, // ✅ 필수(로그인용)
           owner_admin: scope.empId,
         })
         .eq("emp_id", emp_id)
@@ -171,14 +150,15 @@ export async function POST(req: NextRequest) {
     }
 
     // 1) 신규 insert
-    const row = {
+    const row: any = {
       emp_id,
+      username, // ✅ 핵심: NOT NULL 충족
       name: name || null,
       is_active,
       role: allowedRole,
-      password_hash,
+      password_hash, // ✅ 로그인과 동일
       owner_admin: scope.empId,
-      team: s(body?.team) || null, // team은 옵션 (원하면 UI에서 입력/자동세팅)
+      team: s(body?.team) || null,
     };
 
     const ins = await sb.from(TABLE).insert(row).select("*").single();
@@ -199,25 +179,16 @@ export async function POST(req: NextRequest) {
 }
 
 /* ---------------- PATCH ---------------- */
-/**
- * ✅ 수정(이름/활성만)
- * - 내(owner_admin=empId) 계정만 수정 가능
- */
 export async function PATCH(req: NextRequest) {
   const scope = getAdminEmpId(req);
-  if (!scope.ok) {
-    return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
-  }
+  if (!scope.ok) return NextResponse.json({ ok: false, error: scope.error }, { status: 401 });
 
   try {
     const body = await readBody(req);
     const id = body?.id;
 
-    if (!id) {
-      return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
-    }
+    if (!id) return NextResponse.json({ ok: false, error: "MISSING_ID" }, { status: 400 });
 
-    // ✅ 대상 소유권 체크
     const ex = await sb.from(TABLE).select("id, owner_admin").eq("id", id).maybeSingle();
     if (ex.error) {
       return NextResponse.json(
@@ -246,7 +217,7 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "NO_FIELDS" }, { status: 400 });
     }
 
-    // ✅ owner_admin 비어있는 레거시 row면 "내 소유"로 정리
+    // 레거시 owner_admin 비어있으면 내 소유로 정리
     patch.owner_admin = scope.empId;
 
     const up = await sb.from(TABLE).update(patch).eq("id", id).select("*");
