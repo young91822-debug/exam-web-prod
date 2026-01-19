@@ -43,6 +43,12 @@ function upperTeam(v: any) {
   return t === "B" ? "B" : "A";
 }
 
+/** ✅ UUID 검증 (questions.id가 uuid라서 필수 안전장치) */
+function isUUID(v: any) {
+  const x = s(v);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);
+}
+
 /**
  * ✅ 관리자 팀 가드
  * - owner_admin 있으면 우선 owner_admin === adminEmpId
@@ -170,9 +176,13 @@ async function loadAnswersFromAttemptAnswers(attemptId: number) {
 
 async function buildDetailFromExamAttempts(attempt: any) {
   const attemptId = n(attempt?.id, null);
-  const questionIds: string[] = Array.isArray(attempt?.question_ids)
+
+  // ✅ question_ids 안전 정리 (uuid만 통과)
+  const rawIds: string[] = Array.isArray(attempt?.question_ids)
     ? attempt.question_ids.map((x: any) => s(x)).filter(Boolean)
     : [];
+
+  const questionIds = rawIds.filter((x) => isUUID(x));
 
   // ✅ 1) attempt.answers 우선
   let answersMap = parseAnswersFromAttemptColumn(attempt);
@@ -199,18 +209,27 @@ async function buildDetailFromExamAttempts(attempt: any) {
     }
   }
 
-  // questions 조회
-  const { data: questions, error: qErr } = await supabaseAdmin
-    .from("questions")
-    .select("*")
-    .in("id", questionIds.length ? (questionIds as any) : ["__never__"]);
+  // ✅ questions 조회
+  // - questionIds가 비어있으면 "조회 자체를 안 함" (중요)
+  let questions: any[] = [];
+  if (questionIds.length > 0) {
+    const qr = await supabaseAdmin
+      .from("questions")
+      .select("*")
+      .in("id", questionIds as any);
 
-  if (qErr) return { ok: false as const, error: "QUESTIONS_QUERY_FAILED", detail: qErr };
+    if (qr.error) return { ok: false as const, error: "QUESTIONS_QUERY_FAILED", detail: qr.error };
+    questions = qr.data ?? [];
+  }
 
   const qById = new Map<string, any>();
   for (const q of questions ?? []) qById.set(String((q as any).id), q);
 
-  const graded = questionIds.map((qid) => {
+  // graded는 원래 attempt.question_ids 기준으로 "순서" 유지하고 싶을 수 있음
+  // 근데 uuid 아닌 값은 아예 문제라서 제외하는 게 안전
+  const gradedIds = questionIds;
+
+  const graded = gradedIds.map((qid) => {
     const q = qById.get(String(qid)) ?? {};
     const key = String(qid).trim();
 
@@ -276,6 +295,8 @@ async function buildDetailFromExamAttempts(attempt: any) {
       wrongQ,
       score100,
       mapKeysCount: Object.keys(answersMap).length,
+      rawQuestionIdsCount: rawIds.length,
+      filteredQuestionIdsCount: questionIds.length,
     },
   };
 }
