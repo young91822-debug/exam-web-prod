@@ -42,6 +42,8 @@ export async function GET(req: NextRequest) {
     const adminTeam = upperTeam(teamCookie || (empId === "admin_gs" ? "B" : "A"));
 
     // ✅ 팀 강제 + 유효 응시만
+    // ✅ "응시 최신순" = started_at DESC (미제출도 정확히 최신이 위로)
+    //    동률/보조: submitted_at DESC → id DESC
     const r = await sb
       .from("exam_attempts")
       .select(
@@ -51,7 +53,8 @@ export async function GET(req: NextRequest) {
       .eq("team", adminTeam)
       .not("emp_id", "is", null)
       .neq("emp_id", "")
-      .order("submitted_at", { ascending: false })
+      .order("started_at", { ascending: false, nullsFirst: false })
+      .order("submitted_at", { ascending: false, nullsFirst: false })
       .order("id", { ascending: false })
       .range(from, to);
 
@@ -99,7 +102,7 @@ export async function GET(req: NextRequest) {
     });
 
     // ✅ CSV
-    if (format.toLowerCase() === "csv") {
+    if (format && format.toLowerCase() === "csv") {
       const header = [
         "attempt_id",
         "emp_id",
