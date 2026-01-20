@@ -163,12 +163,22 @@ function Pill({
   return <span style={{ ...base, ...toneStyle }}>{children}</span>;
 }
 
-function btnStyle(compact = false, primary = false): React.CSSProperties {
+function btnStyle(compact = false, primary = false, danger = false): React.CSSProperties {
   return {
     padding: compact ? "8px 10px" : "10px 12px",
     borderRadius: 14,
-    border: `1px solid ${primary ? "rgba(255,255,255,0.20)" : C.border}`,
-    background: primary ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.08)",
+    border: `1px solid ${
+      danger
+        ? "rgba(244,63,94,0.45)"
+        : primary
+        ? "rgba(255,255,255,0.20)"
+        : C.border
+    }`,
+    background: danger
+      ? "rgba(244,63,94,0.18)"
+      : primary
+      ? "rgba(255,255,255,0.14)"
+      : "rgba(255,255,255,0.08)",
     color: C.text,
     cursor: "pointer",
     fontWeight: 950,
@@ -195,6 +205,7 @@ export default function AdminResultsPage() {
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<ApiResp | null>(null);
   const [tick, setTick] = useState(0);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -215,7 +226,8 @@ export default function AdminResultsPage() {
     };
   }, [apiUrl, tick]);
 
-  const GRID_MIN_WIDTH = 1320;
+  // ✅ 화면 넓게 보기용: 더 넓게 잡아 한눈에
+  const GRID_MIN_WIDTH = 1700;
 
   const ok = (data as any)?.ok === true;
   const modeText = ok && (data as any)?.mode ? String((data as any).mode) : "";
@@ -226,12 +238,42 @@ export default function AdminResultsPage() {
   const items: ApiItem[] = ok ? (data as any).items ?? [] : [];
   const rows = items.map(normalize);
 
+  async function onDeleteAttempt(r: Row) {
+    if (deletingId) return;
+
+    const prettyId = r.idType === "uuid" ? r.id.slice(0, 8) + "..." : r.id;
+    const yes = window.confirm(
+      `정말 삭제할까요?\n\n- attemptId: ${prettyId}\n- 응시자: ${r.empId}\n\n삭제하면 복구가 어렵습니다.`
+    );
+    if (!yes) return;
+
+    setDeletingId(r.id);
+    try {
+      const res = await fetch("/api/admin/results/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ attemptId: r.id }),
+      });
+
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || json?.ok !== true) {
+        alert(`삭제 실패: ${json?.error || "DELETE_FAILED"}\n${JSON.stringify(json?.detail || json, null, 2)}`);
+        return;
+      }
+
+      // ✅ 삭제 성공 → 목록 새로고침
+      setTick((x) => x + 1);
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   return (
     <div
       style={{
         minHeight: "100vh",
-        padding: 22,
-        // ✅ 눈부신 왼쪽 상단 스팟 제거(강도 낮춤 + 위치 약간 이동)
+        padding: 18,
         background:
           "radial-gradient(1100px 620px at  20%  8%, rgba(255,255,255,0.10), transparent 62%)," +
           "radial-gradient(900px 520px at  70% 16%, rgba(99,102,241,0.14), transparent 60%)," +
@@ -240,7 +282,8 @@ export default function AdminResultsPage() {
         fontFamily: "system-ui",
       }}
     >
-      <div style={{ width: "100%", maxWidth: 1400, margin: "0 auto" }}>
+      {/* ✅ 풀폭: maxWidth 제거 */}
+      <div style={{ width: "100%", maxWidth: "none", margin: 0 }}>
         {/* Header */}
         <div
           style={{
@@ -249,6 +292,7 @@ export default function AdminResultsPage() {
             gap: 14,
             alignItems: "flex-end",
             marginBottom: 14,
+            flexWrap: "wrap",
           }}
         >
           <div>
@@ -309,12 +353,7 @@ export default function AdminResultsPage() {
           <>
             {/* Table */}
             <Glass style={{ overflow: "hidden" }}>
-              <div
-                style={{
-                  overflowX: "auto",
-                  overflowY: "hidden",
-                }}
-              >
+              <div style={{ overflowX: "auto", overflowY: "hidden" }}>
                 <div style={{ minWidth: GRID_MIN_WIDTH }}>
                   {/* Sticky header */}
                   <div
@@ -323,7 +362,8 @@ export default function AdminResultsPage() {
                       top: 0,
                       zIndex: 2,
                       display: "grid",
-                      gridTemplateColumns: "140px 140px 160px 220px 220px 90px 170px 90px",
+                      // ✅ 마지막에 "삭제" 컬럼 추가
+                      gridTemplateColumns: "140px 140px 160px 220px 220px 90px 200px 90px 90px",
                       fontWeight: 950,
                       letterSpacing: "0.2px",
                       background: "rgba(255,255,255,0.10)",
@@ -339,19 +379,20 @@ export default function AdminResultsPage() {
                     <div>문항수</div>
                     <div>상태</div>
                     <div style={{ whiteSpace: "nowrap" }}>상세</div>
+                    <div style={{ whiteSpace: "nowrap" }}>삭제</div>
                   </div>
 
                   {rows.map((r, idx) => {
                     const statusUp = String(r.status ?? "").toUpperCase();
-                    const statusTone =
-                      statusUp === "SUBMITTED" ? "blue" : statusUp ? "gray" : "gray";
+                    const statusTone = statusUp === "SUBMITTED" ? "blue" : statusUp ? "gray" : "gray";
+                    const shortId = r.idType === "uuid" ? r.id.slice(0, 8) + "..." : r.id;
 
                     return (
                       <div
                         key={`${r.idType}:${r.id}`}
                         style={{
                           display: "grid",
-                          gridTemplateColumns: "140px 140px 160px 220px 220px 90px 170px 90px",
+                          gridTemplateColumns: "140px 140px 160px 220px 220px 90px 200px 90px 90px",
                           padding: 12,
                           borderTop: `1px solid ${idx === 0 ? "transparent" : "rgba(255,255,255,0.08)"}`,
                           alignItems: "center",
@@ -367,7 +408,7 @@ export default function AdminResultsPage() {
                         }}
                       >
                         <div style={{ fontFamily: "monospace", fontSize: 12, color: C.dim }}>
-                          {r.idType === "uuid" ? r.id.slice(0, 8) + "..." : r.id}
+                          {shortId}
                         </div>
 
                         <div style={{ fontWeight: 950 }}>{r.empId}</div>
@@ -376,7 +417,14 @@ export default function AdminResultsPage() {
                           <span style={{ fontWeight: 950 }}>{r.score}</span>
                           <span style={{ color: C.dim }}> / {r.totalPoints}</span>
                           {r.wrongCount ? (
-                            <span style={{ marginLeft: 8, fontSize: 12, color: C.mute, fontWeight: 900 }}>
+                            <span
+                              style={{
+                                marginLeft: 8,
+                                fontSize: 12,
+                                color: C.mute,
+                                fontWeight: 900,
+                              }}
+                            >
                               (오답 {r.wrongCount})
                             </span>
                           ) : null}
@@ -401,31 +449,34 @@ export default function AdminResultsPage() {
                             보기
                           </button>
                         </div>
+
+                        <div style={{ whiteSpace: "nowrap" }}>
+                          <button
+                            onClick={() => onDeleteAttempt(r)}
+                            style={btnStyle(true, false, true)}
+                            disabled={deletingId === r.id}
+                            title="해당 응시 이력/답안 기록을 삭제합니다"
+                          >
+                            {deletingId === r.id ? "삭제중..." : "삭제"}
+                          </button>
+                        </div>
                       </div>
                     );
                   })}
 
                   {rows.length === 0 ? (
-                    <div style={{ padding: 16, color: C.dim, fontWeight: 900 }}>
-                      데이터가 없습니다.
-                    </div>
+                    <div style={{ padding: 16, color: C.dim, fontWeight: 900 }}>데이터가 없습니다.</div>
                   ) : null}
                 </div>
               </div>
             </Glass>
 
             {/* Paging */}
-            <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
-              <button
-                onClick={() => router.push(`/admin/results?page=${Math.max(1, page - 1)}`)}
-                style={btnStyle()}
-              >
+            <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button onClick={() => router.push(`/admin/results?page=${Math.max(1, page - 1)}`)} style={btnStyle()}>
                 이전
               </button>
-              <button
-                onClick={() => router.push(`/admin/results?page=${page + 1}`)}
-                style={btnStyle()}
-              >
+              <button onClick={() => router.push(`/admin/results?page=${page + 1}`)} style={btnStyle()}>
                 다음
               </button>
 
